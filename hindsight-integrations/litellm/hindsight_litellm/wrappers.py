@@ -673,6 +673,7 @@ async def aretain(
     tags: Optional[List[str]] = None,
     metadata: Optional[Dict[str, str]] = None,
     hindsight_api_url: Optional[str] = None,
+    sync: bool = False,
 ) -> RetainResult:
     """Async version of retain().
 
@@ -691,6 +692,7 @@ async def aretain(
             tags=tags,
             metadata=metadata,
             hindsight_api_url=hindsight_api_url,
+            sync=sync,
         ),
     )
 
