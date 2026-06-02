@@ -47,6 +47,13 @@ export interface SessionSummaryBudget {
   dropCompletedTodosAfterTurns: number;
 }
 
+export interface SessionSummaryBudgetedText {
+  outputText: string;
+  recallQueryText: string;
+  promptInjectText: string;
+  retainContextText: string;
+}
+
 export const DEFAULT_SESSION_SUMMARY_BUDGET: SessionSummaryBudget = {
   maxInputChars: 16_000,
   maxOutputChars: 2_000,
@@ -88,6 +95,7 @@ export function sanitizeSessionSummaryText(
   if (!text) return "";
   let cleaned = String(text).replace(MEMORY_TAG_RE, "");
   cleaned = cleaned.replace(METADATA_BLOCK_RE, "");
+  cleaned = stripOperationalMetadataJsonObjects(cleaned);
   cleaned = cleaned.replace(SECRET_RE, "[redacted-secret]");
   const kept: string[] = [];
   for (const rawLine of cleaned.split(/\r?\n/)) {
@@ -147,9 +155,13 @@ export function renderSessionSummary(
 export function shouldUpdateSessionSummary(input: {
   turnIndex: number;
   retainEveryNTurns: number;
+  retainOverlapTurns?: number;
+  recallContextTurns?: number;
   updateEveryNTurns?: number | null;
   minUpdateEveryNTurns?: number;
 }): boolean {
+  void input.retainOverlapTurns;
+  void input.recallContextTurns;
   if (input.turnIndex <= 0) return false;
   const minimum = Math.max(1, Math.trunc(input.minUpdateEveryNTurns ?? 2));
   const cadence =
@@ -184,6 +196,24 @@ export function trimSessionSummaryInputs(
     latestQuery,
     messages: kept.reverse(),
     budget,
+  };
+}
+
+export function buildSessionSummaryBudgetedText(
+  summaryJson: Record<string, unknown>,
+  budget: SessionSummaryBudget
+): SessionSummaryBudgetedText {
+  return {
+    outputText: renderSessionSummary(summaryJson, { maxChars: budget.maxOutputChars }),
+    recallQueryText: renderBudgetedSummaryVariant(summaryJson, {
+      maxChars: effectiveRecallQueryChars(budget),
+    }),
+    promptInjectText: renderBudgetedSummaryVariant(summaryJson, {
+      maxChars: budget.maxPromptInjectChars,
+    }),
+    retainContextText: renderBudgetedSummaryVariant(summaryJson, {
+      maxChars: budget.maxRetainContextChars,
+    }),
   };
 }
 
@@ -240,6 +270,20 @@ function evidenceTextFromMessages(messages: Array<Record<string, unknown>>): str
     .map((msg) => sanitizeSessionSummaryText(String(msg.content ?? "")))
     .filter(Boolean)
     .join("\n");
+}
+
+function stripOperationalMetadataJsonObjects(text: string): string {
+  return text.replace(/\{[^{}\n]*\}/g, (raw) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return raw;
+    const keys = Object.keys(parsed).map((key) => key.toLowerCase().replace(/-/g, "_"));
+    return keys.some((key) => OPERATIONAL_METADATA_KEYS.has(key)) ? "" : raw;
+  });
 }
 
 function activeProjects(
@@ -301,7 +345,17 @@ function matchingLines(evidenceText: string, needles: string[]): string[] {
 }
 
 function looksLikeMetadataAssignment(text: string): boolean {
-  const key = text.trim().replace(/,$/, "").split(":", 1)[0].trim().replace(/['"]/g, "");
+  const stripped = text.trim().replace(/,$/, "");
+  try {
+    const parsed = JSON.parse(stripped) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const keys = Object.keys(parsed).map((key) => key.toLowerCase().replace(/-/g, "_"));
+      if (keys.some((key) => OPERATIONAL_METADATA_KEYS.has(key))) return true;
+    }
+  } catch {
+    // Non-JSON metadata assignment handling follows.
+  }
+  const key = stripped.split(":", 1)[0].trim().replace(/['"]/g, "");
   return OPERATIONAL_METADATA_KEYS.has(key.toLowerCase().replace(/-/g, "_"));
 }
 
@@ -330,4 +384,23 @@ function dedupe(values: string[], limit: number): string[] {
     if (out.length >= limit) break;
   }
   return out;
+}
+
+function effectiveRecallQueryChars(budget: SessionSummaryBudget): number {
+  const ratioLimit = Math.trunc(
+    Math.max(0, budget.maxInputChars) * Math.max(0, budget.recallQueryBudgetRatio)
+  );
+  return Math.max(0, Math.min(budget.maxRecallQueryChars, ratioLimit));
+}
+
+function renderBudgetedSummaryVariant(
+  summaryJson: Record<string, unknown>,
+  options: { maxChars: number }
+): string {
+  if (options.maxChars <= 0) return "";
+  const full = renderSessionSummary(summaryJson, options);
+  if (full.length < options.maxChars) return full;
+  const anchors = asStringList(summaryJson.semanticAnchors);
+  if (anchors.length === 0) return full;
+  return renderSessionSummary({ semanticAnchors: anchors }, options) || full;
 }

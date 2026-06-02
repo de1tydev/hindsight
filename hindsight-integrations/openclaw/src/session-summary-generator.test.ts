@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   FakeSessionSummaryGenerator,
   SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
+  buildSessionSummaryBudgetedText,
   buildSessionSummaryPrompt,
   renderSessionSummary,
   sanitizeSessionSummaryText,
@@ -81,6 +82,42 @@ describe("session summary generator", () => {
     }
   });
 
+  it("ignores inline metadata JSON values across the negative-anchor matrix", () => {
+    const result = new FakeSessionSummaryGenerator().generate(
+      request({
+        messages: [
+          {
+            role: "user",
+            content: [
+              '{"bank":"bank-alpha","source":"telegram-source","session":"session-123",',
+              '"sender":"sender-alpha","profile":"prod-profile","provider":"slack-provider",',
+              '"tool":"metadata-tool"}',
+              "The real project is source-map-cli.",
+            ].join(""),
+          },
+        ],
+      })
+    );
+    const combined = [
+      ...((result.summaryJson.activeProjects as string[]) ?? []),
+      ...((result.summaryJson.exactIdentifiers as string[]) ?? []),
+      ...((result.summaryJson.semanticAnchors as string[]) ?? []),
+    ].join(" ");
+
+    expect(combined).toContain("source-map-cli");
+    for (const forbidden of [
+      "bank-alpha",
+      "telegram-source",
+      "session-123",
+      "sender-alpha",
+      "prod-profile",
+      "slack-provider",
+      "metadata-tool",
+    ]) {
+      expect(combined).not.toContain(forbidden);
+    }
+  });
+
   it("removes injection and privacy canaries", () => {
     const secretCanary = "OC_SECRET" + "_CANARY_DO_NOT_STORE_7f3a9c";
     const privatePath = "/private/canary/path/" + "DO_NOT_LEAK_42";
@@ -110,6 +147,8 @@ describe("session summary generator", () => {
   it("keeps summary cadence independent from retain every turn by default", () => {
     expect(shouldUpdateSessionSummary({ turnIndex: 1, retainEveryNTurns: 1 })).toBe(false);
     expect(shouldUpdateSessionSummary({ turnIndex: 2, retainEveryNTurns: 1 })).toBe(true);
+    expect(shouldUpdateSessionSummary({ turnIndex: 1, retainEveryNTurns: 2 })).toBe(false);
+    expect(shouldUpdateSessionSummary({ turnIndex: 2, retainEveryNTurns: 2 })).toBe(true);
     expect(shouldUpdateSessionSummary({ turnIndex: 3, retainEveryNTurns: 4 })).toBe(false);
     expect(shouldUpdateSessionSummary({ turnIndex: 4, retainEveryNTurns: 4 })).toBe(true);
     expect(
@@ -121,6 +160,22 @@ describe("session summary generator", () => {
         retainEveryNTurns: 1,
         updateEveryNTurns: 1,
         minUpdateEveryNTurns: 2,
+      })
+    ).toBe(false);
+    expect(
+      shouldUpdateSessionSummary({
+        turnIndex: 4,
+        retainEveryNTurns: 2,
+        retainOverlapTurns: 3,
+        recallContextTurns: 4,
+      })
+    ).toBe(true);
+    expect(
+      shouldUpdateSessionSummary({
+        turnIndex: 3,
+        retainEveryNTurns: 2,
+        retainOverlapTurns: 3,
+        recallContextTurns: 4,
       })
     ).toBe(false);
   });
@@ -152,6 +207,32 @@ describe("session summary generator", () => {
       trimmed.messages.reduce((sum, msg) => sum + String(msg.content).length, 0)
     ).toBeLessThanOrEqual(48);
     expect(String(trimmed.messages.at(-1)?.content)).toMatch(/b{48}$/);
+  });
+
+  it("enforces independent summary budgets for derived text variants", () => {
+    const rendered = buildSessionSummaryBudgetedText(
+      {
+        activeProjects: ["source-map-cli"],
+        semanticAnchors: ["Anchor " + "x".repeat(120)],
+        decisions: ["Decision " + "y".repeat(120)],
+      },
+      {
+        maxInputChars: 100,
+        maxOutputChars: 50,
+        maxRecallQueryChars: 80,
+        recallQueryBudgetRatio: 0.25,
+        maxPromptInjectChars: 30,
+        maxRetainContextChars: 40,
+        minLatestQueryReserveChars: 400,
+        dropCompletedTodosAfterTurns: 20,
+      }
+    );
+
+    expect(rendered.outputText.length).toBeLessThanOrEqual(50);
+    expect(rendered.recallQueryText.length).toBeLessThanOrEqual(25);
+    expect(rendered.promptInjectText.length).toBeLessThanOrEqual(30);
+    expect(rendered.retainContextText.length).toBeLessThanOrEqual(40);
+    expect(rendered.recallQueryText).not.toBe(rendered.promptInjectText);
   });
 
   it("builds summary-only prompt and bounded render output", () => {
