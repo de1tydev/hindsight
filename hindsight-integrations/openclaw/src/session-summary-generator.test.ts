@@ -6,6 +6,7 @@ import {
   buildSessionSummaryPrompt,
   renderSessionSummary,
   sanitizeSessionSummaryText,
+  sessionSummaryWindowBounds,
   shouldUpdateSessionSummary,
   trimSessionSummaryInputs,
 } from "./session-summary-generator.js";
@@ -118,6 +119,40 @@ describe("session summary generator", () => {
     }
   });
 
+  it("ignores camelCase lineage metadata aliases", () => {
+    const result = new FakeSessionSummaryGenerator().generate(
+      request({
+        messages: [
+          {
+            role: "user",
+            content: [
+              '{"sourceSystem":"openclaw-source","documentId":"doc-alpha","updateMode":"bulk-update"}',
+              "sourceSystem: assignment-source",
+              "document_id=assignment-document",
+              "The real project is lineage-audit-cli.",
+            ].join("\n"),
+          },
+        ],
+      })
+    );
+    const combined = [
+      ...((result.summaryJson.activeProjects as string[]) ?? []),
+      ...((result.summaryJson.exactIdentifiers as string[]) ?? []),
+      ...((result.summaryJson.semanticAnchors as string[]) ?? []),
+    ].join(" ");
+
+    expect(combined).toContain("lineage-audit-cli");
+    for (const forbidden of [
+      "openclaw-source",
+      "doc-alpha",
+      "bulk-update",
+      "assignment-source",
+      "assignment-document",
+    ]) {
+      expect(combined).not.toContain(forbidden);
+    }
+  });
+
   it("removes injection and privacy canaries", () => {
     const secretCanary = "OC_SECRET" + "_CANARY_DO_NOT_STORE_7f3a9c";
     const privatePath = "/private/canary/path/" + "DO_NOT_LEAK_42";
@@ -180,6 +215,35 @@ describe("session summary generator", () => {
     ).toBe(false);
   });
 
+  it("computes summary window bounds from overlap and recall context", () => {
+    expect(
+      sessionSummaryWindowBounds({
+        turnIndex: 8,
+        retainEveryNTurns: 4,
+        retainOverlapTurns: 1,
+        recallContextTurns: 2,
+      })
+    ).toEqual({
+      segmentStartTurn: 5,
+      segmentEndTurn: 8,
+      inputStartTurn: 4,
+      recallContextStartTurn: 7,
+    });
+
+    expect(
+      sessionSummaryWindowBounds({
+        turnIndex: 8,
+        retainEveryNTurns: 4,
+        retainOverlapTurns: 0,
+        recallContextTurns: 6,
+      })
+    ).toMatchObject({
+      segmentStartTurn: 5,
+      inputStartTurn: 3,
+      recallContextStartTurn: 3,
+    });
+  });
+
   it("trims inputs while reserving latest query budget", () => {
     const trimmed = trimSessionSummaryInputs(
       request({
@@ -207,6 +271,45 @@ describe("session summary generator", () => {
       trimmed.messages.reduce((sum, msg) => sum + String(msg.content).length, 0)
     ).toBeLessThanOrEqual(48);
     expect(String(trimmed.messages.at(-1)?.content)).toMatch(/b{48}$/);
+  });
+
+  it("counts previous summary against input budget and prompt size", () => {
+    const longPrevious = "previous-summary-" + "p".repeat(5000);
+    const budget = {
+      maxInputChars: 360,
+      maxOutputChars: 2000,
+      maxRecallQueryChars: 40,
+      recallQueryBudgetRatio: 0.25,
+      maxPromptInjectChars: 1200,
+      maxRetainContextChars: 1200,
+      minLatestQueryReserveChars: 80,
+      dropCompletedTodosAfterTurns: 20,
+    };
+    const req = request({
+      previousSummary: {
+        schemaVersion: SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
+        activeProjects: ["grounded-app"],
+        completedTodos: [longPrevious],
+        semanticAnchors: [longPrevious],
+      },
+      latestQuery: "latest-query-" + "x".repeat(120),
+      messages: [
+        { role: "user", content: "Continue grounded-app. " + "m".repeat(600) },
+        { role: "assistant", content: "Done: " + "todo ".repeat(300) },
+      ],
+      budget,
+    });
+
+    const trimmed = trimSessionSummaryInputs(req, budget);
+    const prompt = buildSessionSummaryPrompt(req);
+    const previousJson = JSON.stringify(trimmed.previousSummary ?? {});
+
+    expect(trimmed.latestQuery).toHaveLength(80);
+    expect((trimmed.previousSummary?.completedTodos as string[] | undefined) ?? []).toHaveLength(0);
+    expect(previousJson).not.toContain("p".repeat(5000));
+    expect(prompt).not.toContain("p".repeat(5000));
+    expect(previousJson.length).toBeLessThanOrEqual(90);
+    expect(prompt).toContain("latest-query-");
   });
 
   it("enforces independent summary budgets for derived text variants", () => {
@@ -248,5 +351,15 @@ describe("session summary generator", () => {
     expect(prompt).toContain("Generate a compact Hindsight session summary");
     expect(rendered.toLowerCase()).not.toContain("recall");
     expect(rendered.length).toBeLessThanOrEqual(40);
+  });
+
+  it("returns error status for generator failures without throwing", () => {
+    const result = new FakeSessionSummaryGenerator().generate(
+      request({ messages: null }) as Parameters<FakeSessionSummaryGenerator["generate"]>[0]
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.error).toBeTruthy();
+    expect(result.summaryText).toBe("");
   });
 });

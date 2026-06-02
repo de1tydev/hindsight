@@ -7,6 +7,8 @@ const OPERATIONAL_METADATA_KEYS = new Set([
   "bank_id",
   "channel",
   "channel_id",
+  "document",
+  "document_id",
   "message_id",
   "profile",
   "provider",
@@ -21,6 +23,7 @@ const OPERATIONAL_METADATA_KEYS = new Set([
   "thread_id",
   "tool",
   "tool_call_id",
+  "update_mode",
   "user_id",
 ]);
 
@@ -52,6 +55,13 @@ export interface SessionSummaryBudgetedText {
   recallQueryText: string;
   promptInjectText: string;
   retainContextText: string;
+}
+
+export interface SessionSummaryWindowBounds {
+  segmentStartTurn: number;
+  segmentEndTurn: number;
+  inputStartTurn: number;
+  recallContextStartTurn: number;
 }
 
 export const DEFAULT_SESSION_SUMMARY_BUDGET: SessionSummaryBudget = {
@@ -126,7 +136,7 @@ export function buildSessionSummaryPrompt(request: SessionSummaryRequest): strin
   return [
     "Generate a compact Hindsight session summary as JSON only.",
     `Schema version: ${SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION}`,
-    "Rules: use only evidence in user/assistant messages; do not promote bank, source, session, sender, profile, provider, or tool metadata into semantic entities; carry forward previous anchors only when grounded.",
+    "Rules: use only evidence in user/assistant messages; do not promote bank, source, session, sender, profile, provider, tool, document, or update-mode metadata into semantic entities; carry forward previous anchors only when grounded.",
     `Previous summary JSON:\n${JSON.stringify(trimmed.previousSummary ?? {}, null, 0)}`,
     `Latest query:\n${sanitizeSessionSummaryText(trimmed.latestQuery ?? "")}`,
     `Messages JSON:\n${JSON.stringify(messages)}`,
@@ -160,15 +170,48 @@ export function shouldUpdateSessionSummary(input: {
   updateEveryNTurns?: number | null;
   minUpdateEveryNTurns?: number;
 }): boolean {
-  void input.retainOverlapTurns;
-  void input.recallContextTurns;
   if (input.turnIndex <= 0) return false;
+  sessionSummaryWindowBounds({
+    turnIndex: input.turnIndex,
+    retainEveryNTurns: input.retainEveryNTurns,
+    retainOverlapTurns: input.retainOverlapTurns,
+    recallContextTurns: input.recallContextTurns,
+  });
   const minimum = Math.max(1, Math.trunc(input.minUpdateEveryNTurns ?? 2));
   const cadence =
     input.updateEveryNTurns != null
       ? Math.max(minimum, Math.trunc(input.updateEveryNTurns || minimum))
       : Math.max(minimum, Math.trunc(input.retainEveryNTurns || 1));
   return input.turnIndex % cadence === 0;
+}
+
+export function sessionSummaryWindowBounds(input: {
+  turnIndex: number;
+  retainEveryNTurns: number;
+  retainOverlapTurns?: number;
+  recallContextTurns?: number;
+}): SessionSummaryWindowBounds {
+  const endTurn = Math.max(0, Math.trunc(input.turnIndex || 0));
+  if (endTurn <= 0) {
+    return {
+      segmentStartTurn: 0,
+      segmentEndTurn: 0,
+      inputStartTurn: 0,
+      recallContextStartTurn: 0,
+    };
+  }
+  const segmentSize = Math.max(1, Math.trunc(input.retainEveryNTurns || 1));
+  const overlap = Math.max(0, Math.trunc(input.retainOverlapTurns || 0));
+  const recallContext = Math.max(1, Math.trunc(input.recallContextTurns || 1));
+  const segmentStart = Math.max(1, endTurn - segmentSize + 1);
+  const overlapStart = Math.max(1, segmentStart - overlap);
+  const recallStart = Math.max(1, endTurn - recallContext + 1);
+  return {
+    segmentStartTurn: segmentStart,
+    segmentEndTurn: endTurn,
+    inputStartTurn: Math.min(overlapStart, recallStart),
+    recallContextStartTurn: recallStart,
+  };
 }
 
 export function trimSessionSummaryInputs(
@@ -178,7 +221,11 @@ export function trimSessionSummaryInputs(
   const latestQuery = sanitizeSessionSummaryText(request.latestQuery ?? "", {
     maxChars: Math.max(0, budget.minLatestQueryReserveChars),
   });
-  let remaining = Math.max(0, budget.maxInputChars - latestQuery.length);
+  const remainingTotal = Math.max(0, budget.maxInputChars - latestQuery.length);
+  const previousSummary = trimPreviousSummary(request.previousSummary, {
+    maxChars: request.previousSummary ? Math.trunc(remainingTotal / 4) : 0,
+  });
+  let remaining = Math.max(0, remainingTotal - jsonLength(previousSummary));
   const kept: Array<Record<string, unknown>> = [];
   for (const msg of [...request.messages].reverse()) {
     let content = sanitizeSessionSummaryText(String(msg.content ?? ""));
@@ -193,6 +240,7 @@ export function trimSessionSummaryInputs(
   }
   return {
     ...request,
+    previousSummary,
     latestQuery,
     messages: kept.reverse(),
     budget,
@@ -273,7 +321,7 @@ function evidenceTextFromMessages(messages: Array<Record<string, unknown>>): str
 }
 
 function stripOperationalMetadataJsonObjects(text: string): string {
-  return text.replace(/\{[^{}\n]*\}/g, (raw) => {
+  return text.replace(/\{[^{}]*\}/g, (raw) => {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -281,7 +329,7 @@ function stripOperationalMetadataJsonObjects(text: string): string {
       return raw;
     }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return raw;
-    const keys = Object.keys(parsed).map((key) => key.toLowerCase().replace(/-/g, "_"));
+    const keys = Object.keys(parsed).map((key) => normalizeMetadataKey(key));
     return keys.some((key) => OPERATIONAL_METADATA_KEYS.has(key)) ? "" : raw;
   });
 }
@@ -349,19 +397,67 @@ function looksLikeMetadataAssignment(text: string): boolean {
   try {
     const parsed = JSON.parse(stripped) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const keys = Object.keys(parsed).map((key) => key.toLowerCase().replace(/-/g, "_"));
+      const keys = Object.keys(parsed).map((key) => normalizeMetadataKey(key));
       if (keys.some((key) => OPERATIONAL_METADATA_KEYS.has(key))) return true;
     }
   } catch {
     // Non-JSON metadata assignment handling follows.
   }
-  const key = stripped.split(":", 1)[0].trim().replace(/['"]/g, "");
-  return OPERATIONAL_METADATA_KEYS.has(key.toLowerCase().replace(/-/g, "_"));
+  const separator = stripped.includes(":") ? ":" : stripped.includes("=") ? "=" : "";
+  if (!separator) return false;
+  const key = stripped.split(separator, 1)[0].trim().replace(/['"]/g, "");
+  return OPERATIONAL_METADATA_KEYS.has(normalizeMetadataKey(key));
 }
 
 function isOperationalIdentifier(value: string): boolean {
-  const normalized = value.toLowerCase().replace(/[-.]/g, "_");
-  return OPERATIONAL_METADATA_KEYS.has(normalized);
+  return OPERATIONAL_METADATA_KEYS.has(normalizeMetadataKey(value));
+}
+
+function normalizeMetadataKey(value: unknown): string {
+  return String(value)
+    .trim()
+    .replace(/(?<=[a-z0-9])(?=[A-Z])/g, "_")
+    .replace(/[-.]/g, "_")
+    .toLowerCase()
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function trimPreviousSummary(
+  previousSummary: Record<string, unknown> | null | undefined,
+  options: { maxChars: number }
+): Record<string, unknown> | null {
+  if (!previousSummary || options.maxChars <= 2) return null;
+  const sanitized: Record<string, unknown> = {};
+  if (previousSummary.schemaVersion !== undefined) {
+    const candidate = { schemaVersion: previousSummary.schemaVersion };
+    if (jsonLength(candidate) <= options.maxChars) Object.assign(sanitized, candidate);
+  }
+  for (const key of [
+    "activeProjects",
+    "exactIdentifiers",
+    "semanticAnchors",
+    "decisions",
+    "blockers",
+    "openQuestions",
+    "completedTodos",
+  ]) {
+    const kept: string[] = [];
+    for (const value of asStringList(previousSummary[key])) {
+      const text = sanitizeSessionSummaryText(value);
+      if (!text) continue;
+      const candidate = { ...sanitized, [key]: [...kept, text] };
+      if (jsonLength(candidate) > options.maxChars) break;
+      kept.push(text);
+    }
+    if (kept.length > 0) sanitized[key] = kept;
+  }
+  return Object.keys(sanitized).length > 0 ? sanitized : null;
+}
+
+function jsonLength(value: unknown): number {
+  if (value == null) return 0;
+  return JSON.stringify(value).length;
 }
 
 function asStringList(value: unknown): string[] {
