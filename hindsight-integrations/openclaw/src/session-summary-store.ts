@@ -144,9 +144,9 @@ export class SessionSummaryStore {
       };
     }
 
-    this.db
-      .prepare(
-        `UPDATE session_summaries
+    const updateSql =
+      write.expectedVersion == null
+        ? `UPDATE session_summaries
            SET identity_scope = @identityScope,
                summary_json = @summaryJson,
                summary_text = @summaryText,
@@ -160,8 +160,35 @@ export class SessionSummaryStore {
                last_error = @lastError,
                updated_at = @updatedAt
          WHERE summary_key = @summaryKey`
-      )
-      .run(toWriteParams(write, now));
+        : `UPDATE session_summaries
+           SET identity_scope = @identityScope,
+               summary_json = @summaryJson,
+               summary_text = @summaryText,
+               schema_version = @schemaVersion,
+               version = version + 1,
+               turn = @turn,
+               turn_hash = @turnHash,
+               last_input_hash = @lastInputHash,
+               parent_summary_key = @parentSummaryKey,
+               status = @status,
+               last_error = @lastError,
+               updated_at = @updatedAt
+         WHERE summary_key = @summaryKey
+           AND version = @expectedVersion`;
+    const updateParams =
+      write.expectedVersion == null
+        ? toWriteParams(write, now)
+        : { ...toWriteParams(write, now), expectedVersion: write.expectedVersion };
+    const updateResult = this.db.prepare(updateSql).run(updateParams);
+    if (updateResult.changes === 0) {
+      return {
+        record: this.get(write.summaryKey),
+        inserted: false,
+        updated: false,
+        stale: true,
+        idempotent: false,
+      };
+    }
     return {
       record: this.get(write.summaryKey),
       inserted: false,
