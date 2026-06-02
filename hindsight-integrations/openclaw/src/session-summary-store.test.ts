@@ -106,6 +106,36 @@ describe("SessionSummaryStore", () => {
     store.close();
   });
 
+  it("drops cross-connection stale CAS writes interleaved after the initial read", () => {
+    const dbPath = tempDbPath();
+    const staleStore = new SessionSummaryStore({ dbPath });
+    const currentStore = new SessionSummaryStore({ dbPath });
+    staleStore.upsert(makeWrite({ lastInputHash: "hash-1", summaryText: "one" }));
+
+    const originalGet = staleStore.get.bind(staleStore);
+    let didInterleave = false;
+    staleStore.get = (summaryKey: string) => {
+      const record = originalGet(summaryKey);
+      if (!didInterleave && record?.version === 1) {
+        didInterleave = true;
+        currentStore.upsert(
+          makeWrite({ expectedVersion: 1, lastInputHash: "hash-2", summaryText: "two" })
+        );
+      }
+      return record;
+    };
+
+    const stale = staleStore.upsert(
+      makeWrite({ expectedVersion: 1, lastInputHash: "hash-3", summaryText: "stale" })
+    );
+
+    expect(didInterleave).toBe(true);
+    expect(stale).toMatchObject({ inserted: false, updated: false, stale: true });
+    expect(originalGet("bank/session")).toMatchObject({ summaryText: "two", version: 2 });
+    staleStore.close();
+    currentStore.close();
+  });
+
   it("is idempotent for the same summary key and last input hash", () => {
     const store = new SessionSummaryStore({ dbPath: tempDbPath() });
     store.upsert(makeWrite({ lastInputHash: "same", summaryText: "first" }));
