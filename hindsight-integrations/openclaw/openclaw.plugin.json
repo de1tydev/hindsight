@@ -248,35 +248,39 @@
       },
       "sessionSummaryEnabled": {
         "type": "boolean",
-        "description": "Enable the structured session summary generator surface. This does not inject summaries, enrich recall, enrich retain, or add lifecycle hooks by itself.",
+        "description": "Enable rolling session summary lifecycle when at least one summary consumption or update flag is enabled.",
         "default": false
+      },
+      "sessionSummaryStorePath": {
+        "type": "string",
+        "description": "Optional SQLite path for rolling session summaries. Defaults to ~/.openclaw/data/hindsight-session-summaries.sqlite."
       },
       "sessionSummaryEnrichRecallQuery": {
         "type": "boolean",
-        "description": "Future flag for adding rolling summary context after the latest recall query. No lifecycle hook consumes it in this stage.",
+        "description": "Add rolling summary context after the latest recall query while preserving recallMaxQueryChars.",
         "default": false
       },
       "sessionSummaryEnrichRetainContext": {
         "type": "boolean",
-        "description": "Future flag for adding rolling summary text to retain extraction context, never transcript content. No lifecycle hook consumes it in this stage.",
+        "description": "Add rolling summary text to retain extraction context, never transcript content.",
         "default": false
       },
       "sessionSummaryInjectPrompt": {
         "type": "boolean",
-        "description": "Future flag for rendering a separate prompt summary block outside recalled memory blocks. No lifecycle hook consumes it in this stage.",
+        "description": "Inject a separate <hindsight_session_summary> prompt block outside recalled memory blocks.",
         "default": false
       },
       "sessionSummaryGeneratorProvider": {
         "type": "string",
-        "description": "Optional LLM provider for future real summary generation."
+        "description": "Optional real generator request. OpenClaw currently uses FakeSessionSummaryGenerator until a stable plugin-side LLM helper is planned."
       },
       "sessionSummaryGeneratorModel": {
         "type": "string",
-        "description": "Optional LLM model for future real summary generation."
+        "description": "Optional real generator model request. Currently no-op without a stable OpenClaw LLM helper."
       },
       "sessionSummaryGeneratorBaseUrl": {
         "type": "string",
-        "description": "Optional OpenAI-compatible base URL for future real summary generation."
+        "description": "Optional real generator base URL request. Currently no-op without a stable OpenClaw LLM helper."
       },
       "sessionSummaryGeneratorApiKeyEnv": {
         "type": "string",
@@ -302,7 +306,7 @@
       "sessionSummaryTimeoutMs": {
         "type": "integer",
         "minimum": 1,
-        "description": "Timeout for future background summary generation.",
+        "description": "Timeout for bounded summary generation/update work.",
         "default": 20000
       },
       "sessionSummaryMaxInputChars": {
@@ -320,26 +324,26 @@
       "sessionSummaryMaxRecallQueryChars": {
         "type": "integer",
         "minimum": 1,
-        "description": "Budget for future summary-derived recall query text.",
+        "description": "Budget for summary-derived recall query text.",
         "default": 800
       },
       "sessionSummaryRecallQueryBudgetRatio": {
         "type": "number",
         "minimum": 0,
         "maximum": 1,
-        "description": "Maximum fraction of the summary input budget usable for future recall query text.",
+        "description": "Maximum fraction of the summary input budget usable for recall query text.",
         "default": 0.25
       },
       "sessionSummaryMaxPromptInjectChars": {
         "type": "integer",
         "minimum": 1,
-        "description": "Budget for future prompt-injected summary context.",
+        "description": "Budget for prompt-injected summary context.",
         "default": 1200
       },
       "sessionSummaryMaxRetainContextChars": {
         "type": "integer",
         "minimum": 1,
-        "description": "Budget for future retain context summary text.",
+        "description": "Budget for retain context summary text.",
         "default": 1200
       },
       "sessionSummaryMinLatestQueryReserveChars": {
@@ -577,27 +581,31 @@
     },
     "sessionSummaryEnabled": {
       "label": "Session Summary Enabled",
-      "placeholder": "false (generator surface only)"
+      "placeholder": "false (enable with a summary consumption/update flag)"
+    },
+    "sessionSummaryStorePath": {
+      "label": "Session Summary Store Path",
+      "placeholder": "~/.openclaw/data/hindsight-session-summaries.sqlite"
     },
     "sessionSummaryEnrichRecallQuery": {
       "label": "Summary Recall Enrichment",
-      "placeholder": "false (not lifecycle-wired in this stage)"
+      "placeholder": "false (append rolling summary to recall query)"
     },
     "sessionSummaryEnrichRetainContext": {
       "label": "Summary Retain Context",
-      "placeholder": "false (not lifecycle-wired in this stage)"
+      "placeholder": "false (add summary to retain context only)"
     },
     "sessionSummaryInjectPrompt": {
       "label": "Summary Prompt Injection",
-      "placeholder": "false (not lifecycle-wired in this stage)"
+      "placeholder": "false (inject separate summary prompt block)"
     },
     "sessionSummaryGeneratorProvider": {
       "label": "Summary Generator Provider",
-      "placeholder": "Optional provider for future summary generation"
+      "placeholder": "Optional; fake generator used until LLM helper exists"
     },
     "sessionSummaryGeneratorModel": {
       "label": "Summary Generator Model",
-      "placeholder": "Optional model for future summary generation"
+      "placeholder": "Optional; fake generator used until LLM helper exists"
     },
     "sessionSummaryGeneratorBaseUrl": {
       "label": "Summary Generator Base URL",

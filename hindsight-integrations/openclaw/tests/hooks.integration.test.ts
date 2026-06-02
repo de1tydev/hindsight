@@ -23,6 +23,9 @@ import {
   vi,
   type MockInstance,
 } from "vitest";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import type { RecallResponse, RetainResponse } from "@vectorize-io/hindsight-client";
 import type { MoltbotPluginAPI, PluginConfig } from "../src/types.js";
 
@@ -149,6 +152,7 @@ let stopServicesFn: () => Promise<void>;
 // play nicely with the hindsight-client class shape (method overloads).
 let recallSpy: MockInstance;
 let retainSpy: MockInstance;
+const tempDirs: string[] = [];
 
 beforeAll(async () => {
   apiReachable = await waitForApi(HINDSIGHT_API_URL, 8000);
@@ -207,6 +211,10 @@ afterEach(() => {
   // Reset spy call history between tests; don't remove the implementation.
   recallSpy?.mockReset();
   retainSpy?.mockReset();
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -701,6 +709,44 @@ describe("agent_end hook", () => {
     ]);
     expect(content).not.toContain("My name is Carol.");
     expect(options?.metadata?.message_count).toBe("2");
+  });
+
+  it("enriches retain context with a rolling summary without changing transcript content", async () => {
+    if (!apiReachable) return;
+    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-int-"));
+    tempDirs.push(dir);
+    retainSpy.mockResolvedValue(OK_RETAIN);
+    const mod = await import("../src/index.js");
+    const handle = createMockApi({
+      hindsightApiUrl: HINDSIGHT_API_URL,
+      dynamicBankId: true,
+      retainEveryNTurns: 1,
+      sessionSummaryEnabled: true,
+      sessionSummaryEnrichRetainContext: true,
+      sessionSummaryStorePath: join(dir, "summary.sqlite"),
+    });
+    mod.default(handle.api);
+    await handle.startServices();
+
+    await handle.trigger(
+      "agent_end",
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "I work on project aurora." },
+          { role: "assistant", content: "Noted." },
+          { role: "user", content: "We decided to use TypeScript for project aurora." },
+        ],
+      },
+      { messageProvider: "telegram", senderId: "U019S", sessionKey: "sess-summary-retain" }
+    );
+
+    expect(retainSpy).toHaveBeenCalledOnce();
+    const [, content, options] = retainSpy.mock.calls[0];
+    expect(content).not.toContain("Rolling session summary");
+    expect(options?.context).toContain("Rolling session summary for extraction context:");
+    expect(options?.context).toContain("project aurora");
+    await handle.stopServices();
   });
 });
 
