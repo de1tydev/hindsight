@@ -19,6 +19,8 @@ import { createRequire } from "module";
 import { homedir } from "os";
 import { createKnowledgeTools, TOOL_NAMES } from "@vectorize-io/hindsight-agent-sdk";
 
+export * from "./session-summary-generator.js";
+
 function loadPackageVersion(): string {
   try {
     const require = createRequire(import.meta.url);
@@ -1554,6 +1556,87 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       typeof config.recallTimeoutMs === "number" && config.recallTimeoutMs >= 1000
         ? config.recallTimeoutMs
         : undefined,
+    sessionSummaryEnabled: config.sessionSummaryEnabled === true,
+    sessionSummaryReuseHindsightLlmConfig: config.sessionSummaryReuseHindsightLlmConfig !== false,
+    sessionSummaryGeneratorProvider:
+      typeof config.sessionSummaryGeneratorProvider === "string" &&
+      config.sessionSummaryGeneratorProvider.trim().length > 0
+        ? config.sessionSummaryGeneratorProvider.trim()
+        : config.sessionSummaryReuseHindsightLlmConfig === false
+          ? undefined
+          : config.llmProvider,
+    sessionSummaryGeneratorModel:
+      typeof config.sessionSummaryGeneratorModel === "string" &&
+      config.sessionSummaryGeneratorModel.trim().length > 0
+        ? config.sessionSummaryGeneratorModel.trim()
+        : config.sessionSummaryReuseHindsightLlmConfig === false
+          ? undefined
+          : config.llmModel,
+    sessionSummaryGeneratorBaseUrl:
+      typeof config.sessionSummaryGeneratorBaseUrl === "string" &&
+      config.sessionSummaryGeneratorBaseUrl.trim().length > 0
+        ? config.sessionSummaryGeneratorBaseUrl.trim()
+        : config.sessionSummaryReuseHindsightLlmConfig === false
+          ? undefined
+          : config.llmBaseUrl,
+    sessionSummaryGeneratorApiKeyEnv:
+      typeof config.sessionSummaryGeneratorApiKeyEnv === "string" &&
+      config.sessionSummaryGeneratorApiKeyEnv.trim().length > 0
+        ? config.sessionSummaryGeneratorApiKeyEnv.trim()
+        : "HINDSIGHT_LLM_API_KEY",
+    sessionSummaryUpdateEveryNTurns:
+      typeof config.sessionSummaryUpdateEveryNTurns === "number" &&
+      config.sessionSummaryUpdateEveryNTurns >= 1
+        ? Math.trunc(config.sessionSummaryUpdateEveryNTurns)
+        : undefined,
+    sessionSummaryMinUpdateEveryNTurns:
+      typeof config.sessionSummaryMinUpdateEveryNTurns === "number" &&
+      config.sessionSummaryMinUpdateEveryNTurns >= 2
+        ? Math.trunc(config.sessionSummaryMinUpdateEveryNTurns)
+        : 2,
+    sessionSummaryTimeoutMs:
+      typeof config.sessionSummaryTimeoutMs === "number" && config.sessionSummaryTimeoutMs >= 1
+        ? Math.trunc(config.sessionSummaryTimeoutMs)
+        : 20_000,
+    sessionSummaryMaxInputChars:
+      typeof config.sessionSummaryMaxInputChars === "number" &&
+      config.sessionSummaryMaxInputChars >= 1
+        ? Math.trunc(config.sessionSummaryMaxInputChars)
+        : 16_000,
+    sessionSummaryMaxOutputChars:
+      typeof config.sessionSummaryMaxOutputChars === "number" &&
+      config.sessionSummaryMaxOutputChars >= 1
+        ? Math.trunc(config.sessionSummaryMaxOutputChars)
+        : 2_000,
+    sessionSummaryMaxRecallQueryChars:
+      typeof config.sessionSummaryMaxRecallQueryChars === "number" &&
+      config.sessionSummaryMaxRecallQueryChars >= 1
+        ? Math.trunc(config.sessionSummaryMaxRecallQueryChars)
+        : 800,
+    sessionSummaryRecallQueryBudgetRatio:
+      typeof config.sessionSummaryRecallQueryBudgetRatio === "number"
+        ? Math.min(1, Math.max(0, config.sessionSummaryRecallQueryBudgetRatio))
+        : 0.25,
+    sessionSummaryMaxPromptInjectChars:
+      typeof config.sessionSummaryMaxPromptInjectChars === "number" &&
+      config.sessionSummaryMaxPromptInjectChars >= 1
+        ? Math.trunc(config.sessionSummaryMaxPromptInjectChars)
+        : 1_200,
+    sessionSummaryMaxRetainContextChars:
+      typeof config.sessionSummaryMaxRetainContextChars === "number" &&
+      config.sessionSummaryMaxRetainContextChars >= 1
+        ? Math.trunc(config.sessionSummaryMaxRetainContextChars)
+        : 1_200,
+    sessionSummaryMinLatestQueryReserveChars:
+      typeof config.sessionSummaryMinLatestQueryReserveChars === "number" &&
+      config.sessionSummaryMinLatestQueryReserveChars >= 0
+        ? Math.trunc(config.sessionSummaryMinLatestQueryReserveChars)
+        : 400,
+    sessionSummaryDropCompletedTodosAfterTurns:
+      typeof config.sessionSummaryDropCompletedTodosAfterTurns === "number" &&
+      config.sessionSummaryDropCompletedTodosAfterTurns >= 0
+        ? Math.trunc(config.sessionSummaryDropCompletedTodosAfterTurns)
+        : 20,
     ignoreSessionPatterns: Array.isArray(config.ignoreSessionPatterns)
       ? config.ignoreSessionPatterns
       : [],

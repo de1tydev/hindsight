@@ -116,6 +116,23 @@ export interface PluginConfig {
   recallMaxQueryChars?: number; // Max chars for composed recall query. Default: 800
   recallPromptPreamble?: string; // Prompt preamble placed above recalled memories. Default: built-in guidance text.
   recallInjectionPosition?: "prepend" | "append" | "user"; // Where to inject recalled memories. 'prepend' = start of system prompt (default), 'append' = end of system prompt (preserves prompt cache), 'user' = before user message.
+  sessionSummaryEnabled?: boolean; // Summary generator surface flag. This does not wire prompt/recall/retain consumption by itself.
+  sessionSummaryGeneratorProvider?: string; // Optional LLM provider for future real summary generation.
+  sessionSummaryGeneratorModel?: string; // Optional LLM model for future real summary generation.
+  sessionSummaryGeneratorBaseUrl?: string; // Optional OpenAI-compatible base URL for future real summary generation.
+  sessionSummaryGeneratorApiKeyEnv?: string; // Env var name for summary generator API key. Default: HINDSIGHT_LLM_API_KEY.
+  sessionSummaryReuseHindsightLlmConfig?: boolean; // Reuse llmProvider/llmModel/llmBaseUrl when summary fields are unset. Default: true.
+  sessionSummaryUpdateEveryNTurns?: number; // Optional summary refresh cadence independent from retainEveryNTurns.
+  sessionSummaryMinUpdateEveryNTurns?: number; // Minimum summary refresh cadence. Default: 2.
+  sessionSummaryTimeoutMs?: number; // Timeout for future background summary generation. Default: 20000.
+  sessionSummaryMaxInputChars?: number; // Max input chars for summary generation. Default: 16000.
+  sessionSummaryMaxOutputChars?: number; // Max rendered summary chars. Default: 2000.
+  sessionSummaryMaxRecallQueryChars?: number; // Budget for future summary-derived recall query. Default: 800.
+  sessionSummaryRecallQueryBudgetRatio?: number; // Fraction of summary input budget available to future recall query text. Default: 0.25.
+  sessionSummaryMaxPromptInjectChars?: number; // Budget for future prompt-injected summary context. Default: 1200.
+  sessionSummaryMaxRetainContextChars?: number; // Budget for future retain context summary text. Default: 1200.
+  sessionSummaryMinLatestQueryReserveChars?: number; // Latest-query reserve during summary input trimming. Default: 400.
+  sessionSummaryDropCompletedTodosAfterTurns?: number; // Completed todo retention horizon. Default: 20.
   ignoreSessionPatterns?: string[]; // Session key glob patterns to skip entirely (no recall, no retain). E.g. ["agent:main:**", "agent:*:cron:**"]
   statelessSessionPatterns?: string[]; // Session key glob patterns for read-only sessions (recall allowed, retain skipped). E.g. ["agent:*:subagent:**"]
   skipStatelessSessions?: boolean; // When true (default), stateless sessions also skip recall. When false, they recall but never retain.
