@@ -95,8 +95,15 @@ export function sanitizeSessionSummaryText(
     if (!line || INJECTION_RE.test(line)) continue;
     kept.push(line);
   }
-  cleaned = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  if (options.maxChars !== undefined && options.maxChars >= 0 && cleaned.length > options.maxChars) {
+  cleaned = kept
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (
+    options.maxChars !== undefined &&
+    options.maxChars >= 0 &&
+    cleaned.length > options.maxChars
+  ) {
     return cleaned.slice(0, options.maxChars).trimEnd();
   }
   return cleaned;
@@ -313,7 +320,9 @@ function dedupe(values: string[], limit: number): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const value of values) {
-    const text = sanitizeSessionSummaryText(String(value)).trim().replace(/[ .,;]+$/, "");
+    const text = sanitizeSessionSummaryText(String(value))
+      .trim()
+      .replace(/[ .,;]+$/, "");
     const key = text.toLowerCase();
     if (!text || seen.has(key)) continue;
     seen.add(key);

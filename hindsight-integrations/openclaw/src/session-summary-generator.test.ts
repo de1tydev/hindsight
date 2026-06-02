@@ -85,8 +85,7 @@ describe("session summary generator", () => {
     const secretCanary = "OC_SECRET" + "_CANARY_DO_NOT_STORE_7f3a9c";
     const privatePath = "/private/canary/path/" + "DO_NOT_LEAK_42";
     const rawCard = "RAW_PEER_CARD" + "_CANARY_SHOULD_NOT_APPEAR";
-    const digest =
-      "sha256:" + "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000";
+    const digest = "sha256:" + "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000";
     const sanitized = sanitizeSessionSummaryText(
       [
         "Keep useful project fact.",
@@ -149,7 +148,9 @@ describe("session summary generator", () => {
 
     expect(trimmed.latestQuery).toHaveLength(32);
     expect(trimmed.latestQuery).toMatch(/^latest-query-/);
-    expect(trimmed.messages.reduce((sum, msg) => sum + String(msg.content).length, 0)).toBeLessThanOrEqual(48);
+    expect(
+      trimmed.messages.reduce((sum, msg) => sum + String(msg.content).length, 0)
+    ).toBeLessThanOrEqual(48);
     expect(String(trimmed.messages.at(-1)?.content)).toMatch(/b{48}$/);
   });
 
