@@ -1387,13 +1387,21 @@ describe("getPluginConfig — session summary generator", () => {
   it("defaults summary cadence and budgets without enabling lifecycle behavior", () => {
     const cfg = getPluginConfig(makeApi({ retainEveryNTurns: 1 }));
 
+    expect(cfg.retainEveryNTurns).toBe(1);
+    expect(cfg.retainOverlapTurns).toBe(0);
+    expect(cfg.recallContextTurns).toBe(1);
     expect(cfg.sessionSummaryEnabled).toBe(false);
     expect(cfg.sessionSummaryUpdateEveryNTurns).toBeUndefined();
     expect(cfg.sessionSummaryMinUpdateEveryNTurns).toBe(2);
     expect(cfg.sessionSummaryTimeoutMs).toBe(20_000);
     expect(cfg.sessionSummaryMaxInputChars).toBe(16_000);
     expect(cfg.sessionSummaryMaxOutputChars).toBe(2_000);
+    expect(cfg.sessionSummaryMaxRecallQueryChars).toBe(800);
+    expect(cfg.sessionSummaryRecallQueryBudgetRatio).toBe(0.25);
+    expect(cfg.sessionSummaryMaxPromptInjectChars).toBe(1_200);
+    expect(cfg.sessionSummaryMaxRetainContextChars).toBe(1_200);
     expect(cfg.sessionSummaryMinLatestQueryReserveChars).toBe(400);
+    expect(cfg.sessionSummaryDropCompletedTodosAfterTurns).toBe(20);
   });
 
   it("normalizes explicit summary model, cadence, and budget fields", () => {
@@ -1402,6 +1410,9 @@ describe("getPluginConfig — session summary generator", () => {
         llmProvider: "openai",
         llmModel: "base-model",
         llmBaseUrl: "http://base.example/v1",
+        retainEveryNTurns: 4,
+        retainOverlapTurns: 2,
+        recallContextTurns: 3,
         sessionSummaryEnabled: true,
         sessionSummaryGeneratorProvider: "openai-compatible",
         sessionSummaryGeneratorModel: "summary-model",
@@ -1422,6 +1433,9 @@ describe("getPluginConfig — session summary generator", () => {
       })
     );
 
+    expect(cfg.retainEveryNTurns).toBe(4);
+    expect(cfg.retainOverlapTurns).toBe(2);
+    expect(cfg.recallContextTurns).toBe(3);
     expect(cfg.sessionSummaryEnabled).toBe(true);
     expect(cfg.sessionSummaryGeneratorProvider).toBe("openai-compatible");
     expect(cfg.sessionSummaryGeneratorModel).toBe("summary-model");
