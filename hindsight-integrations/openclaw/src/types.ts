@@ -118,24 +118,25 @@ export interface PluginConfig {
   recallMaxQueryChars?: number; // Max chars for composed recall query. Default: 800
   recallPromptPreamble?: string; // Prompt preamble placed above recalled memories. Default: built-in guidance text.
   recallInjectionPosition?: "prepend" | "append" | "user"; // Where to inject recalled memories. 'prepend' = start of system prompt (default), 'append' = end of system prompt (preserves prompt cache), 'user' = before user message.
-  sessionSummaryEnabled?: boolean; // Summary generator surface flag. This does not wire prompt/recall/retain consumption by itself.
-  sessionSummaryEnrichRecallQuery?: boolean; // Future summary recall-query enrichment flag. Default: false; no lifecycle wiring in this stage.
-  sessionSummaryEnrichRetainContext?: boolean; // Future summary retain-context enrichment flag. Default: false; no lifecycle wiring in this stage.
-  sessionSummaryInjectPrompt?: boolean; // Future prompt summary block flag. Default: false; no lifecycle wiring in this stage.
-  sessionSummaryGeneratorProvider?: string; // Optional LLM provider for future real summary generation.
-  sessionSummaryGeneratorModel?: string; // Optional LLM model for future real summary generation.
-  sessionSummaryGeneratorBaseUrl?: string; // Optional OpenAI-compatible base URL for future real summary generation.
+  sessionSummaryEnabled?: boolean; // Enables rolling session summary lifecycle when at least one consumption/update flag is enabled.
+  sessionSummaryStorePath?: string; // Optional SQLite path for rolling session summaries. Default: ~/.openclaw/data/hindsight-session-summaries.sqlite.
+  sessionSummaryEnrichRecallQuery?: boolean; // Adds rolling summary text after the latest recall query while preserving recallMaxQueryChars. Default: false.
+  sessionSummaryEnrichRetainContext?: boolean; // Adds rolling summary text to retain extraction context, never transcript content. Default: false.
+  sessionSummaryInjectPrompt?: boolean; // Injects a separate <hindsight_session_summary> prompt block. Default: false.
+  sessionSummaryGeneratorProvider?: string; // Optional real generator request; currently records correct-course boundary and uses FakeSessionSummaryGenerator.
+  sessionSummaryGeneratorModel?: string; // Optional real generator model request; currently no-op without a stable OpenClaw LLM helper.
+  sessionSummaryGeneratorBaseUrl?: string; // Optional real generator base URL request; currently no-op without a stable OpenClaw LLM helper.
   sessionSummaryGeneratorApiKeyEnv?: string; // Env var name for summary generator API key. Default: HINDSIGHT_LLM_API_KEY.
   sessionSummaryReuseHindsightLlmConfig?: boolean; // Reuse llmProvider/llmModel/llmBaseUrl when summary fields are unset. Default: true.
   sessionSummaryUpdateEveryNTurns?: number; // Optional summary refresh cadence independent from retainEveryNTurns.
   sessionSummaryMinUpdateEveryNTurns?: number; // Minimum summary refresh cadence. Default: 2.
-  sessionSummaryTimeoutMs?: number; // Timeout for future background summary generation. Default: 20000.
+  sessionSummaryTimeoutMs?: number; // Timeout for bounded summary generation/update work. Default: 20000.
   sessionSummaryMaxInputChars?: number; // Max input chars for summary generation. Default: 16000.
   sessionSummaryMaxOutputChars?: number; // Max rendered summary chars. Default: 2000.
-  sessionSummaryMaxRecallQueryChars?: number; // Budget for future summary-derived recall query. Default: 800.
-  sessionSummaryRecallQueryBudgetRatio?: number; // Fraction of summary input budget available to future recall query text. Default: 0.25.
-  sessionSummaryMaxPromptInjectChars?: number; // Budget for future prompt-injected summary context. Default: 1200.
-  sessionSummaryMaxRetainContextChars?: number; // Budget for future retain context summary text. Default: 1200.
+  sessionSummaryMaxRecallQueryChars?: number; // Budget for summary-derived recall query text. Default: 800.
+  sessionSummaryRecallQueryBudgetRatio?: number; // Fraction of summary input budget available to recall query text. Default: 0.25.
+  sessionSummaryMaxPromptInjectChars?: number; // Budget for prompt-injected summary context. Default: 1200.
+  sessionSummaryMaxRetainContextChars?: number; // Budget for retain context summary text. Default: 1200.
   sessionSummaryMinLatestQueryReserveChars?: number; // Latest-query reserve during summary input trimming. Default: 400.
   sessionSummaryDropCompletedTodosAfterTurns?: number; // Completed todo retention horizon. Default: 20.
   ignoreSessionPatterns?: string[]; // Session key glob patterns to skip entirely (no recall, no retain). E.g. ["agent:main:**", "agent:*:cron:**"]

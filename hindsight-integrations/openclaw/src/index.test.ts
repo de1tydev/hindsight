@@ -1,5 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
+  default as hindsightOpenclawPlugin,
   stripMemoryTags,
   extractRecallQuery,
   formatCurrentTimeForRecall,
@@ -9,6 +13,7 @@ import {
   getRetentionTurnIndex,
   sliceLastTurnsByUserBoundary,
   composeRecallQuery,
+  composeRecallQueryLatestFirst,
   truncateRecallQuery,
   buildRetainRequest,
   meetsMinimumVersion,
@@ -25,9 +30,17 @@ import {
   stripInlineTimestampPrefix,
   getPluginConfig,
   formatHookPerf,
+  buildSessionSummaryIdentity,
+  getSessionSummaryBudgetFromConfig,
+  isSessionSummaryLifecycleActive,
   DEFAULT_RETAIN_CONTEXT,
 } from "./index.js";
-import type { PluginConfig, MemoryResult, MoltbotPluginAPI } from "./types.js";
+import type {
+  PluginConfig,
+  MemoryResult,
+  MoltbotPluginAPI,
+  PluginHookAgentContext,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
 // stripMemoryTags
@@ -997,6 +1010,21 @@ describe("composeRecallQuery", () => {
   });
 });
 
+describe("composeRecallQueryLatestFirst", () => {
+  it("puts the latest query before prior context for summary-enriched recall", () => {
+    const messages = [
+      { role: "user", content: "I work on project zephyr." },
+      { role: "assistant", content: "Noted." },
+      { role: "user", content: "What project am I working on?" },
+    ];
+
+    const query = composeRecallQueryLatestFirst("What project am I working on?", messages, 2);
+    expect(query.startsWith("What project am I working on?")).toBe(true);
+    expect(query).toContain("Prior context:");
+    expect(query).toContain("user: I work on project zephyr.");
+  });
+});
+
 describe("truncateRecallQuery", () => {
   it("keeps query unchanged when under max", () => {
     const query = "short query";
@@ -1383,6 +1411,52 @@ function makeApi(rawConfig: Record<string, unknown>): MoltbotPluginAPI {
   } as unknown as MoltbotPluginAPI;
 }
 
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function makeHookApi(rawConfig: Record<string, unknown>): {
+  api: MoltbotPluginAPI;
+  trigger(eventName: string, event: unknown, ctx?: PluginHookAgentContext): Promise<unknown>;
+  stop(): Promise<void>;
+} {
+  const handlers = new Map<
+    string,
+    Array<(event: unknown, ctx?: PluginHookAgentContext) => unknown>
+  >();
+  const services: Array<{ stop(): Promise<void> }> = [];
+  const api = {
+    config: { plugins: { entries: { "hindsight-openclaw": { config: rawConfig } } } },
+    registerService: (svc: { stop(): Promise<void> }) => services.push(svc),
+    on: (eventName: string, handler: (event: unknown, ctx?: PluginHookAgentContext) => unknown) => {
+      const current = handlers.get(eventName) ?? [];
+      current.push(handler);
+      handlers.set(eventName, current);
+    },
+    logger: { info: () => undefined, warn: () => undefined, error: () => undefined },
+  } as unknown as MoltbotPluginAPI;
+  return {
+    api,
+    async trigger(eventName, event, ctx) {
+      let result: unknown;
+      for (const handler of handlers.get(eventName) ?? []) {
+        result = await handler(event, ctx);
+      }
+      return result;
+    },
+    async stop() {
+      for (const service of services) {
+        await service.stop().catch(() => undefined);
+      }
+    },
+  };
+}
+
 describe("getPluginConfig — session summary generator", () => {
   it("defaults summary cadence and budgets without enabling lifecycle behavior", () => {
     const cfg = getPluginConfig(makeApi({ retainEveryNTurns: 1 }));
@@ -1391,6 +1465,7 @@ describe("getPluginConfig — session summary generator", () => {
     expect(cfg.retainOverlapTurns).toBe(0);
     expect(cfg.recallContextTurns).toBe(1);
     expect(cfg.sessionSummaryEnabled).toBe(false);
+    expect(cfg.sessionSummaryStorePath).toBeUndefined();
     expect(cfg.sessionSummaryEnrichRecallQuery).toBe(false);
     expect(cfg.sessionSummaryEnrichRetainContext).toBe(false);
     expect(cfg.sessionSummaryInjectPrompt).toBe(false);
@@ -1417,6 +1492,7 @@ describe("getPluginConfig — session summary generator", () => {
         retainOverlapTurns: 2,
         recallContextTurns: 3,
         sessionSummaryEnabled: true,
+        sessionSummaryStorePath: "/tmp/hindsight-summary.sqlite",
         sessionSummaryEnrichRecallQuery: true,
         sessionSummaryEnrichRetainContext: true,
         sessionSummaryInjectPrompt: true,
@@ -1443,6 +1519,7 @@ describe("getPluginConfig — session summary generator", () => {
     expect(cfg.retainOverlapTurns).toBe(2);
     expect(cfg.recallContextTurns).toBe(3);
     expect(cfg.sessionSummaryEnabled).toBe(true);
+    expect(cfg.sessionSummaryStorePath).toBe("/tmp/hindsight-summary.sqlite");
     expect(cfg.sessionSummaryEnrichRecallQuery).toBe(true);
     expect(cfg.sessionSummaryEnrichRetainContext).toBe(true);
     expect(cfg.sessionSummaryInjectPrompt).toBe(true);
@@ -1477,6 +1554,105 @@ describe("getPluginConfig — session summary generator", () => {
     expect(cfg.sessionSummaryGeneratorProvider).toBe("openai");
     expect(cfg.sessionSummaryGeneratorModel).toBe("base-model");
     expect(cfg.sessionSummaryGeneratorBaseUrl).toBe("http://base.example/v1");
+  });
+});
+
+describe("session summary lifecycle helpers", () => {
+  it("is inactive unless enabled and at least one consumption or update flag is set", () => {
+    expect(isSessionSummaryLifecycleActive({ sessionSummaryEnabled: true })).toBe(false);
+    expect(
+      isSessionSummaryLifecycleActive({
+        sessionSummaryEnabled: true,
+        sessionSummaryInjectPrompt: true,
+      })
+    ).toBe(true);
+    expect(
+      isSessionSummaryLifecycleActive({
+        sessionSummaryEnabled: true,
+        sessionSummaryUpdateEveryNTurns: 4,
+      })
+    ).toBe(true);
+  });
+
+  it("derives a stable summary key from bank identity and session key", () => {
+    const identity = buildSessionSummaryIdentity(
+      {
+        agentId: "main",
+        messageProvider: "telegram",
+        channelId: "direct:U123",
+        senderId: "U123",
+        sessionKey: "agent:main:telegram:direct:U123",
+      },
+      { dynamicBankId: true }
+    );
+
+    expect(identity.identityScope).toBe("main::direct%3AU123::U123");
+    expect(identity.summaryKey).toContain("openclaw:");
+    expect(identity.summaryKey).toContain("agent:main:telegram:direct:U123");
+  });
+
+  it("maps plugin summary budget config to generator budget", () => {
+    const budget = getSessionSummaryBudgetFromConfig({
+      sessionSummaryMaxInputChars: 500,
+      sessionSummaryMaxRecallQueryChars: 100,
+      sessionSummaryRecallQueryBudgetRatio: 0.2,
+      sessionSummaryMaxPromptInjectChars: 80,
+      sessionSummaryMaxRetainContextChars: 90,
+    });
+
+    expect(budget.maxInputChars).toBe(500);
+    expect(budget.maxRecallQueryChars).toBe(100);
+    expect(budget.recallQueryBudgetRatio).toBe(0.2);
+    expect(budget.maxPromptInjectChars).toBe(80);
+    expect(budget.maxRetainContextChars).toBe(90);
+  });
+});
+
+describe("session summary hook lifecycle", () => {
+  it("updates a fake rolling summary on agent_end and injects it before prompt build without recall", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-"));
+    tempDirs.push(dir);
+    const handle = makeHookApi({
+      autoRecall: false,
+      autoRetain: false,
+      dynamicBankId: true,
+      sessionSummaryEnabled: true,
+      sessionSummaryInjectPrompt: true,
+      sessionSummaryStorePath: join(dir, "summary.sqlite"),
+    });
+    hindsightOpenclawPlugin(handle.api);
+
+    const ctx: PluginHookAgentContext = {
+      agentId: "main",
+      messageProvider: "telegram",
+      channelId: "direct:U777",
+      senderId: "U777",
+      sessionKey: "agent:main:telegram:direct:U777",
+    };
+    await handle.trigger(
+      "agent_end",
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "I work on project zephyr." },
+          { role: "assistant", content: "Noted." },
+          { role: "user", content: "We decided to use TypeScript for project zephyr." },
+        ],
+      },
+      ctx
+    );
+
+    const result = (await handle.trigger(
+      "before_prompt_build",
+      { rawMessage: "What did we decide?", prompt: "What did we decide?", messages: [] },
+      ctx
+    )) as { prependSystemContext?: string; prependContext?: string } | undefined;
+
+    expect(result?.prependContext).toBeUndefined();
+    expect(result?.prependSystemContext).toContain("<hindsight_session_summary>");
+    expect(result?.prependSystemContext).toContain("project zephyr");
+    expect(result?.prependSystemContext).not.toContain("<hindsight_memories>");
+    await handle.stop();
   });
 });
 

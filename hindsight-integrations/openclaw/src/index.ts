@@ -1,5 +1,6 @@
 import type {
   MoltbotPluginAPI,
+  PluginPromptHookResult,
   PluginConfig,
   PluginHookAgentContext,
   PluginToolContext,
@@ -10,6 +11,21 @@ import { HindsightServer, type Logger } from "@vectorize-io/hindsight-all";
 import { HindsightClient, type HindsightClientOptions } from "@vectorize-io/hindsight-client";
 import { RetainQueue } from "./retain-queue.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
+import { SessionSummaryStore, type SessionSummaryRecord } from "./session-summary-store.js";
+import {
+  buildSessionSummaryBudgetedText,
+  DEFAULT_SESSION_SUMMARY_BUDGET,
+  FakeSessionSummaryGenerator,
+  shouldUpdateSessionSummary,
+  type SessionSummaryBudget,
+  type SessionSummaryGenerator,
+  type SessionSummaryResult,
+} from "./session-summary-generator.js";
+import {
+  buildSummaryRetainContext,
+  composeSummaryRecallQuery,
+  renderSummaryPromptBlock,
+} from "./session-summary-assembly.js";
 import { createHash } from "crypto";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -249,6 +265,13 @@ function toStringMetadata(
 const turnCountBySession = new Map<string, number>();
 const MAX_TRACKED_SESSIONS = 10_000;
 const DEFAULT_RECALL_TIMEOUT_MS = 10_000;
+const DEFAULT_SESSION_SUMMARY_STORE_PATH = join(
+  homedir(),
+  ".openclaw",
+  "data",
+  "hindsight-session-summaries.sqlite"
+);
+const DEFAULT_SERVICE_STOP_FLUSH_TIMEOUT_MS = 2_000;
 
 type SessionIdentityRecord = Pick<
   PluginHookAgentContext,
@@ -275,6 +298,14 @@ let retainQueue: RetainQueue | null = null;
 let retainQueueFlushTimer: ReturnType<typeof setInterval> | null = null;
 let isFlushInProgress = false;
 const DEFAULT_FLUSH_INTERVAL_MS = 60_000; // 1 min
+
+// Rolling session summary state. OpenClaw does not currently expose a stable
+// plugin-side LLM helper, so this stage intentionally uses the fake generator
+// until a correct-course plan introduces a real provider contract.
+let sessionSummaryStore: SessionSummaryStore | null = null;
+let sessionSummaryStorePath: string | null = null;
+let sessionSummaryGenerator: SessionSummaryGenerator | null = null;
+let loggedSessionSummaryGeneratorBoundary = false;
 
 /**
  * Attempt to flush pending retains from the queue.
@@ -329,6 +360,345 @@ async function flushRetainQueue(): Promise<void> {
   } finally {
     isFlushInProgress = false;
   }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  const timeout = Math.max(1, Math.trunc(timeoutMs || 1));
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new DOMException(`${label} timed out after ${timeout}ms`, "TimeoutError")),
+        timeout
+      )
+    ),
+  ]);
+}
+
+export function isSessionSummaryLifecycleActive(config: PluginConfig): boolean {
+  return (
+    config.sessionSummaryEnabled === true &&
+    (config.sessionSummaryEnrichRecallQuery === true ||
+      config.sessionSummaryEnrichRetainContext === true ||
+      config.sessionSummaryInjectPrompt === true ||
+      typeof config.sessionSummaryUpdateEveryNTurns === "number")
+  );
+}
+
+export function getSessionSummaryBudgetFromConfig(config: PluginConfig): SessionSummaryBudget {
+  return {
+    ...DEFAULT_SESSION_SUMMARY_BUDGET,
+    maxInputChars:
+      config.sessionSummaryMaxInputChars ?? DEFAULT_SESSION_SUMMARY_BUDGET.maxInputChars,
+    maxOutputChars:
+      config.sessionSummaryMaxOutputChars ?? DEFAULT_SESSION_SUMMARY_BUDGET.maxOutputChars,
+    maxRecallQueryChars:
+      config.sessionSummaryMaxRecallQueryChars ??
+      DEFAULT_SESSION_SUMMARY_BUDGET.maxRecallQueryChars,
+    recallQueryBudgetRatio:
+      config.sessionSummaryRecallQueryBudgetRatio ??
+      DEFAULT_SESSION_SUMMARY_BUDGET.recallQueryBudgetRatio,
+    maxPromptInjectChars:
+      config.sessionSummaryMaxPromptInjectChars ??
+      DEFAULT_SESSION_SUMMARY_BUDGET.maxPromptInjectChars,
+    maxRetainContextChars:
+      config.sessionSummaryMaxRetainContextChars ??
+      DEFAULT_SESSION_SUMMARY_BUDGET.maxRetainContextChars,
+    minLatestQueryReserveChars:
+      config.sessionSummaryMinLatestQueryReserveChars ??
+      DEFAULT_SESSION_SUMMARY_BUDGET.minLatestQueryReserveChars,
+    dropCompletedTodosAfterTurns:
+      config.sessionSummaryDropCompletedTodosAfterTurns ??
+      DEFAULT_SESSION_SUMMARY_BUDGET.dropCompletedTodosAfterTurns,
+  };
+}
+
+function ensureSessionSummaryStore(config: PluginConfig): SessionSummaryStore | null {
+  if (!isSessionSummaryLifecycleActive(config)) return null;
+  const dbPath =
+    typeof config.sessionSummaryStorePath === "string" &&
+    config.sessionSummaryStorePath.trim().length > 0
+      ? config.sessionSummaryStorePath.trim()
+      : DEFAULT_SESSION_SUMMARY_STORE_PATH;
+  if (sessionSummaryStore && sessionSummaryStorePath === dbPath) return sessionSummaryStore;
+  closeSessionSummaryStore();
+  try {
+    sessionSummaryStore = new SessionSummaryStore({
+      dbPath,
+    });
+    sessionSummaryStorePath = dbPath;
+    return sessionSummaryStore;
+  } catch (err) {
+    log.warn(`session summary store unavailable; summary lifecycle no-op: ${err}`);
+    return null;
+  }
+}
+
+function ensureSessionSummaryGenerator(config: PluginConfig): SessionSummaryGenerator | null {
+  if (!isSessionSummaryLifecycleActive(config)) return null;
+  if (!loggedSessionSummaryGeneratorBoundary) {
+    const requestedRealGenerator =
+      config.sessionSummaryGeneratorProvider ||
+      config.sessionSummaryGeneratorModel ||
+      config.sessionSummaryGeneratorBaseUrl;
+    if (requestedRealGenerator) {
+      log.warn(
+        "session summary real generator config is present, but OpenClaw has no stable plugin-side LLM helper; using FakeSessionSummaryGenerator pending correct-course"
+      );
+    }
+    loggedSessionSummaryGeneratorBoundary = true;
+  }
+  if (!sessionSummaryGenerator) {
+    sessionSummaryGenerator = new FakeSessionSummaryGenerator();
+  }
+  return sessionSummaryGenerator;
+}
+
+function closeSessionSummaryStore(): void {
+  if (!sessionSummaryStore) return;
+  try {
+    sessionSummaryStore.close();
+  } catch (err) {
+    log.warn(`session summary store close failed: ${err}`);
+  } finally {
+    sessionSummaryStore = null;
+    sessionSummaryStorePath = null;
+    sessionSummaryGenerator = null;
+  }
+}
+
+export function buildSessionSummaryIdentity(
+  resolvedCtx: PluginHookAgentContext | undefined,
+  config: PluginConfig
+): { summaryKey: string; identityScope: string } {
+  const bankId = deriveBankId(resolvedCtx, config);
+  const sessionPart = sanitizeDocumentIdPart(resolvedCtx?.sessionKey, "session");
+  const bankPart = sanitizeDocumentIdPart(bankId, "bank");
+  return {
+    identityScope: bankId,
+    summaryKey: `openclaw:${bankPart}:${sessionPart}`,
+  };
+}
+
+function readSessionSummary(
+  resolvedCtx: PluginHookAgentContext | undefined,
+  config: PluginConfig
+): SessionSummaryRecord | null {
+  const store = ensureSessionSummaryStore(config);
+  if (!store) return null;
+  try {
+    return store.get(buildSessionSummaryIdentity(resolvedCtx, config).summaryKey);
+  } catch (err) {
+    log.warn(`session summary read failed; continuing without summary: ${err}`);
+    return null;
+  }
+}
+
+function summaryJsonObject(record: SessionSummaryRecord | null): Record<string, unknown> | null {
+  if (
+    !record?.summaryJson ||
+    typeof record.summaryJson !== "object" ||
+    Array.isArray(record.summaryJson)
+  ) {
+    return null;
+  }
+  return record.summaryJson as Record<string, unknown>;
+}
+
+function getSessionSummarySurfaceText(
+  record: SessionSummaryRecord | null,
+  config: PluginConfig,
+  surface: "recall" | "prompt" | "retain"
+): string {
+  if (!record || record.status !== "ready") return "";
+  const budget = getSessionSummaryBudgetFromConfig(config);
+  const json = summaryJsonObject(record);
+  if (json) {
+    const rendered = buildSessionSummaryBudgetedText(json, budget);
+    if (surface === "recall") return rendered.recallQueryText;
+    if (surface === "prompt") return rendered.promptInjectText;
+    return rendered.retainContextText;
+  }
+  const maxChars =
+    surface === "recall"
+      ? budget.maxRecallQueryChars
+      : surface === "prompt"
+        ? budget.maxPromptInjectChars
+        : budget.maxRetainContextChars;
+  return record.summaryText.slice(0, Math.max(0, maxChars)).trim();
+}
+
+function latestUserText(messages: any[]): string {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role !== "user") continue;
+    if (typeof msg.content === "string") {
+      return stripMetadataEnvelopes(stripMemoryTags(msg.content)).trim();
+    }
+    if (Array.isArray(msg.content)) {
+      return msg.content
+        .filter((block: any) => block?.type === "text" && typeof block?.text === "string")
+        .map((block: any) => stripMetadataEnvelopes(stripMemoryTags(block.text)).trim())
+        .filter(Boolean)
+        .join("\n");
+    }
+  }
+  return "";
+}
+
+function normalizeSummaryMessages(messages: any[]): Array<Record<string, unknown>> {
+  if (!Array.isArray(messages)) return [];
+  return messages.map((msg) => {
+    let content = "";
+    if (typeof msg?.content === "string") {
+      content = msg.content;
+    } else if (Array.isArray(msg?.content)) {
+      content = msg.content
+        .filter((block: any) => block?.type === "text" && typeof block?.text === "string")
+        .map((block: any) => block.text)
+        .join("\n");
+    }
+    return {
+      role: msg?.role,
+      content: stripInlineTimestampPrefix(
+        stripMetadataEnvelopes(stripInlineRetainTags(stripMemoryTags(content)))
+      ),
+      timestamp: normalizeMessageTimestamp(msg),
+    };
+  });
+}
+
+function stableHash(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+async function updateSessionSummaryForMessages(input: {
+  messages: any[];
+  resolvedCtx: PluginHookAgentContext | undefined;
+  config: PluginConfig;
+  force?: boolean;
+  latestQuery?: string;
+}): Promise<SessionSummaryRecord | null> {
+  const config = input.config;
+  if (!isSessionSummaryLifecycleActive(config)) return null;
+  const store = ensureSessionSummaryStore(config);
+  const generator = ensureSessionSummaryGenerator(config);
+  if (!store || !generator) return readSessionSummary(input.resolvedCtx, config);
+
+  const turnIndex = countUserTurns(input.messages);
+  const existing = readSessionSummary(input.resolvedCtx, config);
+  if (turnIndex <= 0) return existing;
+  if (input.force && existing && existing.turn >= turnIndex) return existing;
+  if (
+    !input.force &&
+    !shouldUpdateSessionSummary({
+      turnIndex,
+      retainEveryNTurns: config.retainEveryNTurns ?? 1,
+      retainOverlapTurns: config.retainOverlapTurns ?? 0,
+      recallContextTurns: config.recallContextTurns ?? 1,
+      updateEveryNTurns: config.sessionSummaryUpdateEveryNTurns,
+      minUpdateEveryNTurns: config.sessionSummaryMinUpdateEveryNTurns,
+    })
+  ) {
+    return existing;
+  }
+
+  const { summaryKey, identityScope } = buildSessionSummaryIdentity(input.resolvedCtx, config);
+  const messages = normalizeSummaryMessages(input.messages);
+  const latestQuery = input.latestQuery || latestUserText(input.messages);
+  const lastInputHash = stableHash({
+    messages,
+    latestQuery,
+    previousVersion: existing?.version ?? 0,
+    turnIndex,
+  });
+
+  let result: SessionSummaryResult;
+  try {
+    result = await withTimeout(
+      Promise.resolve(
+        generator.generate({
+          sessionId: summaryKey,
+          identityScope,
+          messages,
+          previousSummary: summaryJsonObject(existing),
+          latestQuery,
+          turnIndex,
+          metadata: {
+            source: "openclaw",
+            sessionKey: input.resolvedCtx?.sessionKey,
+            provider: input.resolvedCtx?.messageProvider,
+            channelId: input.resolvedCtx?.channelId,
+            senderId: input.resolvedCtx?.senderId,
+          },
+          budget: getSessionSummaryBudgetFromConfig(config),
+        })
+      ),
+      config.sessionSummaryTimeoutMs ?? 20_000,
+      "session summary generation"
+    );
+  } catch (err) {
+    result = {
+      summaryJson: summaryJsonObject(existing) ?? {},
+      summaryText: existing?.summaryText ?? "",
+      schemaVersion: existing?.schemaVersion ?? 1,
+      status: "error",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  try {
+    const write = store.upsert({
+      summaryKey,
+      identityScope,
+      summaryJson: result.summaryJson,
+      summaryText: result.status === "ready" ? result.summaryText : (existing?.summaryText ?? ""),
+      schemaVersion: result.schemaVersion,
+      turn: turnIndex,
+      turnHash: stableHash({ turnIndex, messages }),
+      lastInputHash,
+      parentSummaryKey: existing?.parentSummaryKey ?? null,
+      status: result.status,
+      lastError: result.status === "error" ? (result.error ?? "session summary error") : null,
+      expectedVersion: existing?.version ?? 0,
+    });
+    if (write.stale) {
+      return store.get(summaryKey);
+    }
+    return write.record ?? existing;
+  } catch (err) {
+    log.warn(`session summary write failed; continuing without update: ${err}`);
+    return existing;
+  }
+}
+
+function mergePromptHookResult(input: {
+  memoryBlock?: string;
+  summaryBlock?: string;
+  memoryPosition?: PluginConfig["recallInjectionPosition"];
+}): PluginPromptHookResult | undefined {
+  const result: PluginPromptHookResult = {};
+  const summaryBlock = input.summaryBlock?.trim();
+  if (summaryBlock) result.prependSystemContext = summaryBlock;
+
+  const memoryBlock = input.memoryBlock?.trim();
+  if (memoryBlock) {
+    const position = input.memoryPosition || "prepend";
+    if (position === "append") {
+      result.appendSystemContext = memoryBlock;
+    } else if (position === "user") {
+      result.prependContext = memoryBlock;
+    } else {
+      result.prependSystemContext = result.prependSystemContext
+        ? `${result.prependSystemContext}\n\n${memoryBlock}`
+        : memoryBlock;
+    }
+  }
+
+  return result.prependSystemContext || result.appendSystemContext || result.prependContext
+    ? result
+    : undefined;
 }
 
 const DEFAULT_RECALL_PROMPT_PREAMBLE =
@@ -736,6 +1106,42 @@ export function composeRecallQuery(
   }
 
   return ["Prior context:", contextLines.join("\n"), latest].join("\n\n");
+}
+
+export function composeRecallQueryLatestFirst(
+  latestQuery: string,
+  messages: any[] | undefined,
+  recallContextTurns: number,
+  recallRoles: Array<"user" | "assistant" | "system" | "tool"> = ["user", "assistant"]
+): string {
+  const latest = latestQuery.trim();
+  if (recallContextTurns <= 1 || !Array.isArray(messages) || messages.length === 0) {
+    return latest;
+  }
+
+  const allowedRoles = new Set(recallRoles);
+  const contextualMessages = sliceLastTurnsByUserBoundary(messages, recallContextTurns);
+  const contextLines = contextualMessages
+    .map((msg: any) => {
+      const role = msg?.role;
+      if (!allowedRoles.has(role)) return null;
+      const content =
+        typeof msg?.content === "string"
+          ? msg.content
+          : Array.isArray(msg?.content)
+            ? msg.content
+                .filter((block: any) => block?.type === "text" && typeof block?.text === "string")
+                .map((block: any) => block.text)
+                .join("\n")
+            : "";
+      const cleaned = stripMetadataEnvelopes(stripMemoryTags(content)).trim();
+      if (!cleaned || (role === "user" && cleaned === latest)) return null;
+      return `${role}: ${cleaned}`;
+    })
+    .filter((line: string | null): line is string => Boolean(line));
+
+  if (contextLines.length === 0) return latest;
+  return [latest, "Prior context:", contextLines.join("\n")].join("\n\n");
 }
 
 export function truncateRecallQuery(query: string, latestQuery: string, maxChars: number): string {
@@ -1538,6 +1944,11 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         ? config.recallTimeoutMs
         : undefined,
     sessionSummaryEnabled: config.sessionSummaryEnabled === true,
+    sessionSummaryStorePath:
+      typeof config.sessionSummaryStorePath === "string" &&
+      config.sessionSummaryStorePath.trim().length > 0
+        ? config.sessionSummaryStorePath.trim()
+        : undefined,
     sessionSummaryEnrichRecallQuery: config.sessionSummaryEnrichRecallQuery === true,
     sessionSummaryEnrichRetainContext: config.sessionSummaryEnrichRetainContext === true,
     sessionSummaryInjectPrompt: config.sessionSummaryInjectPrompt === true,
@@ -1711,6 +2122,12 @@ export default function (api: MoltbotPluginAPI) {
           debug(
             `[Hindsight] Custom bank mission configured: "${pluginConfig.bankMission.substring(0, 50)}..."`
           );
+        }
+
+        if (isSessionSummaryLifecycleActive(pluginConfig)) {
+          ensureSessionSummaryStore(pluginConfig);
+          ensureSessionSummaryGenerator(pluginConfig);
+          debug("[Hindsight] Session summary lifecycle enabled");
         }
 
         // Log bank ID mode
@@ -2026,6 +2443,17 @@ export default function (api: MoltbotPluginAPI) {
             clearInterval(retainQueueFlushTimer);
             retainQueueFlushTimer = null;
           }
+          if (retainQueue && retainQueue.size() > 0 && client) {
+            await withTimeout(
+              flushRetainQueue().catch((err) => {
+                log.warn(`retain queue stop flush failed: ${err}`);
+              }),
+              DEFAULT_SERVICE_STOP_FLUSH_TIMEOUT_MS,
+              "retain queue stop flush"
+            ).catch((err) => {
+              log.warn(`retain queue stop flush bounded: ${err}`);
+            });
+          }
           if (retainQueue) {
             const pending = retainQueue.size();
             if (pending > 0) {
@@ -2041,6 +2469,7 @@ export default function (api: MoltbotPluginAPI) {
           clientOptions = null;
           banksWithMissionSet.clear();
           isInitialized = false;
+          closeSessionSummaryStore();
 
           stopLogger();
           debug("[Hindsight] Service stopped");
@@ -2157,12 +2586,6 @@ export default function (api: MoltbotPluginAPI) {
           }
         }
 
-        // Skip auto-recall when disabled (agent has its own recall tool)
-        if (!pluginConfig.autoRecall) {
-          debug("[Hindsight] Auto-recall disabled via config, skipping");
-          return;
-        }
-
         const sessionKeyForCache =
           ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
         const skipTurnReason = sessionKeyForCache
@@ -2194,6 +2617,29 @@ export default function (api: MoltbotPluginAPI) {
           return;
         }
 
+        const summaryRecord = readSessionSummary(resolvedCtxForRecall, pluginConfig);
+        const summaryPromptBlock =
+          pluginConfig.sessionSummaryInjectPrompt === true
+            ? renderSummaryPromptBlock({
+                summaryText: getSessionSummarySurfaceText(summaryRecord, pluginConfig, "prompt"),
+                maxChars:
+                  pluginConfig.sessionSummaryMaxPromptInjectChars ??
+                  DEFAULT_SESSION_SUMMARY_BUDGET.maxPromptInjectChars,
+              })
+            : "";
+        const summaryOnlyResult = () =>
+          mergePromptHookResult({
+            summaryBlock: summaryPromptBlock,
+            memoryPosition: pluginConfig.recallInjectionPosition,
+          });
+
+        // Skip auto-recall when disabled (agent has its own recall tool). Prompt
+        // summary injection is independent from recall and remains available.
+        if (!pluginConfig.autoRecall) {
+          debug("[Hindsight] Auto-recall disabled via config, skipping");
+          return summaryOnlyResult();
+        }
+
         const bankId = deriveBankId(resolvedCtxForRecall, pluginConfig);
         debug(
           `[Hindsight] before_prompt_build - bank: ${bankId}, channel: ${resolvedCtxForRecall?.messageProvider}/${resolvedCtxForRecall?.channelId}`
@@ -2209,11 +2655,11 @@ export default function (api: MoltbotPluginAPI) {
         const extracted = extractRecallQuery(event.rawMessage, event.prompt);
         if (!extracted) {
           debug("[Hindsight] extractRecallQuery returned null, skipping recall");
-          return;
+          return summaryOnlyResult();
         }
         if (isEphemeralOperationalText(extracted)) {
           debug("[Hindsight] Recall query is operational/ephemeral noise, skipping recall");
-          return;
+          return summaryOnlyResult();
         }
         debug(`[Hindsight] extractRecallQuery result length: ${extracted.length}`);
         const recallContextTurns = pluginConfig.recallContextTurns ?? 1;
@@ -2229,13 +2675,24 @@ export default function (api: MoltbotPluginAPI) {
           );
         }
         const recallRoles = pluginConfig.recallRoles ?? ["user", "assistant"];
-        const composedPrompt = composeRecallQuery(
-          extracted,
-          sessionMessages,
-          recallContextTurns,
-          recallRoles
-        );
+        const composedPrompt =
+          pluginConfig.sessionSummaryEnrichRecallQuery === true
+            ? composeRecallQueryLatestFirst(
+                extracted,
+                sessionMessages,
+                recallContextTurns,
+                recallRoles
+              )
+            : composeRecallQuery(extracted, sessionMessages, recallContextTurns, recallRoles);
         let prompt = truncateRecallQuery(composedPrompt, extracted, recallMaxQueryChars);
+        if (pluginConfig.sessionSummaryEnrichRecallQuery === true) {
+          prompt = composeSummaryRecallQuery({
+            latestQuery: prompt,
+            summaryText: getSessionSummarySurfaceText(summaryRecord, pluginConfig, "recall"),
+            maxChars: recallMaxQueryChars,
+            budget: getSessionSummaryBudgetFromConfig(pluginConfig),
+          });
+        }
 
         // Final defensive cap
         if (prompt.length > recallMaxQueryChars) {
@@ -2246,7 +2703,7 @@ export default function (api: MoltbotPluginAPI) {
         const clientGlobal = (global as any).__hindsightClient;
         if (!clientGlobal) {
           debug("[Hindsight] Client global not available, skipping auto-recall");
-          return;
+          return summaryOnlyResult();
         }
 
         await clientGlobal.waitForReady();
@@ -2255,7 +2712,7 @@ export default function (api: MoltbotPluginAPI) {
         const client = await clientGlobal.getClientForContext(resolvedCtxForRecall);
         if (!client) {
           debug("[Hindsight] Client not initialized, skipping auto-recall");
-          return;
+          return summaryOnlyResult();
         }
 
         debug(`[Hindsight] Auto-recall for bank ${bankId}, full query:\n---\n${prompt}\n---`);
@@ -2299,7 +2756,7 @@ export default function (api: MoltbotPluginAPI) {
             );
           }
           debug("[Hindsight] No memories found for auto-recall");
-          return;
+          return summaryOnlyResult();
         }
 
         debug(
@@ -2339,17 +2796,14 @@ ${memoriesFormatted}
         }
 
         // Inject recalled memories. Position is configurable to preserve prompt caching
-        // when agents have large static system prompts.
-        const position = pluginConfig.recallInjectionPosition || "prepend";
-        switch (position) {
-          case "append":
-            return { appendSystemContext: contextMessage };
-          case "user":
-            return { prependContext: contextMessage };
-          case "prepend":
-          default:
-            return { prependSystemContext: contextMessage };
-        }
+        // when agents have large static system prompts. Rolling summary prompt
+        // context stays in a separate system block and never enters
+        // <hindsight_memories>.
+        return mergePromptHookResult({
+          memoryBlock: contextMessage,
+          summaryBlock: summaryPromptBlock,
+          memoryPosition: pluginConfig.recallInjectionPosition,
+        });
       } catch (error) {
         if (error instanceof DOMException && error.name === "TimeoutError") {
           log.warn(
@@ -2479,13 +2933,18 @@ ${memoriesFormatted}
           return;
         }
 
-        if (
-          !Array.isArray(event.context?.sessionEntry?.messages ?? event.messages) ||
-          (event.context?.sessionEntry?.messages ?? event.messages ?? []).length === 0
-        ) {
+        const allMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
+        if (!Array.isArray(allMessages) || allMessages.length === 0) {
           debug("[Hindsight Hook] No messages in event, skipping retention");
           return;
         }
+
+        let summaryRecordForRetain = await updateSessionSummaryForMessages({
+          messages: allMessages,
+          resolvedCtx: resolvedCtxForRetain,
+          config: pluginConfig,
+          force,
+        });
 
         if (pluginConfig.autoRetain === false) {
           debug("[Hindsight Hook] autoRetain is disabled, skipping retention");
@@ -2494,7 +2953,6 @@ ${memoriesFormatted}
 
         // Chunked retention: skip non-Nth turns and use a sliding window when firing
         const retainEveryN = pluginConfig.retainEveryNTurns ?? 1;
-        const allMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
         let messagesToRetain = allMessages;
         let retainFullWindow = false;
 
@@ -2634,6 +3092,21 @@ ${memoriesFormatted}
             appendSupported: supportsUpdateModeAppend,
           }
         );
+        if (pluginConfig.sessionSummaryEnrichRetainContext === true) {
+          summaryRecordForRetain =
+            summaryRecordForRetain ?? readSessionSummary(resolvedCtxForRetain, pluginConfig);
+          retainRequest.context = buildSummaryRetainContext({
+            baseContext: retainRequest.context,
+            summaryText: getSessionSummarySurfaceText(
+              summaryRecordForRetain,
+              pluginConfig,
+              "retain"
+            ),
+            maxChars:
+              pluginConfig.sessionSummaryMaxRetainContextChars ??
+              DEFAULT_SESSION_SUMMARY_BUDGET.maxRetainContextChars,
+          });
+        }
 
         // Retain to Hindsight
         debug(
