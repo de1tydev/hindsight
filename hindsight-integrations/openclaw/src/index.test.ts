@@ -1383,6 +1383,80 @@ function makeApi(rawConfig: Record<string, unknown>): MoltbotPluginAPI {
   } as unknown as MoltbotPluginAPI;
 }
 
+describe("getPluginConfig — session summary generator", () => {
+  it("defaults summary cadence and budgets without enabling lifecycle behavior", () => {
+    const cfg = getPluginConfig(makeApi({ retainEveryNTurns: 1 }));
+
+    expect(cfg.sessionSummaryEnabled).toBe(false);
+    expect(cfg.sessionSummaryUpdateEveryNTurns).toBeUndefined();
+    expect(cfg.sessionSummaryMinUpdateEveryNTurns).toBe(2);
+    expect(cfg.sessionSummaryTimeoutMs).toBe(20_000);
+    expect(cfg.sessionSummaryMaxInputChars).toBe(16_000);
+    expect(cfg.sessionSummaryMaxOutputChars).toBe(2_000);
+    expect(cfg.sessionSummaryMinLatestQueryReserveChars).toBe(400);
+  });
+
+  it("normalizes explicit summary model, cadence, and budget fields", () => {
+    const cfg = getPluginConfig(
+      makeApi({
+        llmProvider: "openai",
+        llmModel: "base-model",
+        llmBaseUrl: "http://base.example/v1",
+        sessionSummaryEnabled: true,
+        sessionSummaryGeneratorProvider: "openai-compatible",
+        sessionSummaryGeneratorModel: "summary-model",
+        sessionSummaryGeneratorBaseUrl: "http://summary.example/v1",
+        sessionSummaryGeneratorApiKeyEnv: "SUMMARY_API_KEY",
+        sessionSummaryReuseHindsightLlmConfig: false,
+        sessionSummaryUpdateEveryNTurns: 7,
+        sessionSummaryMinUpdateEveryNTurns: 3,
+        sessionSummaryTimeoutMs: 9_000,
+        sessionSummaryMaxInputChars: 1234,
+        sessionSummaryMaxOutputChars: 432,
+        sessionSummaryMaxRecallQueryChars: 321,
+        sessionSummaryRecallQueryBudgetRatio: 2,
+        sessionSummaryMaxPromptInjectChars: 222,
+        sessionSummaryMaxRetainContextChars: 333,
+        sessionSummaryMinLatestQueryReserveChars: 111,
+        sessionSummaryDropCompletedTodosAfterTurns: 5,
+      })
+    );
+
+    expect(cfg.sessionSummaryEnabled).toBe(true);
+    expect(cfg.sessionSummaryGeneratorProvider).toBe("openai-compatible");
+    expect(cfg.sessionSummaryGeneratorModel).toBe("summary-model");
+    expect(cfg.sessionSummaryGeneratorBaseUrl).toBe("http://summary.example/v1");
+    expect(cfg.sessionSummaryGeneratorApiKeyEnv).toBe("SUMMARY_API_KEY");
+    expect(cfg.sessionSummaryReuseHindsightLlmConfig).toBe(false);
+    expect(cfg.sessionSummaryUpdateEveryNTurns).toBe(7);
+    expect(cfg.sessionSummaryMinUpdateEveryNTurns).toBe(3);
+    expect(cfg.sessionSummaryTimeoutMs).toBe(9_000);
+    expect(cfg.sessionSummaryMaxInputChars).toBe(1234);
+    expect(cfg.sessionSummaryMaxOutputChars).toBe(432);
+    expect(cfg.sessionSummaryMaxRecallQueryChars).toBe(321);
+    expect(cfg.sessionSummaryRecallQueryBudgetRatio).toBe(1);
+    expect(cfg.sessionSummaryMaxPromptInjectChars).toBe(222);
+    expect(cfg.sessionSummaryMaxRetainContextChars).toBe(333);
+    expect(cfg.sessionSummaryMinLatestQueryReserveChars).toBe(111);
+    expect(cfg.sessionSummaryDropCompletedTodosAfterTurns).toBe(5);
+  });
+
+  it("can reuse existing Hindsight LLM config when summary fields are absent", () => {
+    const cfg = getPluginConfig(
+      makeApi({
+        llmProvider: "openai",
+        llmModel: "base-model",
+        llmBaseUrl: "http://base.example/v1",
+      })
+    );
+
+    expect(cfg.sessionSummaryReuseHindsightLlmConfig).toBe(true);
+    expect(cfg.sessionSummaryGeneratorProvider).toBe("openai");
+    expect(cfg.sessionSummaryGeneratorModel).toBe("base-model");
+    expect(cfg.sessionSummaryGeneratorBaseUrl).toBe("http://base.example/v1");
+  });
+});
+
 describe("getPluginConfig — retainQueue whitelist (#1443)", () => {
   it("passes retainQueuePath through when set to a non-empty string", () => {
     const cfg = getPluginConfig(makeApi({ retainQueuePath: "/custom/path/retain.jsonl" }));

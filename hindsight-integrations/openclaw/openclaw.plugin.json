@@ -257,6 +257,99 @@
         "description": "Where to inject recalled memories. 'prepend' = start of system prompt (default), 'append' = end of system prompt (preserves prompt cache), 'user' = before user message.",
         "default": "prepend"
       },
+      "sessionSummaryEnabled": {
+        "type": "boolean",
+        "description": "Enable the structured session summary generator surface. This does not inject summaries, enrich recall, enrich retain, or add lifecycle hooks by itself.",
+        "default": false
+      },
+      "sessionSummaryGeneratorProvider": {
+        "type": "string",
+        "description": "Optional LLM provider for future real summary generation."
+      },
+      "sessionSummaryGeneratorModel": {
+        "type": "string",
+        "description": "Optional LLM model for future real summary generation."
+      },
+      "sessionSummaryGeneratorBaseUrl": {
+        "type": "string",
+        "description": "Optional OpenAI-compatible base URL for future real summary generation."
+      },
+      "sessionSummaryGeneratorApiKeyEnv": {
+        "type": "string",
+        "description": "Environment variable name for the summary generator API key.",
+        "default": "HINDSIGHT_LLM_API_KEY"
+      },
+      "sessionSummaryReuseHindsightLlmConfig": {
+        "type": "boolean",
+        "description": "Reuse llmProvider, llmModel, and llmBaseUrl when summary-specific fields are unset.",
+        "default": true
+      },
+      "sessionSummaryUpdateEveryNTurns": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Optional summary refresh cadence independent from retainEveryNTurns."
+      },
+      "sessionSummaryMinUpdateEveryNTurns": {
+        "type": "integer",
+        "minimum": 2,
+        "description": "Minimum summary refresh cadence; prevents per-turn summary LLM calls by default.",
+        "default": 2
+      },
+      "sessionSummaryTimeoutMs": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Timeout for future background summary generation.",
+        "default": 20000
+      },
+      "sessionSummaryMaxInputChars": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Maximum characters considered by summary generation.",
+        "default": 16000
+      },
+      "sessionSummaryMaxOutputChars": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Maximum rendered summary characters.",
+        "default": 2000
+      },
+      "sessionSummaryMaxRecallQueryChars": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Budget for future summary-derived recall query text.",
+        "default": 800
+      },
+      "sessionSummaryRecallQueryBudgetRatio": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "description": "Maximum fraction of the summary input budget usable for future recall query text.",
+        "default": 0.25
+      },
+      "sessionSummaryMaxPromptInjectChars": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Budget for future prompt-injected summary context.",
+        "default": 1200
+      },
+      "sessionSummaryMaxRetainContextChars": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Budget for future retain context summary text.",
+        "default": 1200
+      },
+      "sessionSummaryMinLatestQueryReserveChars": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Latest-query reserve when trimming summary inputs.",
+        "default": 400
+      },
+      "sessionSummaryDropCompletedTodosAfterTurns": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Age after which completed todos may be dropped from summaries.",
+        "default": 20
+      },
       "debug": {
         "type": "boolean",
         "description": "Enable debug logging for Hindsight plugin operations. Equivalent to logLevel: 'debug'.",
@@ -485,6 +578,74 @@
     "recallInjectionPosition": {
       "label": "Recall Injection Position",
       "placeholder": "prepend, append, or user"
+    },
+    "sessionSummaryEnabled": {
+      "label": "Session Summary Enabled",
+      "placeholder": "false (generator surface only)"
+    },
+    "sessionSummaryGeneratorProvider": {
+      "label": "Summary Generator Provider",
+      "placeholder": "Optional provider for future summary generation"
+    },
+    "sessionSummaryGeneratorModel": {
+      "label": "Summary Generator Model",
+      "placeholder": "Optional model for future summary generation"
+    },
+    "sessionSummaryGeneratorBaseUrl": {
+      "label": "Summary Generator Base URL",
+      "placeholder": "Optional OpenAI-compatible base URL"
+    },
+    "sessionSummaryGeneratorApiKeyEnv": {
+      "label": "Summary Generator API Key Env",
+      "placeholder": "HINDSIGHT_LLM_API_KEY"
+    },
+    "sessionSummaryReuseHindsightLlmConfig": {
+      "label": "Reuse Hindsight LLM Config",
+      "placeholder": "true (default)"
+    },
+    "sessionSummaryUpdateEveryNTurns": {
+      "label": "Summary Update Every N Turns",
+      "placeholder": "Optional; independent from retain cadence"
+    },
+    "sessionSummaryMinUpdateEveryNTurns": {
+      "label": "Summary Minimum Update Cadence",
+      "placeholder": "2"
+    },
+    "sessionSummaryTimeoutMs": {
+      "label": "Summary Timeout (ms)",
+      "placeholder": "20000"
+    },
+    "sessionSummaryMaxInputChars": {
+      "label": "Summary Max Input Chars",
+      "placeholder": "16000"
+    },
+    "sessionSummaryMaxOutputChars": {
+      "label": "Summary Max Output Chars",
+      "placeholder": "2000"
+    },
+    "sessionSummaryMaxRecallQueryChars": {
+      "label": "Summary Recall Query Budget",
+      "placeholder": "800"
+    },
+    "sessionSummaryRecallQueryBudgetRatio": {
+      "label": "Summary Recall Query Ratio",
+      "placeholder": "0.25"
+    },
+    "sessionSummaryMaxPromptInjectChars": {
+      "label": "Summary Prompt Budget",
+      "placeholder": "1200"
+    },
+    "sessionSummaryMaxRetainContextChars": {
+      "label": "Summary Retain Context Budget",
+      "placeholder": "1200"
+    },
+    "sessionSummaryMinLatestQueryReserveChars": {
+      "label": "Summary Latest Query Reserve",
+      "placeholder": "400"
+    },
+    "sessionSummaryDropCompletedTodosAfterTurns": {
+      "label": "Summary Completed Todo Horizon",
+      "placeholder": "20"
     },
     "debug": {
       "label": "Debug"
