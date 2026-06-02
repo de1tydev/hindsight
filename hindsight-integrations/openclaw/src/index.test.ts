@@ -1391,6 +1391,9 @@ describe("getPluginConfig — session summary generator", () => {
     expect(cfg.retainOverlapTurns).toBe(0);
     expect(cfg.recallContextTurns).toBe(1);
     expect(cfg.sessionSummaryEnabled).toBe(false);
+    expect(cfg.sessionSummaryEnrichRecallQuery).toBe(false);
+    expect(cfg.sessionSummaryEnrichRetainContext).toBe(false);
+    expect(cfg.sessionSummaryInjectPrompt).toBe(false);
     expect(cfg.sessionSummaryUpdateEveryNTurns).toBeUndefined();
     expect(cfg.sessionSummaryMinUpdateEveryNTurns).toBe(2);
     expect(cfg.sessionSummaryTimeoutMs).toBe(20_000);
@@ -1414,6 +1417,9 @@ describe("getPluginConfig — session summary generator", () => {
         retainOverlapTurns: 2,
         recallContextTurns: 3,
         sessionSummaryEnabled: true,
+        sessionSummaryEnrichRecallQuery: true,
+        sessionSummaryEnrichRetainContext: true,
+        sessionSummaryInjectPrompt: true,
         sessionSummaryGeneratorProvider: "openai-compatible",
         sessionSummaryGeneratorModel: "summary-model",
         sessionSummaryGeneratorBaseUrl: "http://summary.example/v1",
@@ -1437,6 +1443,9 @@ describe("getPluginConfig — session summary generator", () => {
     expect(cfg.retainOverlapTurns).toBe(2);
     expect(cfg.recallContextTurns).toBe(3);
     expect(cfg.sessionSummaryEnabled).toBe(true);
+    expect(cfg.sessionSummaryEnrichRecallQuery).toBe(true);
+    expect(cfg.sessionSummaryEnrichRetainContext).toBe(true);
+    expect(cfg.sessionSummaryInjectPrompt).toBe(true);
     expect(cfg.sessionSummaryGeneratorProvider).toBe("openai-compatible");
     expect(cfg.sessionSummaryGeneratorModel).toBe("summary-model");
     expect(cfg.sessionSummaryGeneratorBaseUrl).toBe("http://summary.example/v1");

@@ -21,6 +21,7 @@ import { homedir } from "os";
 import { createKnowledgeTools, TOOL_NAMES } from "@vectorize-io/hindsight-agent-sdk";
 
 export * from "./session-summary-generator.js";
+export * from "./session-summary-assembly.js";
 
 function loadPackageVersion(): string {
   try {
@@ -1537,6 +1538,9 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         ? config.recallTimeoutMs
         : undefined,
     sessionSummaryEnabled: config.sessionSummaryEnabled === true,
+    sessionSummaryEnrichRecallQuery: config.sessionSummaryEnrichRecallQuery === true,
+    sessionSummaryEnrichRetainContext: config.sessionSummaryEnrichRetainContext === true,
+    sessionSummaryInjectPrompt: config.sessionSummaryInjectPrompt === true,
     sessionSummaryReuseHindsightLlmConfig: config.sessionSummaryReuseHindsightLlmConfig !== false,
     sessionSummaryGeneratorProvider:
       typeof config.sessionSummaryGeneratorProvider === "string" &&

@@ -119,6 +119,9 @@ export interface PluginConfig {
   recallPromptPreamble?: string; // Prompt preamble placed above recalled memories. Default: built-in guidance text.
   recallInjectionPosition?: "prepend" | "append" | "user"; // Where to inject recalled memories. 'prepend' = start of system prompt (default), 'append' = end of system prompt (preserves prompt cache), 'user' = before user message.
   sessionSummaryEnabled?: boolean; // Summary generator surface flag. This does not wire prompt/recall/retain consumption by itself.
+  sessionSummaryEnrichRecallQuery?: boolean; // Future summary recall-query enrichment flag. Default: false; no lifecycle wiring in this stage.
+  sessionSummaryEnrichRetainContext?: boolean; // Future summary retain-context enrichment flag. Default: false; no lifecycle wiring in this stage.
+  sessionSummaryInjectPrompt?: boolean; // Future prompt summary block flag. Default: false; no lifecycle wiring in this stage.
   sessionSummaryGeneratorProvider?: string; // Optional LLM provider for future real summary generation.
   sessionSummaryGeneratorModel?: string; // Optional LLM model for future real summary generation.
   sessionSummaryGeneratorBaseUrl?: string; // Optional OpenAI-compatible base URL for future real summary generation.
