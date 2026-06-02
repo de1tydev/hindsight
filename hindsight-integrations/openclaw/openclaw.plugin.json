@@ -251,6 +251,21 @@
         "description": "Enable the structured session summary generator surface. This does not inject summaries, enrich recall, enrich retain, or add lifecycle hooks by itself.",
         "default": false
       },
+      "sessionSummaryEnrichRecallQuery": {
+        "type": "boolean",
+        "description": "Future flag for adding rolling summary context after the latest recall query. No lifecycle hook consumes it in this stage.",
+        "default": false
+      },
+      "sessionSummaryEnrichRetainContext": {
+        "type": "boolean",
+        "description": "Future flag for adding rolling summary text to retain extraction context, never transcript content. No lifecycle hook consumes it in this stage.",
+        "default": false
+      },
+      "sessionSummaryInjectPrompt": {
+        "type": "boolean",
+        "description": "Future flag for rendering a separate prompt summary block outside recalled memory blocks. No lifecycle hook consumes it in this stage.",
+        "default": false
+      },
       "sessionSummaryGeneratorProvider": {
         "type": "string",
         "description": "Optional LLM provider for future real summary generation."
@@ -563,6 +578,18 @@
     "sessionSummaryEnabled": {
       "label": "Session Summary Enabled",
       "placeholder": "false (generator surface only)"
+    },
+    "sessionSummaryEnrichRecallQuery": {
+      "label": "Summary Recall Enrichment",
+      "placeholder": "false (not lifecycle-wired in this stage)"
+    },
+    "sessionSummaryEnrichRetainContext": {
+      "label": "Summary Retain Context",
+      "placeholder": "false (not lifecycle-wired in this stage)"
+    },
+    "sessionSummaryInjectPrompt": {
+      "label": "Summary Prompt Injection",
+      "placeholder": "false (not lifecycle-wired in this stage)"
     },
     "sessionSummaryGeneratorProvider": {
       "label": "Summary Generator Provider",
