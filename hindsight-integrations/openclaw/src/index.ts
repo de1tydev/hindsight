@@ -677,6 +677,13 @@ async function updateSessionSummaryForMessages(input: {
     };
   }
 
+  // On transient generation error, keep an existing ready summary rather than
+  // overwriting it with an error record (which would disable all summary surfaces).
+  if (result.status === "error" && existing?.status === "ready") {
+    log.warn(`session summary update failed; keeping existing ready summary: ${result.error}`);
+    return existing;
+  }
+
   try {
     const write = store.upsert({
       summaryKey,

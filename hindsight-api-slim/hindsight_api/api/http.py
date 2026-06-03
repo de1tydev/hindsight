@@ -3054,8 +3054,29 @@ def _register_routes(app: FastAPI):
         tags=["Session Summary"],
         operation_id="generate_session_summary",
     )
-    async def api_generate_session_summary(request: SessionSummaryRequest):
+    async def api_generate_session_summary(
+        request: SessionSummaryRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
         """Generate a session summary via server-side LLM."""
+        await app.state.memory._authenticate_tenant(request_context)
+        validator = getattr(app.state.memory, "_operation_validator", None)
+        if validator is not None:
+            from hindsight_api.extensions import PrecheckContext
+
+            bank_id_for_check = request.bank_id or request.identity_scope or ""
+            ctx_precheck = PrecheckContext(
+                operation="session_summary",
+                bank_id=bank_id_for_check,
+                request_context=request_context,
+            )
+            precheck_result = await validator.precheck(ctx_precheck)
+            if not precheck_result.allowed:
+                raise HTTPException(
+                    status_code=precheck_result.status_code,
+                    detail=precheck_result.reason or "Operation not allowed",
+                )
+
         from hindsight_api.config import get_config
         from hindsight_api.engine.session_summary import (
             generate_session_summary,

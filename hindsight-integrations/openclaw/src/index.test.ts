@@ -1686,6 +1686,108 @@ describe("session summary hook lifecycle", () => {
     await handle.stop();
     vi.unstubAllGlobals();
   });
+
+  it("keeps existing ready summary when API fails on subsequent update (no-op on transient error)", async () => {
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            status: "ready",
+            schema_version: 1,
+            summary_json: {
+              schemaVersion: 1,
+              activeProjects: ["stable-project"],
+              semanticAnchors: [],
+              exactIdentifiers: [],
+              decisions: [],
+              blockers: [],
+              openQuestions: [],
+              completedTodos: [],
+            },
+            summary_text: "Active projects: stable-project",
+            model_info: { provider: "mock", model: "m" },
+          }),
+        });
+      }
+      // Subsequent calls: server error
+      return Promise.resolve({
+        ok: false,
+        status: 503,
+        text: async () => "Service Unavailable",
+      });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-retain-ready-"));
+    tempDirs.push(dir);
+    const handle = makeHookApi({
+      autoRecall: false,
+      autoRetain: false,
+      dynamicBankId: true,
+      sessionSummaryEnabled: true,
+      sessionSummaryInjectPrompt: true,
+      sessionSummaryStorePath: join(dir, "summary.sqlite"),
+      hindsightApiUrl: "http://hindsight-test:9077",
+    });
+    hindsightOpenclawPlugin(handle.api);
+
+    const ctx: PluginHookAgentContext = {
+      agentId: "main",
+      messageProvider: "telegram",
+      channelId: "direct:U999",
+      senderId: "U999",
+      sessionKey: "agent:main:telegram:direct:U999",
+    };
+
+    // First agent_end (2 user turns) → API succeeds → "ready" record created
+    await handle.trigger(
+      "agent_end",
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "Working on stable-project." },
+          { role: "assistant", content: "Noted." },
+          { role: "user", content: "All tests pass." },
+          { role: "assistant", content: "Great." },
+        ],
+      },
+      ctx
+    );
+
+    // Second agent_end (4 user turns) → API fails → should NOT overwrite ready record
+    await handle.trigger(
+      "agent_end",
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "Working on stable-project." },
+          { role: "assistant", content: "Noted." },
+          { role: "user", content: "All tests pass." },
+          { role: "assistant", content: "Great." },
+          { role: "user", content: "Deploying now." },
+          { role: "assistant", content: "Ok." },
+          { role: "user", content: "Deploy done." },
+          { role: "assistant", content: "Awesome." },
+        ],
+      },
+      ctx
+    );
+
+    // Summary should still show "stable-project" from the original ready record
+    const result = (await handle.trigger(
+      "before_prompt_build",
+      { rawMessage: "Status?", prompt: "Status?", messages: [] },
+      ctx
+    )) as { prependSystemContext?: string } | undefined;
+
+    expect(result?.prependSystemContext).toContain("stable-project");
+
+    await handle.stop();
+    vi.unstubAllGlobals();
+  });
 });
 
 describe("getPluginConfig — retainQueue whitelist (#1443)", () => {
