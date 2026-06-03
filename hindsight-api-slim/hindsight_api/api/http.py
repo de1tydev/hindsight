@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
@@ -205,6 +206,94 @@ async def run_cancellable_on_disconnect(
     except OperationCancelledError as e:
         logger.info(f"[{operation.upper()} CANCELLED] bank={bank_id} reason={e.reason}")
         raise HTTPException(status_code=_CLIENT_CLOSED_REQUEST_STATUS_CODE, detail=e.reason) from e
+
+
+def _duration_ms(seconds: Any) -> int:
+    try:
+        return int(round(float(seconds) * 1000))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _detail_int(details: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = details.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int | float):
+            return int(value)
+    return 0
+
+
+def _field_value(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _recall_phase_metrics_from_trace(trace: Any) -> list[Any]:
+    if not trace:
+        return []
+    direct = _field_value(trace, "phase_metrics")
+    if isinstance(direct, list):
+        return direct
+    summary = _field_value(trace, "summary")
+    if summary:
+        nested = _field_value(summary, "phase_metrics")
+        if isinstance(nested, list):
+            return nested
+    return []
+
+
+def _summarize_recall_phase_metrics(trace: Any) -> dict[str, int]:
+    """Return compact, non-sensitive recall phase metrics for production logs."""
+    phase_metrics = _recall_phase_metrics_from_trace(trace)
+    if not phase_metrics:
+        return {}
+
+    fields = {
+        "embedding_ms": 0,
+        "retrieval_ms": 0,
+        "rerank_ms": 0,
+        "token_filtering_ms": 0,
+        "entity_hydration_ms": 0,
+        "merge_ms": 0,
+        "candidates_reranked": 0,
+        "candidates_merged": 0,
+    }
+    for metric in phase_metrics:
+        name = str(_field_value(metric, "phase_name", "") or "").lower().replace("_", " ").replace("-", " ")
+        duration = _duration_ms(_field_value(metric, "duration_seconds", 0))
+        details = _field_value(metric, "details", {}) or {}
+        if not isinstance(details, dict):
+            details = {}
+
+        if "embed" in name:
+            fields["embedding_ms"] += duration
+        elif "rerank" in name or "re rank" in name:
+            fields["rerank_ms"] += duration
+            fields["candidates_reranked"] = max(
+                fields["candidates_reranked"],
+                _detail_int(details, "candidates_reranked", "candidates", "candidate_count", "num_candidates"),
+            )
+        elif "token" in name and ("filter" in name or "budget" in name):
+            fields["token_filtering_ms"] += duration
+        elif "entity" in name and ("hydrat" in name or "expand" in name or "include" in name):
+            fields["entity_hydration_ms"] += duration
+        elif "merge" in name or "dedup" in name or "combine" in name:
+            fields["merge_ms"] += duration
+            fields["candidates_merged"] = max(
+                fields["candidates_merged"],
+                _detail_int(details, "candidates_merged", "candidates", "candidate_count", "num_candidates"),
+            )
+        elif "retriev" in name or "semantic" in name or "bm25" in name or "graph" in name or "temporal" in name:
+            fields["retrieval_ms"] += duration
+
+    return fields
+
+
+def _format_metric_fields(fields: dict[str, Any]) -> str:
+    return " ".join(f"{key}={value}" for key, value in fields.items())
 
 
 class EntityIncludeOptions(BaseModel):
@@ -3473,6 +3562,7 @@ def _register_routes(app: FastAPI):
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Generate a session summary via server-side LLM."""
+        summary_started_at = time.monotonic()
         await app.state.memory._authenticate_tenant(request_context)
         validator = getattr(app.state.memory, "_operation_validator", None)
         if validator is not None:
@@ -3510,6 +3600,23 @@ def _register_routes(app: FastAPI):
             "budget": request.budget,
         }
         result = await generate_session_summary(payload, llm)
+        duration_ms = _duration_ms(time.monotonic() - summary_started_at)
+        model_info = result.get("model_info") if isinstance(result, dict) else None
+        if not isinstance(model_info, dict):
+            model_info = {}
+        logger.info(
+            "[SESSION SUMMARY HTTP] "
+            + _format_metric_fields(
+                {
+                    "bank": request.bank_id or request.identity_scope or "",
+                    "status": result.get("status") if isinstance(result, dict) else "unknown",
+                    "duration_ms": duration_ms,
+                    "message_count": len(request.messages),
+                    "provider": model_info.get("provider", ""),
+                    "model": model_info.get("model", ""),
+                }
+            )
+        )
         return result
 
     @app.get(
@@ -3970,7 +4077,7 @@ def _register_routes(app: FastAPI):
 
             response = RecallResponse(
                 results=recall_results,
-                trace=core_result.trace,
+                trace=core_result.trace if request.trace else None,
                 entities=entities_response,
                 chunks=chunks_response,
                 source_facts=source_facts_response,
@@ -3984,6 +4091,21 @@ def _register_routes(app: FastAPI):
                     f"[RECALL HTTP] bank={bank_id} handler_total={handler_duration:.3f}s "
                     f"pre={pre_recall:.3f}s recall={recall_duration:.3f}s post={post_recall:.3f}s "
                     f"results={len(recall_results)} entities={len(entities_response) if entities_response else 0}"
+                )
+            phase_fields = _summarize_recall_phase_metrics(core_result.trace)
+            if phase_fields:
+                logger.info(
+                    "[RECALL HTTP PHASES] "
+                    + _format_metric_fields(
+                        {
+                            "bank": bank_id,
+                            "total_ms": _duration_ms(handler_duration),
+                            "recall_ms": _duration_ms(recall_duration),
+                            **phase_fields,
+                            "results": len(recall_results),
+                            "entities": len(entities_response) if entities_response else 0,
+                        }
+                    )
                 )
 
             return response

@@ -1901,6 +1901,184 @@ describe("session summary hook lifecycle", () => {
     await handle.stop();
     vi.unstubAllGlobals();
   });
+
+  it("reopens the summary store before writing when config reload closes the in-flight store", async () => {
+    let resolveFetch: ((value: unknown) => void) | undefined;
+    const mockFetch = vi.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveFetch = resolve;
+        })
+    );
+    vi.stubGlobal("fetch", mockFetch);
+
+    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-reload-"));
+    tempDirs.push(dir);
+    const handle = makeHookApi({
+      autoRecall: false,
+      autoRetain: false,
+      dynamicBankId: true,
+      sessionSummaryEnabled: true,
+      sessionSummaryInjectPrompt: true,
+      sessionSummaryStorePath: join(dir, "summary.sqlite"),
+      hindsightApiUrl: "http://hindsight-test:9077",
+    });
+    hindsightOpenclawPlugin(handle.api);
+
+    const ctx: PluginHookAgentContext = {
+      agentId: "main",
+      messageProvider: "telegram",
+      channelId: "direct:U888",
+      senderId: "U888",
+      sessionKey: "agent:main:telegram:direct:U888",
+    };
+
+    const update = handle.trigger(
+      "agent_end",
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "Working on reload-race-project." },
+          { role: "assistant", content: "Noted." },
+          { role: "user", content: "Reload can happen while summary generation awaits." },
+        ],
+      },
+      ctx
+    );
+
+    await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+
+    // Simulate config hot reload closing the global SQLite store while the
+    // summary API request is still in flight. The in-flight update must not
+    // call upsert on that closed handle when generation returns.
+    await handle.stop();
+    resolveFetch?.({
+      ok: true,
+      json: async () => ({
+        status: "ready",
+        schema_version: 1,
+        summary_json: {
+          schemaVersion: 1,
+          activeProjects: ["reload-race-project"],
+          semanticAnchors: ["summary generation awaited during reload"],
+          exactIdentifiers: [],
+          decisions: [],
+          blockers: [],
+          openQuestions: [],
+          completedTodos: [],
+        },
+        summary_text: "Active projects: reload-race-project",
+        model_info: { provider: "mock", model: "m" },
+      }),
+    });
+    await update;
+
+    const result = (await handle.trigger(
+      "before_prompt_build",
+      { rawMessage: "Status?", prompt: "Status?", messages: [] },
+      ctx
+    )) as { prependSystemContext?: string } | undefined;
+
+    expect(result?.prependSystemContext).toContain("reload-race-project");
+    vi.unstubAllGlobals();
+  });
+
+  it("does not let a stale in-flight update replace a post-reload store with a different path", async () => {
+    let resolveFetch: ((value: unknown) => void) | undefined;
+    const mockFetch = vi.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveFetch = resolve;
+        })
+    );
+    vi.stubGlobal("fetch", mockFetch);
+
+    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-path-reload-"));
+    tempDirs.push(dir);
+    const oldStorePath = join(dir, "old-summary.sqlite");
+    const newStorePath = join(dir, "new-summary.sqlite");
+
+    const oldHandle = makeHookApi({
+      autoRecall: false,
+      autoRetain: false,
+      dynamicBankId: true,
+      sessionSummaryEnabled: true,
+      sessionSummaryInjectPrompt: true,
+      sessionSummaryStorePath: oldStorePath,
+      hindsightApiUrl: "http://hindsight-test:9077",
+    });
+    hindsightOpenclawPlugin(oldHandle.api);
+
+    const ctx: PluginHookAgentContext = {
+      agentId: "main",
+      messageProvider: "telegram",
+      channelId: "direct:U889",
+      senderId: "U889",
+      sessionKey: "agent:main:telegram:direct:U889",
+    };
+
+    const staleUpdate = oldHandle.trigger(
+      "agent_end",
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "Working on stale-path-project." },
+          { role: "assistant", content: "Noted." },
+          { role: "user", content: "Reload changes the summary store path." },
+        ],
+      },
+      ctx
+    );
+    await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+
+    await oldHandle.stop();
+    const newHandle = makeHookApi({
+      autoRecall: false,
+      autoRetain: false,
+      dynamicBankId: true,
+      sessionSummaryEnabled: true,
+      sessionSummaryInjectPrompt: true,
+      sessionSummaryStorePath: newStorePath,
+      hindsightApiUrl: "http://hindsight-test:9077",
+    });
+    hindsightOpenclawPlugin(newHandle.api);
+    await newHandle.trigger(
+      "before_prompt_build",
+      { rawMessage: "Open new store", prompt: "Open new store", messages: [] },
+      ctx
+    );
+
+    resolveFetch?.({
+      ok: true,
+      json: async () => ({
+        status: "ready",
+        schema_version: 1,
+        summary_json: {
+          schemaVersion: 1,
+          activeProjects: ["stale-path-project"],
+          semanticAnchors: [],
+          exactIdentifiers: [],
+          decisions: [],
+          blockers: [],
+          openQuestions: [],
+          completedTodos: [],
+        },
+        summary_text: "Active projects: stale-path-project",
+        model_info: { provider: "mock", model: "m" },
+      }),
+    });
+    await staleUpdate;
+
+    const staleResult = (await oldHandle.trigger(
+      "before_prompt_build",
+      { rawMessage: "Status?", prompt: "Status?", messages: [] },
+      ctx
+    )) as { prependSystemContext?: string } | undefined;
+    expect(staleResult?.prependSystemContext).toBeUndefined();
+
+    await newHandle.stop();
+    vi.unstubAllGlobals();
+  });
 });
 
 describe("getPluginConfig — retainQueue whitelist (#1443)", () => {

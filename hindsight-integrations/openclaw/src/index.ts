@@ -413,14 +413,21 @@ export function getSessionSummaryBudgetFromConfig(config: PluginConfig): Session
   };
 }
 
-function ensureSessionSummaryStore(config: PluginConfig): SessionSummaryStore | null {
-  if (!isSessionSummaryLifecycleActive(config)) return null;
-  const dbPath =
-    typeof config.sessionSummaryStorePath === "string" &&
+function getSessionSummaryStorePath(config: PluginConfig): string {
+  return typeof config.sessionSummaryStorePath === "string" &&
     config.sessionSummaryStorePath.trim().length > 0
-      ? config.sessionSummaryStorePath.trim()
-      : DEFAULT_SESSION_SUMMARY_STORE_PATH;
+    ? config.sessionSummaryStorePath.trim()
+    : DEFAULT_SESSION_SUMMARY_STORE_PATH;
+}
+
+function ensureSessionSummaryStore(
+  config: PluginConfig,
+  opts: { replaceExisting?: boolean } = {}
+): SessionSummaryStore | null {
+  if (!isSessionSummaryLifecycleActive(config)) return null;
+  const dbPath = getSessionSummaryStorePath(config);
   if (sessionSummaryStore && sessionSummaryStorePath === dbPath) return sessionSummaryStore;
+  if (sessionSummaryStore && opts.replaceExisting === false) return null;
   closeSessionSummaryStore();
   try {
     sessionSummaryStore = new SessionSummaryStore({
@@ -610,9 +617,8 @@ async function updateSessionSummaryForMessages(input: {
 }): Promise<SessionSummaryRecord | null> {
   const config = input.config;
   if (!isSessionSummaryLifecycleActive(config)) return null;
-  const store = ensureSessionSummaryStore(config);
   const generator = ensureSessionSummaryGenerator(config);
-  if (!store || !generator) return readSessionSummary(input.resolvedCtx, config);
+  if (!generator) return readSessionSummary(input.resolvedCtx, config);
 
   const turnIndex = countUserTurns(input.messages);
   const existing = readSessionSummary(input.resolvedCtx, config);
@@ -684,6 +690,8 @@ async function updateSessionSummaryForMessages(input: {
   }
 
   try {
+    const store = ensureSessionSummaryStore(config, { replaceExisting: false });
+    if (!store) return existing;
     const write = store.upsert({
       summaryKey,
       identityScope,

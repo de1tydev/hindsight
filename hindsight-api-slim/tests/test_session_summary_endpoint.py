@@ -374,6 +374,44 @@ class TestSessionSummaryHttpEndpoint:
             )
         assert response.status_code == 200
 
+    def test_endpoint_logs_latency_without_prompt_or_secret_payload(self, test_app, caplog):
+        """Production logs expose timing/model status, not raw prompt content."""
+        import logging
+        from unittest.mock import AsyncMock, patch
+
+        from fastapi.testclient import TestClient
+
+        mock_result = {
+            "status": "ready",
+            "schema_version": 1,
+            "summary_json": {"schemaVersion": 1, "activeProjects": ["proj"]},
+            "summary_text": "Active projects: proj",
+            "model_info": {"provider": "mock", "model": "m"},
+        }
+        with patch(
+            "hindsight_api.engine.session_summary.generate_session_summary",
+            new=AsyncMock(return_value=mock_result),
+        ):
+            caplog.set_level(logging.INFO, logger="hindsight_api.api.http")
+            client = TestClient(test_app)
+            response = client.post(
+                "/v1/session-summary/generate",
+                json={
+                    "session_id": "session-log-test",
+                    "identity_scope": "bank-logs",
+                    "messages": [{"role": "user", "content": "SECRET-PAYLOAD-SHOULD-NOT-LOG"}],
+                },
+            )
+
+        assert response.status_code == 200
+        log_text = "\n".join(record.getMessage() for record in caplog.records)
+        assert "[SESSION SUMMARY HTTP]" in log_text
+        assert "bank=bank-logs" in log_text
+        assert "status=ready" in log_text
+        assert "provider=mock" in log_text
+        assert "model=m" in log_text
+        assert "SECRET-PAYLOAD-SHOULD-NOT-LOG" not in log_text
+
     def test_endpoint_returns_401_when_auth_configured_and_token_invalid(self, test_app):
         """When _authenticate_tenant raises AuthenticationError the endpoint returns 401."""
         from fastapi.testclient import TestClient
