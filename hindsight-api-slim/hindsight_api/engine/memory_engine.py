@@ -3140,6 +3140,7 @@ class MemoryEngine(MemoryEngineInterface):
         created_after: datetime | None = None,
         created_before: datetime | None = None,
         _connection_budget: int | None = None,
+        _recall_id: str | None = None,
         _quiet: bool = False,
     ) -> RecallResultModel:
         """
@@ -3297,6 +3298,7 @@ class MemoryEngine(MemoryEngineInterface):
                             include_source_facts=include_source_facts,
                             max_source_facts_tokens=max_source_facts_tokens,
                             max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
+                            recall_id=_recall_id,
                         )
                         break  # Success - exit retry loop
                     except Exception as e:
@@ -3428,6 +3430,7 @@ class MemoryEngine(MemoryEngineInterface):
         include_source_facts: bool = False,
         max_source_facts_tokens: int = 4096,
         max_source_facts_tokens_per_observation: int = -1,
+        recall_id: str | None = None,
     ) -> RecallResultModel:
         """
         Search implementation with modular retrieval and reranking.
@@ -3471,7 +3474,7 @@ class MemoryEngine(MemoryEngineInterface):
         # Include a uuid suffix so two recalls on the same bank within the
         # same millisecond don't collide on the budgeted_operation key
         # (`recall-{recall_id}`), which would raise "Operation ... already exists".
-        recall_id = f"{bank_id[:8]}-{int(time.time() * 1000) % 100000}-{uuid.uuid4().hex[:6]}"
+        recall_id = recall_id or f"{bank_id[:8]}-{int(time.time() * 1000) % 100000}-{uuid.uuid4().hex[:6]}"
         log_buffer = []
         tags_info = f", tags={tags}, tags_match={tags_match}" if tags else ""
         log_buffer.append(
@@ -4040,6 +4043,7 @@ class MemoryEngine(MemoryEngineInterface):
             # Fetch source facts for observation-type results (mirrors chunks pattern)
             source_fact_ids_by_obs: dict[str, list[str]] = {}  # obs_id -> [source_id, ...]
             source_facts_dict: dict[str, MemoryFact] | None = None
+            source_fact_hydration_start = time.time()
             if include_source_facts:
                 observation_ids = [uuid.UUID(sr.id) for sr in top_scored if sr.retrieval.fact_type == "observation"]
                 if observation_ids:
@@ -4129,10 +4133,18 @@ class MemoryEngine(MemoryEngineInterface):
                                         break
                                     source_facts_dict[sid] = _make_source_fact(sid, r)
                                     total_source_tokens += fact_tokens
+            source_fact_hydration_duration = time.time() - source_fact_hydration_start
+            if tracer and include_source_facts:
+                tracer.add_phase_metric(
+                    "source_fact_hydration",
+                    source_fact_hydration_duration,
+                    {"source_facts": len(source_facts_dict) if source_facts_dict else 0},
+                )
 
             # Get entities for each fact if include_entities is requested.
             # _entity_rows_for_units_sql resolves both direct unit_entities rows
             # and observation-via-source-memory inheritance in a single query.
+            entity_hydration_start = time.time()
             fact_entity_map = {}  # unit_id -> list of {entity_id, canonical_name}
             if include_entities and top_scored:
                 unit_ids = [uuid.UUID(sr.id) for sr in top_scored]
@@ -4201,6 +4213,13 @@ class MemoryEngine(MemoryEngineInterface):
                         canonical_name=entity_name,
                         observations=[],  # Mental models provide this now
                     )
+            entity_hydration_duration = time.time() - entity_hydration_start
+            if tracer and include_entities:
+                tracer.add_phase_metric(
+                    "entity_hydration",
+                    entity_hydration_duration,
+                    {"entities": len(entities_dict) if entities_dict else 0},
+                )
 
             # Finalize trace if enabled
             trace_dict = None
