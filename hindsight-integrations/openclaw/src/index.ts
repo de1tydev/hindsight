@@ -16,6 +16,7 @@ import {
   buildSessionSummaryBudgetedText,
   DEFAULT_SESSION_SUMMARY_BUDGET,
   FakeSessionSummaryGenerator,
+  HindsightApiSessionSummaryGenerator,
   shouldUpdateSessionSummary,
   type SessionSummaryBudget,
   type SessionSummaryGenerator,
@@ -433,22 +434,50 @@ function ensureSessionSummaryStore(config: PluginConfig): SessionSummaryStore | 
   }
 }
 
+/**
+ * Pure factory: given a resolved PluginConfig (and optional test overrides),
+ * returns the correct SessionSummaryGenerator or null.
+ *
+ * Priority:
+ *   1. hindsightApiUrl configured → HindsightApiSessionSummaryGenerator (real, production)
+ *   2. Session summary lifecycle active but no API URL → null (fail-closed; never silently Fake)
+ *   3. Lifecycle not active → null
+ *
+ * FakeSessionSummaryGenerator is never returned in the production path.
+ */
+export function makeSessionSummaryGenerator(
+  config: PluginConfig,
+  opts?: { fetchFn?: typeof fetch }
+): SessionSummaryGenerator | null {
+  if (!isSessionSummaryLifecycleActive(config)) return null;
+  const apiUrl = config.hindsightApiUrl;
+  if (!apiUrl) {
+    log.warn(
+      "session summary lifecycle is active but hindsightApiUrl is not configured; " +
+        "no real generator is available — session summary generation is disabled. " +
+        "Set hindsightApiUrl to enable server-side summary generation."
+    );
+    return null;
+  }
+  const timeoutMs =
+    typeof config.sessionSummaryTimeoutMs === "number" && config.sessionSummaryTimeoutMs > 0
+      ? config.sessionSummaryTimeoutMs
+      : 20_000;
+  return new HindsightApiSessionSummaryGenerator({
+    apiUrl,
+    apiToken: config.hindsightApiToken ?? undefined,
+    timeoutMs,
+    fetchFn: opts?.fetchFn,
+  });
+}
+
 function ensureSessionSummaryGenerator(config: PluginConfig): SessionSummaryGenerator | null {
   if (!isSessionSummaryLifecycleActive(config)) return null;
   if (!loggedSessionSummaryGeneratorBoundary) {
-    const requestedRealGenerator =
-      config.sessionSummaryGeneratorProvider ||
-      config.sessionSummaryGeneratorModel ||
-      config.sessionSummaryGeneratorBaseUrl;
-    if (requestedRealGenerator) {
-      log.warn(
-        "session summary real generator config is present, but OpenClaw has no stable plugin-side LLM helper; using FakeSessionSummaryGenerator pending correct-course"
-      );
-    }
     loggedSessionSummaryGeneratorBoundary = true;
   }
   if (!sessionSummaryGenerator) {
-    sessionSummaryGenerator = new FakeSessionSummaryGenerator();
+    sessionSummaryGenerator = makeSessionSummaryGenerator(config);
   }
   return sessionSummaryGenerator;
 }

@@ -224,6 +224,11 @@ ENV_CONSOLIDATION_LLM_MAX_BACKOFF = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_BACKOFF
 ENV_CONSOLIDATION_LLM_TIMEOUT = "HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT"
 ENV_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG"
 
+ENV_SESSION_SUMMARY_LLM_PROVIDER = "HINDSIGHT_API_SESSION_SUMMARY_LLM_PROVIDER"
+ENV_SESSION_SUMMARY_LLM_API_KEY = "HINDSIGHT_API_SESSION_SUMMARY_LLM_API_KEY"
+ENV_SESSION_SUMMARY_LLM_MODEL = "HINDSIGHT_API_SESSION_SUMMARY_LLM_MODEL"
+ENV_SESSION_SUMMARY_LLM_BASE_URL = "HINDSIGHT_API_SESSION_SUMMARY_LLM_BASE_URL"
+
 ENV_EMBEDDINGS_PROVIDER = "HINDSIGHT_API_EMBEDDINGS_PROVIDER"
 ENV_EMBEDDINGS_LOCAL_MODEL = "HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL"
 ENV_EMBEDDINGS_LOCAL_FORCE_CPU = "HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU"
@@ -1405,6 +1410,12 @@ class HindsightConfig:
     consolidation_llm_timeout: float | None
     consolidation_llm_litellmrouter_config: dict | None
 
+    # Session summary LLM config (priority: session_summary_llm_* > retain_llm_* > llm_*)
+    session_summary_llm_provider: str | None
+    session_summary_llm_api_key: str | None
+    session_summary_llm_model: str | None
+    session_summary_llm_base_url: str | None
+
     # Embeddings
     embeddings_provider: str
     embeddings_local_model: str
@@ -1722,6 +1733,7 @@ class HindsightConfig:
         "retain_llm_api_key",
         "reflect_llm_api_key",
         "consolidation_llm_api_key",
+        "session_summary_llm_api_key",
         # LiteLLM Router chains — entries embed api_keys and base_urls
         "llm_litellmrouter_config",
         "retain_llm_litellmrouter_config",
@@ -1732,6 +1744,7 @@ class HindsightConfig:
         "retain_llm_base_url",
         "reflect_llm_base_url",
         "consolidation_llm_base_url",
+        "session_summary_llm_base_url",
         "embeddings_tei_base_url",
         "reranker_tei_base_url",
         "reranker_cohere_base_url",
@@ -2146,6 +2159,10 @@ class HindsightConfig:
             if os.getenv(ENV_CONSOLIDATION_LLM_TIMEOUT)
             else None,
             consolidation_llm_litellmrouter_config=_parse_llm_router_config(ENV_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG),
+            session_summary_llm_provider=os.getenv(ENV_SESSION_SUMMARY_LLM_PROVIDER) or None,
+            session_summary_llm_api_key=os.getenv(ENV_SESSION_SUMMARY_LLM_API_KEY) or None,
+            session_summary_llm_model=os.getenv(ENV_SESSION_SUMMARY_LLM_MODEL) or None,
+            session_summary_llm_base_url=os.getenv(ENV_SESSION_SUMMARY_LLM_BASE_URL) or None,
             # Embeddings
             embeddings_provider=os.getenv(ENV_EMBEDDINGS_PROVIDER, DEFAULT_EMBEDDINGS_PROVIDER),
             embeddings_local_model=os.getenv(ENV_EMBEDDINGS_LOCAL_MODEL, DEFAULT_EMBEDDINGS_LOCAL_MODEL),

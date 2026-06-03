@@ -3440,6 +3440,57 @@ def _register_routes(app: FastAPI):
             ),
         )
 
+    # -----------------------------------------------------------------------
+    # Session Summary endpoint (bank-id optional — uses server-side LLM config)
+    # -----------------------------------------------------------------------
+
+    class SessionSummaryMessage(BaseModel):
+        role: str
+        content: str
+
+    class SessionSummaryRequest(BaseModel):
+        session_id: str
+        identity_scope: str = ""
+        bank_id: str | None = None
+        previous_summary: dict | None = None
+        latest_query: str | None = None
+        messages: list[dict] = Field(default_factory=list)
+        metadata: dict | None = None
+        budget: dict | None = None
+
+    @app.post(
+        "/v1/session-summary/generate",
+        summary="Generate a rolling session summary",
+        description=(
+            "Generate a compact session summary JSON from recent conversation messages. "
+            "Uses the server-side LLM with session_summary > retain > global priority."
+        ),
+        tags=["Session Summary"],
+        operation_id="generate_session_summary",
+    )
+    async def api_generate_session_summary(request: SessionSummaryRequest):
+        """Generate a session summary via server-side LLM."""
+        from hindsight_api.config import get_config
+        from hindsight_api.engine.session_summary import (
+            generate_session_summary,
+            resolve_session_summary_llm_config,
+        )
+
+        config = get_config()
+        llm = resolve_session_summary_llm_config(config)
+        payload = {
+            "session_id": request.session_id,
+            "identity_scope": request.identity_scope,
+            "bank_id": request.bank_id,
+            "previous_summary": request.previous_summary,
+            "latest_query": request.latest_query,
+            "messages": request.messages,
+            "metadata": request.metadata,
+            "budget": request.budget,
+        }
+        result = await generate_session_summary(payload, llm)
+        return result
+
     @app.get(
         "/metrics",
         summary="Prometheus metrics endpoint",
