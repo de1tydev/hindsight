@@ -460,7 +460,6 @@ describe("HindsightApiSessionSummaryGenerator", () => {
       apiUrl: "http://hindsight-api:9077",
       apiToken: "ultra-secret-token-xyz",
       timeoutMs: 5000,
-      fetchSpy,
       fetchFn: fetchSpy,
     });
 

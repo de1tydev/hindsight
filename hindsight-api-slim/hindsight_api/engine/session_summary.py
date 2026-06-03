@@ -31,6 +31,69 @@ _REQUIRED_SCHEMA_FIELDS = (
     "completedTodos",
 )
 
+# Array fields whose items are strings that get sanitized.
+_ARRAY_FIELDS = (
+    "activeProjects",
+    "semanticAnchors",
+    "exactIdentifiers",
+    "decisions",
+    "blockers",
+    "openQuestions",
+    "completedTodos",
+)
+
+# Sanitization patterns — mirror the TypeScript OpenClaw guard.
+_INJECTION_RE = re.compile(
+    r"\b(ignore|override|forget|bypass)\b.{0,80}\b(previous|system|developer|instructions?)\b"
+    r"|\b(reveal|print|exfiltrate|leak)\b.{0,80}\b(secret|token|prompt|credentials?)\b"
+    r"|\bdo\s+not\s+(store|summari[sz]e|sanitize)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_CANARY_RE = re.compile(
+    r"\b[A-Z0-9_]*(?:SECRET|CANARY|DO_NOT_STORE|DO_NOT_LEAK|SHOULD_NOT_APPEAR)[A-Z0-9_]*\b"
+    r"|/private/[^\s`'\"<>]+"
+    r"|\bsha256:[a-fA-F0-9]{32,64}\b",
+    re.IGNORECASE,
+)
+_SECRET_RE = re.compile(
+    r"\b(?:api[_\-]?key|token|password|secret)\s*[:=]\s*['\"]?[^'\"\s,;]+",
+    re.IGNORECASE,
+)
+_METADATA_BLOCK_RE = re.compile(
+    r"[\w\s]+\(untrusted metadata\)[^\n]*\n```json\n[\s\S]*?```",
+    re.IGNORECASE,
+)
+_MEMORY_TAG_RE = re.compile(
+    r"<(?:hindsight_memories|relevant_memories)>[\s\S]*?</(?:hindsight_memories|relevant_memories)>",
+    re.IGNORECASE,
+)
+_OPERATIONAL_METADATA_KEYS = {
+    "agent",
+    "agent_id",
+    "bank",
+    "bank_id",
+    "channel",
+    "channel_id",
+    "document",
+    "document_id",
+    "message_id",
+    "profile",
+    "provider",
+    "sender",
+    "sender_id",
+    "session",
+    "session_id",
+    "session_key",
+    "source",
+    "source_system",
+    "thread",
+    "thread_id",
+    "tool",
+    "tool_call_id",
+    "update_mode",
+    "user_id",
+}
+
 # Prompt mirrors the TypeScript buildSessionSummaryPrompt contract.
 _SYSTEM_PROMPT = (
     "You are a concise session summarizer. "
@@ -55,6 +118,76 @@ _SYSTEM_PROMPT = (
 )
 
 
+def _normalize_metadata_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")
+
+
+def _is_operational_metadata_json(text: str) -> bool:
+    stripped = text.strip().rstrip(",")
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        return False
+    if not isinstance(parsed, dict) or not parsed:
+        return False
+    keys = {_normalize_metadata_key(str(k)) for k in parsed.keys()}
+    return any(k in _OPERATIONAL_METADATA_KEYS for k in keys)
+
+
+def _strip_operational_metadata_json_objects(text: str) -> str:
+    def replace(raw: re.Match[str]) -> str:
+        return "" if _is_operational_metadata_json(raw.group(0)) else raw.group(0)
+
+    return re.sub(r"\{[^{}]*\}", replace, text)
+
+
+def _sanitize_string(s: str) -> str | None:
+    """Sanitize a single summary string; returns None if the entry should be dropped."""
+    s = _MEMORY_TAG_RE.sub("", str(s))
+    s = _METADATA_BLOCK_RE.sub("", s)
+    s = _strip_operational_metadata_json_objects(s)
+    if _is_operational_metadata_json(s):
+        return None
+    s = _CANARY_RE.sub("[redacted]", s)
+    s = _SECRET_RE.sub("[redacted-secret]", s)
+    s = s.strip()
+    if not s or _INJECTION_RE.search(s):
+        return None
+    return s
+
+
+def _sanitize_summary_json(summary_json: dict[str, Any]) -> dict[str, Any]:
+    """Return a schema-only summary JSON with sanitized, bounded array fields."""
+    result: dict[str, Any] = {"schemaVersion": SESSION_SUMMARY_SCHEMA_VERSION}
+    for field in _ARRAY_FIELDS:
+        raw = summary_json.get(field, [])
+        if not isinstance(raw, list):
+            result[field] = []
+            continue
+        sanitized: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            cleaned = _sanitize_string(str(item)) if item is not None else None
+            if not cleaned:
+                continue
+            cleaned = cleaned[:240]
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            sanitized.append(cleaned)
+            if len(sanitized) >= 16:
+                break
+        result[field] = sanitized
+    return result
+
+
+def _sanitize_error(error: str) -> str:
+    """Strip canary/secret patterns from error messages."""
+    s = _CANARY_RE.sub("[redacted]", str(error))
+    return _SECRET_RE.sub("[redacted-secret]", s)
+
+
 def resolve_session_summary_llm_config(config: HindsightConfig) -> LLMProvider:
     """Return the LLMProvider to use for session summary generation.
 
@@ -64,11 +197,17 @@ def resolve_session_summary_llm_config(config: HindsightConfig) -> LLMProvider:
     api_key = config.session_summary_llm_api_key or config.retain_llm_api_key or config.llm_api_key or ""
     model = config.session_summary_llm_model or config.retain_llm_model or config.llm_model
     base_url = config.session_summary_llm_base_url or config.retain_llm_base_url or config.llm_base_url or ""
+    litellmrouter_config = (
+        config.session_summary_llm_litellmrouter_config
+        or config.retain_llm_litellmrouter_config
+        or config.llm_litellmrouter_config
+    )
     return LLMProvider(
         provider=provider,
         api_key=api_key,
         base_url=base_url,
         model=model,
+        litellmrouter_config=litellmrouter_config,
     )
 
 
@@ -78,7 +217,9 @@ def _build_user_prompt(request: dict[str, Any]) -> str:
     parts.append(f"Schema version: {SESSION_SUMMARY_SCHEMA_VERSION}")
 
     previous = request.get("previous_summary")
-    parts.append(f"Previous summary JSON:\n{json.dumps(previous or {}, separators=(',', ':'))}")
+    # Sanitize previous summary before including in prompt to prevent canary/injection leakage.
+    previous_safe = _sanitize_summary_json(previous) if isinstance(previous, dict) else None
+    parts.append(f"Previous summary JSON:\n{json.dumps(previous_safe or {}, separators=(',', ':'))}")
 
     latest_query = str(request.get("latest_query") or "")
     if latest_query:
@@ -176,6 +317,9 @@ async def generate_session_summary(
             if field not in summary_json:
                 summary_json[field] = [] if field != "schemaVersion" else SESSION_SUMMARY_SCHEMA_VERSION
 
+        # Sanitize and normalize LLM output before returning.
+        summary_json = _sanitize_summary_json(summary_json)
+
         summary_text = _render_summary_text(summary_json)
 
         return {
@@ -194,5 +338,5 @@ async def generate_session_summary(
             "summary_json": _empty_summary_json(),
             "summary_text": "",
             "model_info": model_info,
-            "error": str(exc),
+            "error": _sanitize_error(str(exc)),
         }

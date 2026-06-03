@@ -228,6 +228,7 @@ ENV_SESSION_SUMMARY_LLM_PROVIDER = "HINDSIGHT_API_SESSION_SUMMARY_LLM_PROVIDER"
 ENV_SESSION_SUMMARY_LLM_API_KEY = "HINDSIGHT_API_SESSION_SUMMARY_LLM_API_KEY"
 ENV_SESSION_SUMMARY_LLM_MODEL = "HINDSIGHT_API_SESSION_SUMMARY_LLM_MODEL"
 ENV_SESSION_SUMMARY_LLM_BASE_URL = "HINDSIGHT_API_SESSION_SUMMARY_LLM_BASE_URL"
+ENV_SESSION_SUMMARY_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_SESSION_SUMMARY_LLM_LITELLMROUTER_CONFIG"
 
 ENV_EMBEDDINGS_PROVIDER = "HINDSIGHT_API_EMBEDDINGS_PROVIDER"
 ENV_EMBEDDINGS_LOCAL_MODEL = "HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL"
@@ -1415,6 +1416,7 @@ class HindsightConfig:
     session_summary_llm_api_key: str | None
     session_summary_llm_model: str | None
     session_summary_llm_base_url: str | None
+    session_summary_llm_litellmrouter_config: dict | None
 
     # Embeddings
     embeddings_provider: str
@@ -1739,6 +1741,7 @@ class HindsightConfig:
         "retain_llm_litellmrouter_config",
         "reflect_llm_litellmrouter_config",
         "consolidation_llm_litellmrouter_config",
+        "session_summary_llm_litellmrouter_config",
         # Base URLs (could expose infrastructure)
         "llm_base_url",
         "retain_llm_base_url",
@@ -2163,6 +2166,9 @@ class HindsightConfig:
             session_summary_llm_api_key=os.getenv(ENV_SESSION_SUMMARY_LLM_API_KEY) or None,
             session_summary_llm_model=os.getenv(ENV_SESSION_SUMMARY_LLM_MODEL) or None,
             session_summary_llm_base_url=os.getenv(ENV_SESSION_SUMMARY_LLM_BASE_URL) or None,
+            session_summary_llm_litellmrouter_config=_parse_llm_router_config(
+                ENV_SESSION_SUMMARY_LLM_LITELLMROUTER_CONFIG
+            ),
             # Embeddings
             embeddings_provider=os.getenv(ENV_EMBEDDINGS_PROVIDER, DEFAULT_EMBEDDINGS_PROVIDER),
             embeddings_local_model=os.getenv(ENV_EMBEDDINGS_LOCAL_MODEL, DEFAULT_EMBEDDINGS_LOCAL_MODEL),
