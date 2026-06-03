@@ -1,4 +1,4 @@
-import { afterEach, describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -34,7 +34,12 @@ import {
   getSessionSummaryBudgetFromConfig,
   isSessionSummaryLifecycleActive,
   DEFAULT_RETAIN_CONTEXT,
+  makeSessionSummaryGenerator,
 } from "./index.js";
+import {
+  FakeSessionSummaryGenerator,
+  HindsightApiSessionSummaryGenerator,
+} from "./session-summary-generator.js";
 import type {
   PluginConfig,
   MemoryResult,
@@ -1609,7 +1614,31 @@ describe("session summary lifecycle helpers", () => {
 });
 
 describe("session summary hook lifecycle", () => {
-  it("updates a fake rolling summary on agent_end and injects it before prompt build without recall", async () => {
+  it("updates rolling summary via API on agent_end and injects it before prompt build without recall", async () => {
+    // Stub global fetch so the HindsightApiSessionSummaryGenerator has a real transport
+    // without hitting a real server. The summary content is fixed by the stub.
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        status: "ready",
+        schema_version: 1,
+        summary_json: {
+          schemaVersion: 1,
+          activeProjects: ["project zephyr"],
+          semanticAnchors: ["TypeScript decision"],
+          exactIdentifiers: [],
+          decisions: ["use TypeScript for project zephyr"],
+          blockers: [],
+          openQuestions: [],
+          completedTodos: [],
+        },
+        summary_text:
+          "Active projects: project zephyr\nDecisions: use TypeScript for project zephyr",
+        model_info: { provider: "mock", model: "mock-model" },
+      }),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
     const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-"));
     tempDirs.push(dir);
     const handle = makeHookApi({
@@ -1619,6 +1648,7 @@ describe("session summary hook lifecycle", () => {
       sessionSummaryEnabled: true,
       sessionSummaryInjectPrompt: true,
       sessionSummaryStorePath: join(dir, "summary.sqlite"),
+      hindsightApiUrl: "http://hindsight-test:9077",
     });
     hindsightOpenclawPlugin(handle.api);
 
@@ -1652,7 +1682,9 @@ describe("session summary hook lifecycle", () => {
     expect(result?.prependSystemContext).toContain("<hindsight_session_summary>");
     expect(result?.prependSystemContext).toContain("project zephyr");
     expect(result?.prependSystemContext).not.toContain("<hindsight_memories>");
+
     await handle.stop();
+    vi.unstubAllGlobals();
   });
 });
 
@@ -1818,5 +1850,97 @@ describe("getPluginConfig — retainContext", () => {
     expect(getPluginConfig(makeApi({ retainContext: 42 })).retainContext).toBe(
       DEFAULT_RETAIN_CONTEXT
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// makeSessionSummaryGenerator — production routing
+// ---------------------------------------------------------------------------
+
+describe("makeSessionSummaryGenerator", () => {
+  it("returns HindsightApiSessionSummaryGenerator when hindsightApiUrl is configured", () => {
+    const config = getPluginConfig(
+      makeApi({
+        sessionSummaryEnabled: true,
+        sessionSummaryInjectPrompt: true,
+        hindsightApiUrl: "http://hindsight:9077",
+      })
+    );
+    const gen = makeSessionSummaryGenerator(config);
+    expect(gen).toBeInstanceOf(HindsightApiSessionSummaryGenerator);
+    expect(gen).not.toBeInstanceOf(FakeSessionSummaryGenerator);
+  });
+
+  it("returns null when session summary lifecycle is not active", () => {
+    const config = getPluginConfig(makeApi({ sessionSummaryEnabled: false }));
+    const gen = makeSessionSummaryGenerator(config);
+    expect(gen).toBeNull();
+  });
+
+  it("returns null (fail-closed) when lifecycle is active but no API URL configured", () => {
+    // Without hindsightApiUrl there's no real generator available.
+    // Production path must not silently fall back to Fake.
+    const config = getPluginConfig(
+      makeApi({
+        sessionSummaryEnabled: true,
+        sessionSummaryInjectPrompt: true,
+        // No hindsightApiUrl
+      })
+    );
+    const gen = makeSessionSummaryGenerator(config);
+    expect(gen).toBeNull();
+  });
+
+  it("sends Bearer auth header when apiToken is provided", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        status: "ready",
+        schema_version: 1,
+        summary_json: { schemaVersion: 1, activeProjects: [] },
+        summary_text: "",
+        model_info: { provider: "mock", model: "m" },
+      }),
+    });
+
+    const config = getPluginConfig(
+      makeApi({
+        sessionSummaryEnabled: true,
+        sessionSummaryInjectPrompt: true,
+        hindsightApiUrl: "http://hindsight:9077",
+        hindsightApiToken: "test-bearer-token",
+      })
+    );
+    const gen = makeSessionSummaryGenerator(config, { fetchFn: fetchSpy });
+    expect(gen).toBeInstanceOf(HindsightApiSessionSummaryGenerator);
+    await gen!.generate({
+      sessionId: "s1",
+      identityScope: "b1",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const [, opts] = fetchSpy.mock.calls[0];
+    expect((opts.headers as Record<string, string>)["Authorization"]).toBe(
+      "Bearer test-bearer-token"
+    );
+  });
+
+  it("token not leaked when API call fails", async () => {
+    const fetchSpy = vi.fn().mockRejectedValue(new Error("connection refused"));
+    const config = getPluginConfig(
+      makeApi({
+        sessionSummaryEnabled: true,
+        sessionSummaryInjectPrompt: true,
+        hindsightApiUrl: "http://hindsight:9077",
+        hindsightApiToken: "super-secret-token-abc",
+      })
+    );
+    const gen = makeSessionSummaryGenerator(config, { fetchFn: fetchSpy });
+    const result = await gen!.generate({
+      sessionId: "s1",
+      identityScope: "b1",
+      messages: [],
+    });
+    expect(result.status).toBe("error");
+    expect(result.error ?? "").not.toContain("super-secret-token-abc");
   });
 });

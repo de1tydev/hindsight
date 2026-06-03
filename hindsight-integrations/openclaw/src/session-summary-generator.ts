@@ -265,6 +265,121 @@ export function buildSessionSummaryBudgetedText(
   };
 }
 
+interface HindsightApiGeneratorOptions {
+  apiUrl: string;
+  apiToken: string | undefined;
+  timeoutMs: number;
+  /** Injectable fetch implementation for testing. Defaults to globalThis.fetch. */
+  fetchFn?: typeof fetch;
+}
+
+/**
+ * Production session summary generator that delegates to the Hindsight API endpoint.
+ *
+ * LLM routing (session_summary_llm_* > retain_llm_* > global) happens server-side;
+ * the client only sends the messages and budget constraints.
+ */
+export class HindsightApiSessionSummaryGenerator implements SessionSummaryGenerator {
+  private readonly apiUrl: string;
+  private readonly apiToken: string | undefined;
+  private readonly timeoutMs: number;
+  private readonly fetchFn: typeof fetch;
+
+  constructor(opts: HindsightApiGeneratorOptions) {
+    this.apiUrl = opts.apiUrl.replace(/\/$/, "");
+    this.apiToken = opts.apiToken;
+    this.timeoutMs = opts.timeoutMs;
+    this.fetchFn = opts.fetchFn ?? globalThis.fetch.bind(globalThis);
+  }
+
+  async generate(request: SessionSummaryRequest): Promise<SessionSummaryResult> {
+    const endpoint = `${this.apiUrl}/v1/session-summary/generate`;
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.apiToken) {
+      headers["Authorization"] = `Bearer ${this.apiToken}`;
+    }
+
+    const body = JSON.stringify({
+      session_id: request.sessionId,
+      identity_scope: request.identityScope,
+      previous_summary: request.previousSummary ?? null,
+      latest_query: request.latestQuery ?? null,
+      messages: (request.messages ?? []).map((m) => ({
+        role: String(m.role ?? ""),
+        content: String(m.content ?? ""),
+      })),
+      metadata: request.metadata ?? null,
+      budget: request.budget ?? null,
+    });
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    try {
+      const resp = await this.fetchFn(endpoint, {
+        method: "POST",
+        headers,
+        body,
+        signal: controller.signal,
+      });
+
+      if (!resp.ok) {
+        const detail = await resp.text().catch(() => String(resp.status));
+        return this._errorResult(`session-summary API error ${resp.status}: ${detail}`);
+      }
+
+      const data = (await resp.json()) as Record<string, unknown>;
+      return this._parseApiResponse(data);
+    } catch (err) {
+      // Never include the api token in the error message.
+      const msg = err instanceof Error ? err.message : String(err);
+      return this._errorResult(`session-summary request failed: ${msg}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private _parseApiResponse(data: Record<string, unknown>): SessionSummaryResult {
+    const summaryJson = (data.summary_json as Record<string, unknown> | undefined) ?? {};
+    summaryJson.schemaVersion =
+      summaryJson.schemaVersion ?? SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION;
+
+    const rawText = String(data.summary_text ?? "");
+    const summaryText = sanitizeSessionSummaryText(rawText, {
+      maxChars: DEFAULT_SESSION_SUMMARY_BUDGET.maxOutputChars,
+    });
+
+    const status = data.status === "ready" ? "ready" : "error";
+    const result: SessionSummaryResult = {
+      summaryJson,
+      summaryText,
+      schemaVersion: SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
+      status,
+    };
+    if (data.error) result.error = String(data.error);
+    return result;
+  }
+
+  private _errorResult(msg: string): SessionSummaryResult {
+    return {
+      summaryJson: {
+        schemaVersion: SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
+        activeProjects: [],
+        semanticAnchors: [],
+        exactIdentifiers: [],
+        decisions: [],
+        blockers: [],
+        openQuestions: [],
+        completedTodos: [],
+      },
+      summaryText: "",
+      schemaVersion: SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
+      status: "error",
+      error: msg,
+    };
+  }
+}
+
 export class FakeSessionSummaryGenerator implements SessionSummaryGenerator {
   generate(request: SessionSummaryRequest): SessionSummaryResult {
     try {
