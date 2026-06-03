@@ -253,11 +253,23 @@ def _summarize_recall_phase_metrics(trace: Any) -> dict[str, int]:
 
     fields = {
         "embedding_ms": 0,
-        "retrieval_ms": 0,
+        "retrieval_wall_ms": 0,
+        "retrieval_sum_ms": 0,
+        "retrieval_semantic_ms": 0,
+        "retrieval_bm25_ms": 0,
+        "retrieval_graph_ms": 0,
+        "retrieval_temporal_ms": 0,
+        "retrieval_temporal_extraction_ms": 0,
+        "rrf_merge_ms": 0,
         "rerank_ms": 0,
         "token_filtering_ms": 0,
         "entity_hydration_ms": 0,
-        "merge_ms": 0,
+        "source_fact_hydration_ms": 0,
+        "response_serialization_ms": 0,
+        "candidates_semantic": 0,
+        "candidates_bm25": 0,
+        "candidates_graph": 0,
+        "candidates_temporal": 0,
         "candidates_reranked": 0,
         "candidates_merged": 0,
     }
@@ -270,6 +282,47 @@ def _summarize_recall_phase_metrics(trace: Any) -> dict[str, int]:
 
         if "embed" in name:
             fields["embedding_ms"] += duration
+        elif name == "parallel retrieval":
+            fields["retrieval_wall_ms"] += duration
+            fields["candidates_semantic"] = max(
+                fields["candidates_semantic"], _detail_int(details, "semantic_count", "candidates_semantic")
+            )
+            fields["candidates_bm25"] = max(
+                fields["candidates_bm25"], _detail_int(details, "bm25_count", "candidates_bm25")
+            )
+            fields["candidates_graph"] = max(
+                fields["candidates_graph"], _detail_int(details, "graph_count", "candidates_graph")
+            )
+            fields["candidates_temporal"] = max(
+                fields["candidates_temporal"], _detail_int(details, "temporal_count", "candidates_temporal")
+            )
+        elif name in {"retrieval semantic", "semantic retrieval"}:
+            fields["retrieval_semantic_ms"] += duration
+            fields["retrieval_sum_ms"] += duration
+            fields["candidates_semantic"] = max(
+                fields["candidates_semantic"], _detail_int(details, "candidates", "candidate_count", "num_candidates")
+            )
+        elif name in {"retrieval bm25", "bm25 retrieval", "keyword retrieval"}:
+            fields["retrieval_bm25_ms"] += duration
+            fields["retrieval_sum_ms"] += duration
+            fields["candidates_bm25"] = max(
+                fields["candidates_bm25"], _detail_int(details, "candidates", "candidate_count", "num_candidates")
+            )
+        elif name in {"retrieval graph", "graph retrieval"}:
+            fields["retrieval_graph_ms"] += duration
+            fields["retrieval_sum_ms"] += duration
+            fields["candidates_graph"] = max(
+                fields["candidates_graph"], _detail_int(details, "candidates", "candidate_count", "num_candidates")
+            )
+        elif name in {"retrieval temporal", "temporal retrieval"}:
+            fields["retrieval_temporal_ms"] += duration
+            fields["retrieval_sum_ms"] += duration
+            fields["candidates_temporal"] = max(
+                fields["candidates_temporal"], _detail_int(details, "candidates", "candidate_count", "num_candidates")
+            )
+        elif "temporal" in name and "extraction" in name:
+            fields["retrieval_temporal_extraction_ms"] += duration
+            fields["retrieval_sum_ms"] += duration
         elif "rerank" in name or "re rank" in name:
             fields["rerank_ms"] += duration
             fields["candidates_reranked"] = max(
@@ -278,22 +331,59 @@ def _summarize_recall_phase_metrics(trace: Any) -> dict[str, int]:
             )
         elif "token" in name and ("filter" in name or "budget" in name):
             fields["token_filtering_ms"] += duration
+        elif "source" in name and "fact" in name and "hydrat" in name:
+            fields["source_fact_hydration_ms"] += duration
         elif "entity" in name and ("hydrat" in name or "expand" in name or "include" in name):
             fields["entity_hydration_ms"] += duration
-        elif "merge" in name or "dedup" in name or "combine" in name:
-            fields["merge_ms"] += duration
+        elif "serial" in name or "response build" in name:
+            fields["response_serialization_ms"] += duration
+        elif "rrf" in name or "merge" in name or "dedup" in name or "combine" in name:
+            fields["rrf_merge_ms"] += duration
             fields["candidates_merged"] = max(
                 fields["candidates_merged"],
                 _detail_int(details, "candidates_merged", "candidates", "candidate_count", "num_candidates"),
             )
-        elif "retriev" in name or "semantic" in name or "bm25" in name or "graph" in name or "temporal" in name:
-            fields["retrieval_ms"] += duration
+
+    if fields["retrieval_wall_ms"] == 0 and fields["retrieval_sum_ms"] > 0:
+        fields["retrieval_wall_ms"] = fields["retrieval_sum_ms"]
 
     return fields
 
 
 def _format_metric_fields(fields: dict[str, Any]) -> str:
     return " ".join(f"{key}={value}" for key, value in fields.items())
+
+
+def _log_slow_recall_phases(bank_id: str, recall_id: str, fields: dict[str, int], threshold_ms: int = 2000) -> None:
+    """Emit request-scoped slow-phase logs from compact recall metrics."""
+    for key in (
+        "embedding_ms",
+        "retrieval_wall_ms",
+        "retrieval_semantic_ms",
+        "retrieval_bm25_ms",
+        "retrieval_graph_ms",
+        "retrieval_temporal_ms",
+        "retrieval_temporal_extraction_ms",
+        "rrf_merge_ms",
+        "rerank_ms",
+        "token_filtering_ms",
+        "entity_hydration_ms",
+        "source_fact_hydration_ms",
+        "response_serialization_ms",
+    ):
+        duration_ms = int(fields.get(key) or 0)
+        if duration_ms >= threshold_ms:
+            logger.warning(
+                "[RECALL SLOW PHASE] "
+                + _format_metric_fields(
+                    {
+                        "bank": bank_id,
+                        "recall_id": recall_id,
+                        "phase": key.removesuffix("_ms"),
+                        "duration_ms": duration_ms,
+                    }
+                )
+            )
 
 
 class EntityIncludeOptions(BaseModel):
@@ -3944,6 +4034,7 @@ def _register_routes(app: FastAPI):
         import time
 
         handler_start = time.time()
+        recall_id = f"{bank_id[:8]}-{int(handler_start * 1000) % 100000}-{uuid.uuid4().hex[:6]}"
         metrics = get_metrics_collector()
 
         # Validate query length to prevent expensive operations on oversized queries
@@ -4017,10 +4108,13 @@ def _register_routes(app: FastAPI):
                         tags=request.tags,
                         tags_match=request.tags_match,
                         tag_groups=request.tag_groups,
+                        _recall_id=recall_id,
                     ),
                     operation="recall",
                     bank_id=bank_id,
                 )
+
+            response_build_start = time.time()
 
             # Convert core MemoryFact objects to API RecallResult objects (excluding internal metrics)
             def _fact_to_result(fact: "MemoryFact") -> RecallResult:
@@ -4082,23 +4176,26 @@ def _register_routes(app: FastAPI):
                 chunks=chunks_response,
                 source_facts=source_facts_response,
             )
+            response_build_duration = time.time() - response_build_start
 
             handler_duration = time.time() - handler_start
             recall_duration = time.time() - recall_start
             post_recall = handler_duration - pre_recall - recall_duration
             if handler_duration > 1.0:
                 logging.info(
-                    f"[RECALL HTTP] bank={bank_id} handler_total={handler_duration:.3f}s "
+                    f"[RECALL HTTP] bank={bank_id} recall_id={recall_id} handler_total={handler_duration:.3f}s "
                     f"pre={pre_recall:.3f}s recall={recall_duration:.3f}s post={post_recall:.3f}s "
                     f"results={len(recall_results)} entities={len(entities_response) if entities_response else 0}"
                 )
             phase_fields = _summarize_recall_phase_metrics(core_result.trace)
             if phase_fields:
+                phase_fields["response_serialization_ms"] = _duration_ms(response_build_duration)
                 logger.info(
                     "[RECALL HTTP PHASES] "
                     + _format_metric_fields(
                         {
                             "bank": bank_id,
+                            "recall_id": recall_id,
                             "total_ms": _duration_ms(handler_duration),
                             "recall_ms": _duration_ms(recall_duration),
                             **phase_fields,
@@ -4107,6 +4204,7 @@ def _register_routes(app: FastAPI):
                         }
                     )
                 )
+                _log_slow_recall_phases(bank_id, recall_id, phase_fields)
 
             return response
         except HTTPException:
@@ -4118,7 +4216,8 @@ def _register_routes(app: FastAPI):
         except (asyncio.TimeoutError, TimeoutError):
             handler_duration = time.time() - handler_start
             logger.error(
-                f"[RECALL TIMEOUT] bank={bank_id} handler_duration={handler_duration:.3f}s - database query timed out"
+                f"[RECALL TIMEOUT] bank={bank_id} recall_id={recall_id} "
+                f"handler_duration={handler_duration:.3f}s - database query timed out"
             )
             raise HTTPException(
                 status_code=504,
@@ -4130,7 +4229,8 @@ def _register_routes(app: FastAPI):
             handler_duration = time.time() - handler_start
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(
-                f"[RECALL ERROR] bank={bank_id} handler_duration={handler_duration:.3f}s error={str(e)}\n{error_detail}"
+                f"[RECALL ERROR] bank={bank_id} recall_id={recall_id} "
+                f"handler_duration={handler_duration:.3f}s error={str(e)}\n{error_detail}"
             )
             raise HTTPException(status_code=500, detail=str(e))
 
