@@ -369,6 +369,30 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   ]);
 }
 
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+export function extractHookSessionIdentity(
+  event: any,
+  ctx?: PluginHookAgentContext
+): { sessionId?: string; sessionKey?: string } {
+  const eventContext =
+    event?.context && typeof event.context === "object"
+      ? (event.context as Record<string, unknown>)
+      : {};
+  return {
+    sessionId:
+      stringValue(ctx?.sessionId) ??
+      stringValue(event?.sessionId) ??
+      stringValue(eventContext.sessionId),
+    sessionKey:
+      stringValue(ctx?.sessionKey) ??
+      stringValue(event?.sessionKey) ??
+      stringValue(eventContext.sessionKey),
+  };
+}
+
 export function isSessionSummaryLifecycleActive(config: PluginConfig): boolean {
   return (
     config.sessionSummaryEnabled === true &&
@@ -2536,10 +2560,7 @@ export default function (api: MoltbotPluginAPI) {
 
     api.on("before_dispatch", async (event: any, ctx?: PluginHookAgentContext) => {
       try {
-        const sessionKey =
-          ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
-        const sessionId =
-          ctx?.sessionId ?? (typeof event?.sessionId === "string" ? event.sessionId : undefined);
+        const { sessionId, sessionKey } = extractHookSessionIdentity(event, ctx);
         if (!sessionKey) {
           return;
         }
@@ -2603,7 +2624,7 @@ export default function (api: MoltbotPluginAPI) {
         }
 
         // Session pattern filtering
-        const sessionKey = ctx?.sessionKey;
+        const { sessionId: hookSessionId, sessionKey } = extractHookSessionIdentity(event, ctx);
         if (sessionKey) {
           const ignorePatterns = compileSessionPatterns(pluginConfig.ignoreSessionPatterns ?? []);
           if (ignorePatterns.length > 0 && matchesSessionPattern(sessionKey, ignorePatterns)) {
@@ -2629,14 +2650,12 @@ export default function (api: MoltbotPluginAPI) {
           }
         }
 
-        const sessionKeyForCache =
-          ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
-        const eventSessionId = typeof event?.sessionId === "string" ? event.sessionId : undefined;
+        const sessionKeyForCache = sessionKey;
         const ctxForRecall =
-          ctx || eventSessionId
+          ctx || hookSessionId || sessionKeyForCache
             ? ({
                 ...ctx,
-                sessionId: ctx?.sessionId ?? eventSessionId,
+                sessionId: ctx?.sessionId ?? hookSessionId,
                 sessionKey: ctx?.sessionKey ?? sessionKeyForCache,
               } as PluginHookAgentContext)
             : undefined;
@@ -2874,17 +2893,16 @@ ${memoriesFormatted}
       const perfHookStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
       try {
         // Avoid cross-session contamination: only use context carried by this event.
-        const eventSessionKey =
-          typeof event?.sessionKey === "string" ? event.sessionKey : undefined;
-        const eventSessionId = typeof event?.sessionId === "string" ? event.sessionId : undefined;
+        const { sessionId: eventSessionId, sessionKey: eventSessionKey } =
+          extractHookSessionIdentity(event, ctx);
         const effectiveCtx =
-          ctx ||
-          (eventSessionKey || eventSessionId
+          ctx || eventSessionKey || eventSessionId
             ? ({
+                ...ctx,
                 sessionId: eventSessionId,
-                sessionKey: eventSessionKey,
+                sessionKey: ctx?.sessionKey ?? eventSessionKey,
               } as PluginHookAgentContext)
-            : undefined);
+            : undefined;
 
         // Check if this provider is excluded
         if (
