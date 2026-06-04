@@ -21,9 +21,7 @@ import {
   type SessionSummaryGenerator,
   type SessionSummaryResult,
 } from "./session-summary-generator.js";
-import {
-  composeSummaryRecallQuery,
-} from "./session-summary-assembly.js";
+import { composeSummaryRecallQuery } from "./session-summary-assembly.js";
 import { createHash } from "crypto";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
