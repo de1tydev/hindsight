@@ -507,11 +507,15 @@ export function buildSessionSummaryIdentity(
   config: PluginConfig
 ): { summaryKey: string; identityScope: string } {
   const bankId = deriveBankId(resolvedCtx, config);
-  const sessionPart = sanitizeDocumentIdPart(resolvedCtx?.sessionKey, "session");
   const bankPart = sanitizeDocumentIdPart(bankId, "bank");
+  const sessionId = resolvedCtx?.sessionId?.trim();
+  const sessionKey = resolvedCtx?.sessionKey?.trim();
+  const sessionIdentityPart = sessionId
+    ? `session-id:${sanitizeDocumentIdPart(sessionId, "session")}`
+    : `session-key:${sanitizeDocumentIdPart(sessionKey, "session")}`;
   return {
     identityScope: bankId,
-    summaryKey: `openclaw:${bankPart}:${sessionPart}`,
+    summaryKey: `openclaw:${bankPart}:${sessionIdentityPart}`,
   };
 }
 
@@ -569,12 +573,18 @@ function latestUserText(messages: any[]): string {
     const msg = messages[i];
     if (msg?.role !== "user") continue;
     if (typeof msg.content === "string") {
-      return stripMetadataEnvelopes(stripMemoryTags(msg.content)).trim();
+      return stripRuntimeEnvelope(
+        stripInlineTimestampPrefix(stripMetadataEnvelopes(stripMemoryTags(msg.content)))
+      ).trim();
     }
     if (Array.isArray(msg.content)) {
       return msg.content
         .filter((block: any) => block?.type === "text" && typeof block?.text === "string")
-        .map((block: any) => stripMetadataEnvelopes(stripMemoryTags(block.text)).trim())
+        .map((block: any) =>
+          stripRuntimeEnvelope(
+            stripInlineTimestampPrefix(stripMetadataEnvelopes(stripMemoryTags(block.text)))
+          ).trim()
+        )
         .filter(Boolean)
         .join("\n");
     }
@@ -596,8 +606,10 @@ function normalizeSummaryMessages(messages: any[]): Array<Record<string, unknown
     }
     return {
       role: msg?.role,
-      content: stripInlineTimestampPrefix(
-        stripMetadataEnvelopes(stripInlineRetainTags(stripMemoryTags(content)))
+      content: stripRuntimeEnvelope(
+        stripInlineTimestampPrefix(
+          stripMetadataEnvelopes(stripInlineRetainTags(stripMemoryTags(content)))
+        )
       ),
       timestamp: normalizeMessageTimestamp(msg),
     };
@@ -661,6 +673,7 @@ async function updateSessionSummaryForMessages(input: {
           turnIndex,
           metadata: {
             source: "openclaw",
+            sessionId: input.resolvedCtx?.sessionId,
             sessionKey: input.resolvedCtx?.sessionKey,
             provider: input.resolvedCtx?.messageProvider,
             channelId: input.resolvedCtx?.channelId,
@@ -1198,7 +1211,9 @@ export function composeRecallQueryLatestFirst(
                 .map((block: any) => block.text)
                 .join("\n")
             : "";
-      const cleaned = stripMetadataEnvelopes(stripMemoryTags(content)).trim();
+      const cleaned = stripRuntimeEnvelope(
+        stripInlineTimestampPrefix(stripMetadataEnvelopes(stripMemoryTags(content)))
+      ).trim();
       if (!cleaned || (role === "user" && cleaned === latest)) return null;
       return `${role}: ${cleaned}`;
     })
@@ -2562,6 +2577,8 @@ export default function (api: MoltbotPluginAPI) {
       try {
         const sessionKey =
           ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
+        const sessionId =
+          ctx?.sessionId ?? (typeof event?.sessionId === "string" ? event.sessionId : undefined);
         if (!sessionKey) {
           return;
         }
@@ -2574,6 +2591,7 @@ export default function (api: MoltbotPluginAPI) {
           sessionKey,
           ctx: {
             ...ctx,
+            sessionId,
             sessionKey,
             senderId:
               (typeof event?.senderId === "string" ? event.senderId : undefined) || ctx?.senderId,
@@ -2652,6 +2670,15 @@ export default function (api: MoltbotPluginAPI) {
 
         const sessionKeyForCache =
           ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
+        const eventSessionId = typeof event?.sessionId === "string" ? event.sessionId : undefined;
+        const ctxForRecall =
+          ctx || eventSessionId
+            ? ({
+                ...ctx,
+                sessionId: ctx?.sessionId ?? eventSessionId,
+                sessionKey: ctx?.sessionKey ?? sessionKeyForCache,
+              } as PluginHookAgentContext)
+            : undefined;
         const skipTurnReason = sessionKeyForCache
           ? skipHindsightTurnBySession.get(sessionKeyForCache)
           : undefined;
@@ -2669,7 +2696,7 @@ export default function (api: MoltbotPluginAPI) {
         const { resolvedCtx: resolvedCtxForRecall, skipReason: identitySkipReason } =
           resolveAndCacheIdentity({
             sessionKey: sessionKeyForCache,
-            ctx,
+            ctx: ctxForRecall,
             senderIdHint: senderIdFromPrompt,
             pluginConfig,
           });
@@ -2903,10 +2930,14 @@ ${memoriesFormatted}
         // Avoid cross-session contamination: only use context carried by this event.
         const eventSessionKey =
           typeof event?.sessionKey === "string" ? event.sessionKey : undefined;
+        const eventSessionId = typeof event?.sessionId === "string" ? event.sessionId : undefined;
         const effectiveCtx =
           ctx ||
-          (eventSessionKey
-            ? ({ sessionKey: eventSessionKey } as PluginHookAgentContext)
+          (eventSessionKey || eventSessionId
+            ? ({
+                sessionId: eventSessionId,
+                sessionKey: eventSessionKey,
+              } as PluginHookAgentContext)
             : undefined);
 
         // Check if this provider is excluded
@@ -3376,10 +3407,33 @@ export function buildRetainRequest(
   };
 }
 
+export interface RetentionSessionContext {
+  senderId?: string;
+  channelId?: string;
+  provider?: string;
+}
+
+/**
+ * Build a session-context block for legacy callers that need to render routing
+ * metadata separately from retained transcript content.
+ */
+export function formatRetentionSessionContext(
+  ctx: RetentionSessionContext | null | undefined
+): string | null {
+  if (!ctx) return null;
+  const lines: string[] = [];
+  if (ctx.senderId) lines.push(`sender: ${ctx.senderId}`);
+  if (ctx.channelId) lines.push(`channel: ${ctx.channelId}`);
+  if (ctx.provider) lines.push(`provider: ${ctx.provider}`);
+  if (lines.length === 0) return null;
+  return ["[context]", ...lines, "[/context]"].join("\n");
+}
+
 export function prepareRetentionTranscript(
   messages: any[],
   pluginConfig: PluginConfig,
-  retainFullWindow = false
+  retainFullWindow = false,
+  _sessionContext?: RetentionSessionContext | null
 ): { transcript: string; messageCount: number } | null {
   if (!messages || messages.length === 0) {
     return null;
