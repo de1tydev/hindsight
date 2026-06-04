@@ -119,14 +119,12 @@ export interface PluginConfig {
   recallMaxQueryChars?: number; // Max chars for composed recall query. Default: 800
   recallPromptPreamble?: string; // Prompt preamble placed above recalled memories. Default: built-in guidance text.
   recallInjectionPosition?: "prepend" | "append" | "user"; // Where to inject recalled memories. 'prepend' = start of system prompt (default), 'append' = end of system prompt (preserves prompt cache), 'user' = before user message.
-  sessionSummaryEnabled?: boolean; // Enables rolling session summary lifecycle when at least one consumption/update flag is enabled.
+  sessionSummaryEnabled?: boolean; // Enables rolling session summary lifecycle for configured update cadence and recall-query enrichment.
   sessionSummaryStorePath?: string; // Optional SQLite path for rolling session summaries. Default: ~/.openclaw/data/hindsight-session-summaries.sqlite.
   sessionSummaryEnrichRecallQuery?: boolean; // Adds rolling summary text after the latest recall query while preserving recallMaxQueryChars. Default: false.
-  sessionSummaryEnrichRetainContext?: boolean; // Adds rolling summary text to retain extraction context, never transcript content. Default: false.
-  sessionSummaryInjectPrompt?: boolean; // Injects a separate <hindsight_session_summary> prompt block. Default: false.
-  sessionSummaryGeneratorProvider?: string; // Optional real generator request; currently records correct-course boundary and uses FakeSessionSummaryGenerator.
-  sessionSummaryGeneratorModel?: string; // Optional real generator model request; currently no-op without a stable OpenClaw LLM helper.
-  sessionSummaryGeneratorBaseUrl?: string; // Optional real generator base URL request; currently no-op without a stable OpenClaw LLM helper.
+  sessionSummaryGeneratorProvider?: string; // Optional summary generator provider hint; Hindsight API performs final routing.
+  sessionSummaryGeneratorModel?: string; // Optional summary generator model hint; Hindsight API performs final routing.
+  sessionSummaryGeneratorBaseUrl?: string; // Optional summary generator base URL hint; Hindsight API performs final routing.
   sessionSummaryGeneratorApiKeyEnv?: string; // Env var name for summary generator API key. Default: HINDSIGHT_LLM_API_KEY.
   sessionSummaryReuseHindsightLlmConfig?: boolean; // Reuse llmProvider/llmModel/llmBaseUrl when summary fields are unset. Default: true.
   sessionSummaryUpdateEveryNTurns?: number; // Optional summary refresh cadence independent from retainEveryNTurns.
@@ -136,8 +134,6 @@ export interface PluginConfig {
   sessionSummaryMaxOutputChars?: number; // Max rendered summary chars. Default: 2000.
   sessionSummaryMaxRecallQueryChars?: number; // Budget for summary-derived recall query text. Default: 800.
   sessionSummaryRecallQueryBudgetRatio?: number; // Fraction of summary input budget available to recall query text. Default: 0.25.
-  sessionSummaryMaxPromptInjectChars?: number; // Budget for prompt-injected summary context. Default: 1200.
-  sessionSummaryMaxRetainContextChars?: number; // Budget for retain context summary text. Default: 1200.
   sessionSummaryMinLatestQueryReserveChars?: number; // Latest-query reserve during summary input trimming. Default: 400.
   sessionSummaryDropCompletedTodosAfterTurns?: number; // Completed todo retention horizon. Default: 20.
   ignoreSessionPatterns?: string[]; // Session key glob patterns to skip entirely (no recall, no retain). E.g. ["agent:main:**", "agent:*:cron:**"]

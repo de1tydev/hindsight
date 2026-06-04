@@ -711,18 +711,19 @@ describe("agent_end hook", () => {
     expect(options?.metadata?.message_count).toBe("2");
   });
 
-  it("enriches retain context with a rolling summary without changing transcript content", async () => {
+  it("enriches recall query with a rolling summary without changing retain content", async () => {
     if (!apiReachable) return;
     const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-int-"));
     tempDirs.push(dir);
     retainSpy.mockResolvedValue(OK_RETAIN);
+    recallSpy.mockResolvedValue(EMPTY_RECALL);
     const mod = await import("../src/index.js");
     const handle = createMockApi({
       hindsightApiUrl: HINDSIGHT_API_URL,
       dynamicBankId: true,
       retainEveryNTurns: 1,
       sessionSummaryEnabled: true,
-      sessionSummaryEnrichRetainContext: true,
+      sessionSummaryEnrichRecallQuery: true,
       sessionSummaryStorePath: join(dir, "summary.sqlite"),
     });
     mod.default(handle.api);
@@ -744,8 +745,18 @@ describe("agent_end hook", () => {
     expect(retainSpy).toHaveBeenCalledOnce();
     const [, content, options] = retainSpy.mock.calls[0];
     expect(content).not.toContain("Rolling session summary");
-    expect(options?.context).toContain("Rolling session summary for extraction context:");
-    expect(options?.context).toContain("project aurora");
+    expect(options?.context ?? "").not.toContain("Rolling session summary");
+
+    await handle.trigger(
+      "before_prompt_build",
+      { rawMessage: "What did we decide for aurora?", prompt: "", messages: [] },
+      { messageProvider: "telegram", senderId: "U019S", sessionKey: "sess-summary-retain" }
+    );
+
+    expect(recallSpy).toHaveBeenCalledOnce();
+    const [, query] = recallSpy.mock.calls[0];
+    expect(query).toContain("Rolling session summary:");
+    expect(query).toContain("project aurora");
     await handle.stopServices();
   });
 });

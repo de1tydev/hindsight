@@ -259,8 +259,6 @@ describe("session summary generator", () => {
         maxOutputChars: 2000,
         maxRecallQueryChars: 800,
         recallQueryBudgetRatio: 0.25,
-        maxPromptInjectChars: 1200,
-        maxRetainContextChars: 1200,
         minLatestQueryReserveChars: 32,
         dropCompletedTodosAfterTurns: 20,
       }
@@ -281,8 +279,6 @@ describe("session summary generator", () => {
       maxOutputChars: 2000,
       maxRecallQueryChars: 40,
       recallQueryBudgetRatio: 0.25,
-      maxPromptInjectChars: 1200,
-      maxRetainContextChars: 1200,
       minLatestQueryReserveChars: 80,
       dropCompletedTodosAfterTurns: 20,
     };
@@ -313,7 +309,7 @@ describe("session summary generator", () => {
     expect(prompt).toContain("latest-query-");
   });
 
-  it("enforces independent summary budgets for derived text variants", () => {
+  it("enforces independent summary budgets for output and recall text", () => {
     const rendered = buildSessionSummaryBudgetedText(
       {
         activeProjects: ["source-map-cli"],
@@ -325,8 +321,6 @@ describe("session summary generator", () => {
         maxOutputChars: 50,
         maxRecallQueryChars: 80,
         recallQueryBudgetRatio: 0.25,
-        maxPromptInjectChars: 30,
-        maxRetainContextChars: 40,
         minLatestQueryReserveChars: 400,
         dropCompletedTodosAfterTurns: 20,
       }
@@ -334,9 +328,6 @@ describe("session summary generator", () => {
 
     expect(rendered.outputText.length).toBeLessThanOrEqual(50);
     expect(rendered.recallQueryText.length).toBeLessThanOrEqual(25);
-    expect(rendered.promptInjectText.length).toBeLessThanOrEqual(30);
-    expect(rendered.retainContextText.length).toBeLessThanOrEqual(40);
-    expect(rendered.recallQueryText).not.toBe(rendered.promptInjectText);
   });
 
   it("builds summary-only prompt and bounded render output", () => {
