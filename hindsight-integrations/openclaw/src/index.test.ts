@@ -28,6 +28,7 @@ import {
   extractInlineRetainTags,
   stripInlineRetainTags,
   stripInlineTimestampPrefix,
+  stripRuntimeEnvelope,
   getPluginConfig,
   formatHookPerf,
   buildSessionSummaryIdentity,
@@ -99,6 +100,32 @@ describe("stripMemoryTags", () => {
     expect(result).toContain("[role: user]");
     expect(result).toContain("How do I enable dark mode?");
     expect(result).toContain("[role: assistant]");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stripRuntimeEnvelope
+// ---------------------------------------------------------------------------
+
+describe("stripRuntimeEnvelope", () => {
+  it("strips leading message id and opaque sender prefix while preserving text", () => {
+    const input =
+      "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+      "ou_cb923a19782fe748cd9fff99454eee31: 我是只retain context的那次改动";
+
+    expect(stripRuntimeEnvelope(input)).toBe("我是只retain context的那次改动");
+  });
+
+  it("removes standalone opaque runtime ids", () => {
+    const input = "om_x100b6d3512c5ccb0c084ad240a38842\n真实内容\noc_abcdef123456";
+
+    expect(stripRuntimeEnvelope(input)).toBe("真实内容");
+  });
+
+  it("does not strip ordinary user text with a colon", () => {
+    const input = "计划: 今天修 retain 污染";
+
+    expect(stripRuntimeEnvelope(input)).toBe(input);
   });
 });
 
@@ -411,6 +438,28 @@ describe("buildRetainRequest", () => {
     expect(request.context).toBe(DEFAULT_RETAIN_CONTEXT);
   });
 
+  it("keeps sender/channel/provider in retain metadata", () => {
+    const request = buildRetainRequest(
+      "hello world",
+      1,
+      {
+        sessionKey: "agent:main:feishu:oc_abcdef123456",
+        messageProvider: "feishu",
+        channelId: "oc_abcdef123456",
+        senderId: "ou_cb923a19782fe748cd9fff99454eee31",
+      },
+      {},
+      1700000000000,
+      { turnIndex: 1 }
+    );
+
+    expect(request.metadata).toMatchObject({
+      provider: "feishu",
+      channel_id: "oc_abcdef123456",
+      sender_id: "ou_cb923a19782fe748cd9fff99454eee31",
+    });
+  });
+
   it("describes routing metadata and assistant/user roles in the default retain context", () => {
     expect(DEFAULT_RETAIN_CONTEXT).toContain("routing identifiers");
     expect(DEFAULT_RETAIN_CONTEXT).toContain("operational routing identifiers");
@@ -714,6 +763,73 @@ describe("prepareRetentionTranscript", () => {
     expect(result?.transcript).not.toContain("client:acme");
   });
 
+  it("strips OpenClaw metadata and Feishu runtime headers from retained structured content", () => {
+    const messages = [
+      {
+        role: "user",
+        content:
+          'Conversation info (untrusted metadata):\n```json\n{"message_id":"om_x100b6d3512c5ccb0c084ad240a38842","sender_id":"ou_cb923a19782fe748cd9fff99454eee31"}\n```\n' +
+          "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+          "ou_cb923a19782fe748cd9fff99454eee31: 我是只retain context的那次改动",
+      },
+    ];
+
+    const result = prepareRetentionTranscript(messages, baseConfig);
+
+    expect(result).not.toBeNull();
+    expect(JSON.parse(result!.transcript)).toEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "我是只retain context的那次改动" }],
+      },
+    ]);
+    expect(result!.transcript).not.toContain("Conversation info");
+    expect(result!.transcript).not.toContain("message_id");
+    expect(result!.transcript).not.toContain("om_x100b6d3512c5ccb0c084ad240a38842");
+    expect(result!.transcript).not.toContain("ou_cb923a19782fe748cd9fff99454eee31");
+  });
+
+  it("strips Feishu runtime headers from retained text-only content", () => {
+    const config: PluginConfig = { ...baseConfig, retainToolCalls: false };
+    const messages = [
+      {
+        role: "user",
+        content:
+          "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+          "ou_cb923a19782fe748cd9fff99454eee31: 我是只retain context的那次改动",
+      },
+    ];
+
+    const result = prepareRetentionTranscript(messages, config);
+
+    expect(result).not.toBeNull();
+    expect(JSON.parse(result!.transcript)).toEqual([
+      { role: "user", content: "我是只retain context的那次改动" },
+    ]);
+  });
+
+  it("strips runtime headers that appear after an inline timestamp", () => {
+    const messages = [
+      {
+        role: "user",
+        content:
+          "[Wed 2026-06-03 19:54 GMT+8]\n" +
+          "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+          "ou_cb923a19782fe748cd9fff99454eee31: 我是只retain context的那次改动",
+      },
+    ];
+
+    const result = prepareRetentionTranscript(messages, baseConfig);
+
+    expect(result).not.toBeNull();
+    expect(JSON.parse(result!.transcript)).toEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "我是只retain context的那次改动" }],
+      },
+    ]);
+  });
+
   it("strips memory tags from user message when prependContext is prepended to it", () => {
     // Simulates the host prepending prependContext to the user message content
     const userContent = `<hindsight_memories>\nRelevant memories:\n- User prefers dark mode [world]\n\nUser message: What is dark mode?\n</hindsight_memories>\nWhat is dark mode?`;
@@ -865,46 +981,49 @@ describe("prepareRetentionTranscript", () => {
     expect(result?.messageCount).toBe(2);
   });
 
-  it("prepends a session-context system message when sessionContext is provided (json)", () => {
+  it("does not prepend session context as retained JSON content", () => {
     const config: PluginConfig = { ...baseConfig, retainToolCalls: false };
     const messages = [{ role: "user", content: "What's MIN-123 status?" }];
     const result = prepareRetentionTranscript(messages, config, false, {
-      senderId: "U7JAF258R",
-      channelId: "C04L6E0H3SQ",
-      provider: "slack",
+      senderId: "ou_cb923a19782fe748cd9fff99454eee31",
+      channelId: "oc_abcdef123456",
+      provider: "feishu",
     });
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!.transcript);
-    expect(parsed[0]).toEqual({
-      role: "system",
-      content: "[context]\nsender: U7JAF258R\nchannel: C04L6E0H3SQ\nprovider: slack\n[/context]",
-    });
-    expect(parsed[1]).toEqual({ role: "user", content: "What's MIN-123 status?" });
-    expect(result?.messageCount).toBe(2);
+    expect(parsed).toEqual([{ role: "user", content: "What's MIN-123 status?" }]);
+    expect(result!.transcript).not.toContain("[context]");
+    expect(result!.transcript).not.toContain("sender: ou_");
+    expect(result!.transcript).not.toContain("channel:");
+    expect(result!.transcript).not.toContain("provider:");
+    expect(result?.messageCount).toBe(1);
   });
 
-  it("prepends a session-context block when sessionContext is provided (text format)", () => {
+  it("does not prepend session context as retained text content", () => {
     const config: PluginConfig = { ...baseConfig, retainFormat: "text" };
     const messages = [{ role: "user", content: "ping" }];
     const result = prepareRetentionTranscript(messages, config, false, {
-      senderId: "U7JAF258R",
+      senderId: "ou_cb923a19782fe748cd9fff99454eee31",
+      channelId: "oc_abcdef123456",
+      provider: "feishu",
     });
     expect(result).not.toBeNull();
-    expect(result!.transcript.startsWith("[context]\nsender: U7JAF258R\n[/context]\n\n")).toBe(
-      true
-    );
+    expect(result!.transcript).not.toContain("[context]");
+    expect(result!.transcript).not.toContain("sender: ou_");
+    expect(result!.transcript).not.toContain("channel:");
+    expect(result!.transcript).not.toContain("provider:");
     expect(result!.transcript).toContain("[role: user]\nping\n[user:end]");
   });
 
-  it("omits the context header when includeSenderContext is explicitly disabled", () => {
+  it("does not prepend the context header when includeSenderContext is explicitly enabled", () => {
     const config: PluginConfig = {
       ...baseConfig,
       retainFormat: "text",
-      includeSenderContext: false,
+      includeSenderContext: true,
     };
     const messages = [{ role: "user", content: "ping" }];
     const result = prepareRetentionTranscript(messages, config, false, {
-      senderId: "U7JAF258R",
+      senderId: "ou_cb923a19782fe748cd9fff99454eee31",
     });
     expect(result).not.toBeNull();
     expect(result!.transcript).not.toContain("[context]");
@@ -1579,7 +1698,68 @@ describe("session summary lifecycle helpers", () => {
     ).toBe(true);
   });
 
-  it("derives a stable summary key from bank identity and session key", () => {
+  it("derives a stable summary key from bank identity and real session id", () => {
+    const identity = buildSessionSummaryIdentity(
+      {
+        agentId: "main",
+        messageProvider: "telegram",
+        channelId: "direct:U123",
+        senderId: "U123",
+        sessionId: "openclaw-real-session-1",
+        sessionKey: "agent:main:telegram:direct:U123",
+      },
+      { dynamicBankId: true }
+    );
+
+    expect(identity.identityScope).toBe("main::direct%3AU123::U123");
+    expect(identity.summaryKey).toContain("openclaw:");
+    expect(identity.summaryKey).toContain(":session-id:openclaw-real-session-1");
+    expect(identity.summaryKey).not.toContain(":session-key:");
+    expect(identity.summaryKey).not.toContain("agent:main:telegram:direct:U123");
+  });
+
+  it("uses sessionId over sessionKey for summary identity", () => {
+    const identity = buildSessionSummaryIdentity(
+      {
+        agentId: "main",
+        messageProvider: "telegram",
+        channelId: "direct:U123",
+        senderId: "U123",
+        sessionId: "sid-preferred",
+        sessionKey: "agent:main:telegram:direct:U123",
+      },
+      { dynamicBankId: true }
+    );
+
+    expect(identity.summaryKey).toContain(":session-id:sid-preferred");
+    expect(identity.summaryKey).not.toContain(":session-key:");
+  });
+
+  it("keeps same sessionKey and different sessionIds in different summary keys", () => {
+    const baseCtx: PluginHookAgentContext = {
+      agentId: "main",
+      messageProvider: "telegram",
+      channelId: "direct:U123",
+      senderId: "U123",
+      sessionKey: "agent:main:telegram:direct:U123",
+    };
+
+    const first = buildSessionSummaryIdentity(
+      { ...baseCtx, sessionId: "real-session-a" },
+      { dynamicBankId: true }
+    );
+    const second = buildSessionSummaryIdentity(
+      { ...baseCtx, sessionId: "real-session-b" },
+      { dynamicBankId: true }
+    );
+
+    expect(first.identityScope).toBe(second.identityScope);
+    expect(first.summaryKey).not.toBe(second.summaryKey);
+    expect(first.summaryKey).toContain(":session-id:real-session-a");
+    expect(second.summaryKey).toContain(":session-id:real-session-b");
+  });
+
+  it("falls back to sessionKey for legacy contexts without sessionId", () => {
     const identity = buildSessionSummaryIdentity(
       {
         agentId: "main",
@@ -1591,9 +1771,7 @@ describe("session summary lifecycle helpers", () => {
       { dynamicBankId: true }
     );
 
-    expect(identity.identityScope).toBe("main::direct%3AU123::U123");
-    expect(identity.summaryKey).toContain("openclaw:");
-    expect(identity.summaryKey).toContain("agent:main:telegram:direct:U123");
+    expect(identity.summaryKey).toContain(":session-key:agent:main:telegram:direct:U123");
   });
 
   it("maps plugin summary budget config to generator budget", () => {
@@ -1657,6 +1835,7 @@ describe("session summary hook lifecycle", () => {
       messageProvider: "telegram",
       channelId: "direct:U777",
       senderId: "U777",
+      sessionId: "real-session-U777-a",
       sessionKey: "agent:main:telegram:direct:U777",
     };
     await handle.trigger(
@@ -1672,6 +1851,14 @@ describe("session summary hook lifecycle", () => {
       ctx
     );
 
+    const [, fetchOptions] = mockFetch.mock.calls[0] as [unknown, { body: string }];
+    const summaryRequestBody = JSON.parse(String(fetchOptions.body));
+    expect(summaryRequestBody.session_id).toContain(":session-id:real-session-U777-a");
+    expect(summaryRequestBody.metadata).toMatchObject({
+      sessionId: "real-session-U777-a",
+      sessionKey: "agent:main:telegram:direct:U777",
+    });
+
     const result = (await handle.trigger(
       "before_prompt_build",
       { rawMessage: "What did we decide?", prompt: "What did we decide?", messages: [] },
@@ -1682,6 +1869,117 @@ describe("session summary hook lifecycle", () => {
     expect(result?.prependSystemContext).toContain("<hindsight_session_summary>");
     expect(result?.prependSystemContext).toContain("project zephyr");
     expect(result?.prependSystemContext).not.toContain("<hindsight_memories>");
+
+    await handle.stop();
+    vi.unstubAllGlobals();
+  });
+
+  it("does not reuse a summary across different sessionIds with the same sessionKey", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockImplementation(async (_url: string, options: { body: string }) => {
+        const requestBody = JSON.parse(String(options.body));
+        const sessionId = requestBody.metadata?.sessionId;
+        const project = sessionId === "real-session-alpha" ? "topic-alpha" : "topic-beta";
+        return {
+          ok: true,
+          json: async () => ({
+            status: "ready",
+            schema_version: 1,
+            summary_json: {
+              schemaVersion: 1,
+              activeProjects: [project],
+              semanticAnchors: [],
+              exactIdentifiers: [],
+              decisions: [],
+              blockers: [],
+              openQuestions: [],
+              completedTodos: [],
+            },
+            summary_text: `Active projects: ${project}`,
+            model_info: { provider: "mock", model: "mock-model" },
+          }),
+        };
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-session-id-scope-"));
+    tempDirs.push(dir);
+    const handle = makeHookApi({
+      autoRecall: false,
+      autoRetain: false,
+      dynamicBankId: true,
+      sessionSummaryEnabled: true,
+      sessionSummaryInjectPrompt: true,
+      sessionSummaryStorePath: join(dir, "summary.sqlite"),
+      hindsightApiUrl: "http://hindsight-test:9077",
+    });
+    hindsightOpenclawPlugin(handle.api);
+
+    const commonCtx = {
+      agentId: "main",
+      messageProvider: "telegram",
+      channelId: "direct:U4242",
+      senderId: "U4242",
+      sessionKey: "agent:main:telegram:direct:U4242",
+    } satisfies PluginHookAgentContext;
+    const alphaCtx: PluginHookAgentContext = {
+      ...commonCtx,
+      sessionId: "real-session-alpha",
+    };
+    const betaCtx: PluginHookAgentContext = {
+      ...commonCtx,
+      sessionId: "real-session-beta",
+    };
+
+    await handle.trigger(
+      "agent_end",
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "I am working on topic-alpha." },
+          { role: "assistant", content: "Noted." },
+          { role: "user", content: "topic-alpha uses session A." },
+        ],
+      },
+      alphaCtx
+    );
+
+    const betaBeforeUpdate = (await handle.trigger(
+      "before_prompt_build",
+      { rawMessage: "What is active?", prompt: "What is active?", messages: [] },
+      betaCtx
+    )) as { prependSystemContext?: string } | undefined;
+    expect(betaBeforeUpdate?.prependSystemContext).toBeUndefined();
+
+    await handle.trigger(
+      "agent_end",
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "I am working on topic-beta." },
+          { role: "assistant", content: "Noted." },
+          { role: "user", content: "topic-beta uses session B." },
+        ],
+      },
+      betaCtx
+    );
+
+    const betaAfterUpdate = (await handle.trigger(
+      "before_prompt_build",
+      { rawMessage: "What is active?", prompt: "What is active?", messages: [] },
+      betaCtx
+    )) as { prependSystemContext?: string } | undefined;
+    expect(betaAfterUpdate?.prependSystemContext).toContain("topic-beta");
+    expect(betaAfterUpdate?.prependSystemContext).not.toContain("topic-alpha");
+
+    const alphaAfterBetaUpdate = (await handle.trigger(
+      "before_prompt_build",
+      { rawMessage: "What is active?", prompt: "What is active?", messages: [] },
+      alphaCtx
+    )) as { prependSystemContext?: string } | undefined;
+    expect(alphaAfterBetaUpdate?.prependSystemContext).toContain("topic-alpha");
+    expect(alphaAfterBetaUpdate?.prependSystemContext).not.toContain("topic-beta");
 
     await handle.stop();
     vi.unstubAllGlobals();
