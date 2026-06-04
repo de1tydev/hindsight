@@ -23,6 +23,13 @@ DEFAULTS = {
         "conflicting). Only use memories that are directly useful to continue "
         "this conversation; ignore the rest:"
     ),
+    # Rolling session summary. Disabled by default for compatibility; when
+    # enabled, Codex keeps a local per-session summary and uses it to enrich
+    # recall queries without retaining the summary back into Hindsight.
+    "sessionSummaryEnabled": False,
+    "sessionSummaryUpdateEveryNTurns": 2,
+    "sessionSummaryTimeout": 20,
+    "sessionSummaryMaxMessages": 24,
     # Retain
     "autoRetain": True,
     "retainMode": "full-session",
@@ -69,6 +76,10 @@ ENV_OVERRIDES = {
     "HINDSIGHT_RECALL_TIMEOUT": ("recallTimeout", int),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
+    "HINDSIGHT_SESSION_SUMMARY_ENABLED": ("sessionSummaryEnabled", bool),
+    "HINDSIGHT_SESSION_SUMMARY_UPDATE_EVERY_N_TURNS": ("sessionSummaryUpdateEveryNTurns", int),
+    "HINDSIGHT_SESSION_SUMMARY_TIMEOUT": ("sessionSummaryTimeout", int),
+    "HINDSIGHT_SESSION_SUMMARY_MAX_MESSAGES": ("sessionSummaryMaxMessages", int),
     "HINDSIGHT_API_PORT": ("apiPort", int),
     "HINDSIGHT_DAEMON_IDLE_TIMEOUT": ("daemonIdleTimeout", int),
     "HINDSIGHT_EMBED_VERSION": ("embedVersion", str),

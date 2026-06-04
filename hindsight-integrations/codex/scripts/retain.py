@@ -33,6 +33,7 @@ from lib.content import (
     slice_last_turns_by_user_boundary,
 )
 from lib.daemon import get_api_url
+from lib.session_summary import update_session_summary
 from lib.state import increment_turn_count
 
 
@@ -67,16 +68,24 @@ def main():
     # Retention mode: full session (default) or chunked (legacy)
     retain_mode = config.get("retainMode", "full-session")
     retain_every_n = max(1, config.get("retainEveryNTurns", 1))
+    turn_count = increment_turn_count(session_id)
+    retain_due = turn_count % retain_every_n == 0
+    summary_enabled = config.get("sessionSummaryEnabled", False)
+    summary_every_n = max(1, config.get("sessionSummaryUpdateEveryNTurns", 2))
+    summary_due = summary_enabled and turn_count % summary_every_n == 0
+
+    if not retain_due and not summary_due:
+        next_retain_at = ((turn_count // retain_every_n) + 1) * retain_every_n
+        next_summary_at = ((turn_count // summary_every_n) + 1) * summary_every_n if summary_enabled else None
+        debug_log(
+            config,
+            f"Turn {turn_count}: skipping retain (next at {next_retain_at})"
+            + (f" and summary (next at {next_summary_at})" if next_summary_at else ""),
+        )
+        return
+
     retain_full_window = False
     messages_to_retain = all_messages
-
-    # Respect retainEveryNTurns in both modes
-    if retain_every_n > 1:
-        turn_count = increment_turn_count(session_id)
-        if turn_count % retain_every_n != 0:
-            next_at = ((turn_count // retain_every_n) + 1) * retain_every_n
-            debug_log(config, f"Turn {turn_count}/{retain_every_n}, skipping retain (next at turn {next_at})")
-            return
 
     if retain_mode == "chunked" and retain_every_n > 1:
         overlap_turns = config.get("retainOverlapTurns", 0)
@@ -121,6 +130,15 @@ def main():
     # Derive bank ID and ensure mission
     bank_id = derive_bank_id(hook_input, config)
     ensure_bank_mission(client, bank_id, config, debug_fn=_dbg)
+
+    if summary_due:
+        summary_messages = read_transcript(transcript_path, include_tool_calls=False)
+        update_session_summary(client, bank_id, session_id, summary_messages, config, debug_fn=_dbg)
+
+    if not retain_due:
+        next_at = ((turn_count // retain_every_n) + 1) * retain_every_n
+        debug_log(config, f"Turn {turn_count}: summary updated, skipping retain (next at turn {next_at})")
+        return
 
     # Document ID: use session_id so the same session always upserts.
     # In chunked mode, append timestamp to create distinct documents per chunk.

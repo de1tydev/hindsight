@@ -139,6 +139,61 @@ class TestRecallHook:
         if "body" in captured_body:
             assert "Python" in captured_body["body"].get("query", "")
 
+    def test_session_summary_enriches_recall_query(self, monkeypatch, tmp_path):
+        """When enabled, saved session summary is included in the recall query."""
+        state_dir = tmp_path / ".hindsight" / "codex" / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "session_summary_sess-abc123.json").write_text(json.dumps({
+            "status": "ready",
+            "summary_text": "Active projects: codex hindsight integration",
+            "summary_json": {"schemaVersion": 1, "activeProjects": ["codex hindsight integration"]},
+        }))
+
+        captured_body = {}
+
+        def capture_and_respond(req, timeout=None):
+            if "/recall" in req.full_url:
+                captured_body["body"] = json.loads(req.data.decode())
+            return FakeHTTPResponse({"results": []})
+
+        hook_input = make_hook_input(prompt="What should I do next?")
+        _run_hook(
+            "recall",
+            hook_input,
+            monkeypatch,
+            tmp_path,
+            urlopen_side_effect=capture_and_respond,
+            user_config={"sessionSummaryEnabled": True},
+        )
+
+        assert "codex hindsight integration" in captured_body["body"].get("query", "")
+
+    def test_session_summary_is_not_injected_into_prompt(self, monkeypatch, tmp_path):
+        """Session summary supports recall query only, not prompt injection."""
+        state_dir = tmp_path / ".hindsight" / "codex" / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "session_summary_sess-abc123.json").write_text(json.dumps({
+            "status": "ready",
+            "summary_text": "Active projects: secret summary text",
+            "summary_json": {"schemaVersion": 1, "activeProjects": ["secret summary text"]},
+        }))
+        memory = make_memory("Relevant recalled memory")
+
+        hook_input = make_hook_input(prompt="What should I do next?")
+        output = _run_hook(
+            "recall",
+            hook_input,
+            monkeypatch,
+            tmp_path,
+            urlopen_side_effect=lambda *a, **kw: FakeHTTPResponse({"results": [memory]}),
+            user_config={"sessionSummaryEnabled": True},
+        )
+
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        assert "Relevant recalled memory" in context
+        assert "secret summary text" not in context
+        assert "<hindsight_session_summary>" not in context
+
     def test_recall_timeout_is_configurable(self, monkeypatch, tmp_path):
         memory = make_memory("User prefers Python")
         captured = {}
@@ -272,6 +327,44 @@ class TestRetainHook:
                   urlopen_side_effect=capture,
                   user_config={"retainEveryNTurns": 3})
         assert "called" not in captured
+
+    def test_session_summary_update_is_independent_of_retain_cadence(self, monkeypatch, tmp_path):
+        messages = [{"role": "user", "content": "summarize this"}, {"role": "assistant", "content": "done"}]
+        transcript = make_transcript_file(tmp_path, messages)
+        captured = {}
+
+        def capture(req, timeout=None):
+            if "/session-summary/generate" in req.full_url:
+                captured["summary_body"] = json.loads(req.data.decode())
+                return FakeHTTPResponse({
+                    "status": "ready",
+                    "schema_version": 1,
+                    "summary_json": {"schemaVersion": 1, "activeProjects": ["codex"]},
+                    "summary_text": "Active projects: codex",
+                    "model_info": {"provider": "mock", "model": "mock"},
+                })
+            if "/memories" in req.full_url and "/recall" not in req.full_url:
+                captured["retain_called"] = True
+            return FakeHTTPResponse({})
+
+        hook_input = make_hook_input(transcript_path=transcript)
+        _run_hook(
+            "retain",
+            hook_input,
+            monkeypatch,
+            tmp_path,
+            urlopen_side_effect=capture,
+            user_config={
+                "retainEveryNTurns": 3,
+                "sessionSummaryEnabled": True,
+                "sessionSummaryUpdateEveryNTurns": 1,
+            },
+        )
+
+        assert "summary_body" in captured
+        assert "retain_called" not in captured
+        state_path = tmp_path / ".hindsight" / "codex" / "state" / "session_summary_sess-abc123.json"
+        assert "Active projects: codex" in state_path.read_text()
 
     def test_retain_uses_session_id_as_document_id(self, monkeypatch, tmp_path):
         messages = [

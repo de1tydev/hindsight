@@ -149,6 +149,31 @@ class HindsightClient:
         }
         return self._request("POST", path, body, timeout=timeout)
 
+    def generate_session_summary(
+        self,
+        session_id: str,
+        identity_scope: str,
+        bank_id: Optional[str] = None,
+        previous_summary: Optional[dict] = None,
+        latest_query: Optional[str] = None,
+        messages: Optional[list] = None,
+        metadata: Optional[dict] = None,
+        budget: Optional[dict] = None,
+        timeout: int = 20,
+    ) -> dict:
+        """Generate a rolling session summary using the server-side LLM."""
+        body = {
+            "session_id": session_id,
+            "identity_scope": identity_scope,
+            "bank_id": bank_id,
+            "previous_summary": previous_summary,
+            "latest_query": latest_query,
+            "messages": messages or [],
+            "metadata": metadata or {},
+            "budget": budget or {},
+        }
+        return self._request("POST", "/v1/session-summary/generate", body, timeout=timeout)
+
     def set_bank_mission(
         self, bank_id: str, mission: str, retain_mission: Optional[str] = None, timeout: int = 15
     ) -> dict:
