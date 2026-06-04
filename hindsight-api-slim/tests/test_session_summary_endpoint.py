@@ -11,7 +11,6 @@ import os
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Config resolution
 # ---------------------------------------------------------------------------
@@ -309,6 +308,7 @@ class TestSessionSummaryHttpEndpoint:
         from unittest.mock import AsyncMock, patch
 
         from fastapi.testclient import TestClient
+
         from hindsight_api.engine.session_summary import generate_session_summary
 
         mock_result = {
@@ -352,8 +352,10 @@ class TestSessionSummaryHttpEndpoint:
 
     def test_endpoint_works_without_auth_configured(self, test_app):
         """Backward compat: endpoint returns 200 when no auth/validator is configured."""
-        from fastapi.testclient import TestClient
         from unittest.mock import AsyncMock, patch
+
+        from fastapi.testclient import TestClient
+
         from hindsight_api.engine.session_summary import generate_session_summary
 
         mock_result = {
@@ -414,8 +416,10 @@ class TestSessionSummaryHttpEndpoint:
 
     def test_endpoint_returns_401_when_auth_configured_and_token_invalid(self, test_app):
         """When _authenticate_tenant raises AuthenticationError the endpoint returns 401."""
-        from fastapi.testclient import TestClient
         from unittest.mock import AsyncMock
+
+        from fastapi.testclient import TestClient
+
         from hindsight_api.extensions.tenant import AuthenticationError
 
         with_auth = AsyncMock(side_effect=AuthenticationError("invalid token"))
@@ -527,6 +531,7 @@ class TestSessionSummarySanitization:
 
     def test_canary_strings_removed_from_summary_json(self):
         import asyncio
+
         from hindsight_api.engine.session_summary import generate_session_summary
 
         provider = self._make_provider()
@@ -558,6 +563,7 @@ class TestSessionSummarySanitization:
 
     def test_secret_patterns_redacted_from_summary_json(self):
         import asyncio
+
         from hindsight_api.engine.session_summary import generate_session_summary
 
         provider = self._make_provider()
@@ -588,6 +594,7 @@ class TestSessionSummarySanitization:
 
     def test_injection_strings_dropped_from_summary_json(self):
         import asyncio
+
         from hindsight_api.engine.session_summary import generate_session_summary
 
         provider = self._make_provider()
@@ -642,6 +649,7 @@ class TestSessionSummarySanitization:
 
     def test_summary_json_drops_out_of_schema_secret_fields(self):
         import asyncio
+
         from hindsight_api.engine.session_summary import generate_session_summary
 
         provider = self._make_provider()
@@ -702,6 +710,7 @@ class TestSessionSummarySanitization:
 
     def test_operational_tool_noise_dropped_from_summary_json(self):
         import asyncio
+
         from hindsight_api.engine.session_summary import generate_session_summary
 
         provider = self._make_provider()
@@ -738,6 +747,7 @@ class TestSessionSummarySanitization:
     def test_error_text_sanitized(self):
         """Error messages must not expose canaries or secrets."""
         import asyncio
+
         from hindsight_api.engine.session_summary import generate_session_summary
 
         canary = "OC_SECRET_CANARY_DO_NOT_STORE_abc"
