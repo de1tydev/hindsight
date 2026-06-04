@@ -32,6 +32,7 @@ import {
   getPluginConfig,
   formatHookPerf,
   buildSessionSummaryIdentity,
+  extractHookSessionIdentity,
   getSessionSummaryBudgetFromConfig,
   isSessionSummaryLifecycleActive,
   DEFAULT_RETAIN_CONTEXT,
@@ -1697,6 +1698,28 @@ describe("session summary lifecycle helpers", () => {
     ).toBe(true);
   });
 
+  it("extracts hook session identity from nested event.context when ctx lacks sessionId", () => {
+    expect(
+      extractHookSessionIdentity(
+        {
+          context: {
+            sessionId: "ctx-session-id",
+            sessionKey: "agent:main:feishu:direct:ou_nested",
+          },
+        },
+        {
+          agentId: "main",
+          messageProvider: "feishu",
+          senderId: "ou_nested",
+          sessionKey: "agent:main:feishu:direct:ou_ctx",
+        }
+      )
+    ).toEqual({
+      sessionId: "ctx-session-id",
+      sessionKey: "agent:main:feishu:direct:ou_ctx",
+    });
+  });
+
   it("derives a stable summary key from bank identity and real session id", () => {
     const identity = buildSessionSummaryIdentity(
       {
@@ -1983,6 +2006,138 @@ describe("session summary hook lifecycle", () => {
     [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
     expect(recallRequest.query).toContain("topic-alpha");
     expect(recallRequest.query).not.toContain("topic-beta");
+
+    await handle.stop();
+    vi.unstubAllGlobals();
+  });
+
+  it("uses event.context.sessionId for Feishu direct summary isolation when hook ctx lacks sessionId", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockImplementation(async (_url: string, options: { body: string }) => {
+        const requestBody = JSON.parse(String(options.body));
+        const sessionId = requestBody.metadata?.sessionId;
+        const project = sessionId === "feishu-session-a" ? "feishu-alpha" : "feishu-beta";
+        return {
+          ok: true,
+          json: async () => ({
+            status: "ready",
+            schema_version: 1,
+            summary_json: {
+              schemaVersion: 1,
+              activeProjects: [project],
+              semanticAnchors: [],
+              exactIdentifiers: [],
+              decisions: [],
+              blockers: [],
+              openQuestions: [],
+              completedTodos: [],
+            },
+            summary_text: `Active projects: ${project}`,
+            model_info: { provider: "mock", model: "mock-model" },
+          }),
+        };
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-feishu-session-id-"));
+    tempDirs.push(dir);
+    const handle = makeHookApi({
+      autoRecall: true,
+      autoRetain: false,
+      dynamicBankId: true,
+      sessionSummaryEnabled: true,
+      sessionSummaryEnrichRecallQuery: true,
+      sessionSummaryStorePath: join(dir, "summary.sqlite"),
+      hindsightApiUrl: "http://hindsight-test:9077",
+    });
+    hindsightOpenclawPlugin(handle.api);
+    const { recall } = stubRecallClient();
+
+    const ctx: PluginHookAgentContext = {
+      agentId: "saber-cn",
+      messageProvider: "feishu",
+      channelId: "direct:ou_728e937f684386f2d622a123c4a456c2",
+      senderId: "ou_728e937f684386f2d622a123c4a456c2",
+      sessionKey: "agent:saber-cn:feishu:saber-cn:direct:ou_728e937f684386f2d622a123c4a456c2",
+    };
+
+    await handle.trigger(
+      "agent_end",
+      {
+        success: true,
+        context: {
+          sessionId: "feishu-session-a",
+          sessionKey: ctx.sessionKey,
+        },
+        messages: [
+          { role: "user", content: "I am working on feishu-alpha." },
+          { role: "assistant", content: "Noted." },
+          { role: "user", content: "feishu-alpha belongs to session A." },
+        ],
+      },
+      ctx
+    );
+
+    const [, fetchOptions] = mockFetch.mock.calls[0] as [unknown, { body: string }];
+    const summaryRequestBody = JSON.parse(String(fetchOptions.body));
+    expect(summaryRequestBody.session_id).toContain(":session-id:feishu-session-a");
+    expect(summaryRequestBody.session_id).not.toContain(":session-key:");
+    expect(summaryRequestBody.metadata).toMatchObject({
+      sessionId: "feishu-session-a",
+      sessionKey: ctx.sessionKey,
+      provider: "feishu",
+    });
+
+    await handle.trigger(
+      "before_prompt_build",
+      {
+        rawMessage: "What is active?",
+        prompt: "What is active?",
+        context: {
+          sessionId: "feishu-session-b",
+          sessionKey: ctx.sessionKey,
+        },
+        messages: [],
+      },
+      ctx
+    );
+    let [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
+    expect(recallRequest.query).not.toContain("feishu-alpha");
+
+    await handle.trigger(
+      "agent_end",
+      {
+        success: true,
+        context: {
+          sessionId: "feishu-session-b",
+          sessionKey: ctx.sessionKey,
+        },
+        messages: [
+          { role: "user", content: "I am working on feishu-beta." },
+          { role: "assistant", content: "Noted." },
+          { role: "user", content: "feishu-beta belongs to session B." },
+        ],
+      },
+      ctx
+    );
+
+    await handle.trigger(
+      "before_prompt_build",
+      {
+        rawMessage: "What is active?",
+        prompt: "What is active?",
+        context: {
+          sessionId: "feishu-session-b",
+          sessionKey: ctx.sessionKey,
+        },
+        messages: [],
+      },
+      ctx
+    );
+    [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
+    expect(recallRequest.query).toContain("feishu-beta");
+    expect(recallRequest.query).not.toContain("feishu-alpha");
 
     await handle.stop();
     vi.unstubAllGlobals();
