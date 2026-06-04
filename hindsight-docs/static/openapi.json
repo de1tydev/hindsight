@@ -55,6 +55,66 @@
         }
       }
     },
+    "/v1/session-summary/generate": {
+      "post": {
+        "tags": [
+          "Session Summary"
+        ],
+        "summary": "Generate a rolling session summary",
+        "description": "Generate compact plain-text rolling session summary from recent conversation messages. Uses the server-side LLM with session_summary > retain > global priority.",
+        "operationId": "generate_session_summary",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionSummaryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSummaryResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/metrics": {
       "get": {
         "tags": [
@@ -10212,6 +10272,145 @@
           "operation_id": "550e8400-e29b-41d4-a716-446655440000",
           "success": true
         }
+      },
+      "SessionSummaryMessage": {
+        "properties": {
+          "role": {
+            "type": "string",
+            "title": "Role"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          }
+        },
+        "type": "object",
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "SessionSummaryMessage"
+      },
+      "SessionSummaryRequest": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "identity_scope": {
+            "type": "string",
+            "title": "Identity Scope",
+            "default": ""
+          },
+          "bank_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bank Id"
+          },
+          "previous_summary_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Summary Text"
+          },
+          "latest_query": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Query"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/SessionSummaryMessage"
+            },
+            "type": "array",
+            "title": "Messages"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "budget": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget"
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id"
+        ],
+        "title": "SessionSummaryRequest"
+      },
+      "SessionSummaryResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "schema_version": {
+            "type": "integer",
+            "title": "Schema Version",
+            "default": 2
+          },
+          "summary_text": {
+            "type": "string",
+            "title": "Summary Text",
+            "default": ""
+          },
+          "model_info": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Model Info"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "SessionSummaryResponse"
       },
       "SourceFactsIncludeOptions": {
         "properties": {

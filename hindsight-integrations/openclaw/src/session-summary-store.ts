@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { existsSync, mkdirSync, renameSync, unlinkSync } from "fs";
 import { dirname } from "path";
 
-export const SESSION_SUMMARY_SCHEMA_VERSION = 1;
+export const SESSION_SUMMARY_SCHEMA_VERSION = 2;
 
 export interface SessionSummaryStoreOptions {
   dbPath: string;

@@ -27,24 +27,21 @@ def write_session_summary(session_id: str, result: dict) -> None:
         return
     if result.get("status") != "ready":
         return
+    summary_text = result.get("summary_text") or ""
     write_state(
         _state_name(session_id),
         {
             "status": "ready",
             "schema_version": result.get("schema_version"),
-            "summary_json": result.get("summary_json") or {},
-            "summary_text": result.get("summary_text") or "",
+            "summary_json": {
+                "schemaVersion": result.get("schema_version") or 2,
+                "summaryText": summary_text,
+            },
+            "summary_text": summary_text,
             "model_info": result.get("model_info") or {},
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
     )
-
-
-def summary_json_from_state(state: dict | None) -> dict | None:
-    if not isinstance(state, dict):
-        return None
-    summary_json = state.get("summary_json")
-    return summary_json if isinstance(summary_json, dict) else None
 
 
 def summary_text_from_state(state: dict | None) -> str:
@@ -103,10 +100,15 @@ def update_session_summary(client, bank_id: str, session_id: str, messages: list
             session_id=session_id,
             identity_scope=bank_id,
             bank_id=bank_id,
-            previous_summary=summary_json_from_state(previous),
+            previous_summary_text=summary_text_from_state(previous),
             latest_query=latest_query,
             messages=prepared,
             metadata={"source_system": "codex"},
+            budget={
+                "max_input_chars": int(config.get("sessionSummaryMaxInputChars", 16000)),
+                "max_output_chars": int(config.get("sessionSummaryMaxOutputChars", 2000)),
+                "max_output_tokens": int(config.get("sessionSummaryMaxOutputTokens", 700)),
+            },
             timeout=int(config.get("sessionSummaryTimeout", 20)),
         )
     except Exception as exc:

@@ -13,7 +13,6 @@ import { RetainQueue } from "./retain-queue.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { SessionSummaryStore, type SessionSummaryRecord } from "./session-summary-store.js";
 import {
-  buildSessionSummaryBudgetedText,
   DEFAULT_SESSION_SUMMARY_BUDGET,
   HindsightApiSessionSummaryGenerator,
   shouldUpdateSessionSummary,
@@ -544,28 +543,12 @@ function readSessionSummary(
   }
 }
 
-function summaryJsonObject(record: SessionSummaryRecord | null): Record<string, unknown> | null {
-  if (
-    !record?.summaryJson ||
-    typeof record.summaryJson !== "object" ||
-    Array.isArray(record.summaryJson)
-  ) {
-    return null;
-  }
-  return record.summaryJson as Record<string, unknown>;
-}
-
 function getSessionSummarySurfaceText(
   record: SessionSummaryRecord | null,
   config: PluginConfig
 ): string {
   if (!record || record.status !== "ready") return "";
   const budget = getSessionSummaryBudgetFromConfig(config);
-  const json = summaryJsonObject(record);
-  if (json) {
-    const rendered = buildSessionSummaryBudgetedText(json, budget);
-    return rendered.recallQueryText;
-  }
   return record.summaryText.slice(0, Math.max(0, budget.maxRecallQueryChars)).trim();
 }
 
@@ -670,7 +653,7 @@ async function updateSessionSummaryForMessages(input: {
           sessionId: summaryKey,
           identityScope,
           messages,
-          previousSummary: summaryJsonObject(existing),
+          previousSummaryText: existing?.summaryText ?? "",
           latestQuery,
           turnIndex,
           metadata: {
@@ -689,9 +672,12 @@ async function updateSessionSummaryForMessages(input: {
     );
   } catch (err) {
     result = {
-      summaryJson: summaryJsonObject(existing) ?? {},
+      summaryJson: {
+        schemaVersion: existing?.schemaVersion ?? 2,
+        summaryText: existing?.summaryText ?? "",
+      },
       summaryText: existing?.summaryText ?? "",
-      schemaVersion: existing?.schemaVersion ?? 1,
+      schemaVersion: existing?.schemaVersion ?? 2,
       status: "error",
       error: err instanceof Error ? err.message : String(err),
     };
