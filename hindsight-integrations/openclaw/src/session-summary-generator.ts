@@ -1,4 +1,4 @@
-export const SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION = 1;
+export const SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION = 2;
 
 const OPERATIONAL_METADATA_KEYS = new Set([
   "agent",
@@ -35,10 +35,6 @@ const SECRET_RE = /\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*['"]?[^'"\s,
 const METADATA_BLOCK_RE = /[\w\s]+\(untrusted metadata\)[^\n]*\n```json\n[\s\S]*?```/gi;
 const MEMORY_TAG_RE =
   /<(?:hindsight_memories|relevant_memories)>[\s\S]*?<\/(?:hindsight_memories|relevant_memories)>/gi;
-const IDENTIFIER_RE = /\b[a-z][a-z0-9]*(?:[-_.][a-z0-9]+)+\b/g;
-const PROJECT_CUE_RE =
-  /\b(?:project|repo|repository|package|module|app|service|workspace)\s+([A-Za-z][\w.-]{2,})/gi;
-
 export interface SessionSummaryBudget {
   maxInputChars: number;
   maxOutputChars: number;
@@ -73,7 +69,7 @@ export interface SessionSummaryRequest {
   sessionId: string;
   identityScope: string;
   messages: Array<Record<string, unknown>>;
-  previousSummary?: Record<string, unknown> | null;
+  previousSummaryText?: string | null;
   latestQuery?: string;
   turnIndex?: number;
   metadata?: Record<string, unknown>;
@@ -104,7 +100,7 @@ export function sanitizeSessionSummaryText(
   const kept: string[] = [];
   for (const rawLine of cleaned.split(/\r?\n/)) {
     const line = rawLine.replace(CANARY_RE, "[redacted]").trim();
-    if (!line || INJECTION_RE.test(line)) continue;
+    if (!line || INJECTION_RE.test(line) || looksLikeMetadataAssignment(line)) continue;
     kept.push(line);
   }
   cleaned = kept
@@ -128,10 +124,11 @@ export function buildSessionSummaryPrompt(request: SessionSummaryRequest): strin
     content: sanitizeSessionSummaryText(String(msg.content ?? "")),
   }));
   return [
-    "Generate a compact Hindsight session summary as JSON only.",
-    `Schema version: ${SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION}`,
-    "Rules: use only evidence in user/assistant messages; do not promote bank, source, session, sender, profile, provider, tool, document, or update-mode metadata into semantic entities; carry forward previous anchors only when grounded.",
-    `Previous summary JSON:\n${JSON.stringify(trimmed.previousSummary ?? {}, null, 0)}`,
+    "Generate a compact rolling session summary.",
+    "Return plain text only. No JSON, no markdown.",
+    "Rules: use only evidence in user/assistant messages; preserve exact names, project names, school names, file paths, commands, addresses, dates, amounts, numbers, URLs, model names, error messages, and user terminology; do not rename, translate, normalize, abbreviate, substitute, or autocorrect proper nouns and identifiers; current messages and user corrections override the previous summary.",
+    `Maximum output length: ${resolveBudget(request.budget).maxOutputChars} characters.`,
+    `Previous rolling summary:\n${sanitizeSessionSummaryText(trimmed.previousSummaryText ?? "")}`,
     `Latest query:\n${sanitizeSessionSummaryText(trimmed.latestQuery ?? "")}`,
     `Messages JSON:\n${JSON.stringify(messages)}`,
   ].join("\n");
@@ -141,19 +138,11 @@ export function renderSessionSummary(
   summaryJson: Record<string, unknown>,
   options: { maxChars: number }
 ): string {
-  const sections: string[] = [];
-  for (const [key, label] of [
-    ["activeProjects", "Active projects"],
-    ["semanticAnchors", "Semantic anchors"],
-    ["exactIdentifiers", "Exact identifiers"],
-    ["decisions", "Decisions"],
-    ["blockers", "Blockers"],
-    ["openQuestions", "Open questions"],
-  ] as const) {
-    const values = asStringList(summaryJson[key]);
-    if (values.length > 0) sections.push(`${label}: ${values.join("; ")}`);
+  const summaryText = summaryJson.summaryText;
+  if (typeof summaryText === "string") {
+    return sanitizeSessionSummaryText(summaryText, { maxChars: options.maxChars });
   }
-  return sanitizeSessionSummaryText(sections.join("\n"), { maxChars: options.maxChars });
+  return "";
 }
 
 export function shouldUpdateSessionSummary(input: {
@@ -216,10 +205,10 @@ export function trimSessionSummaryInputs(
     maxChars: Math.max(0, budget.minLatestQueryReserveChars),
   });
   const remainingTotal = Math.max(0, budget.maxInputChars - latestQuery.length);
-  const previousSummary = trimPreviousSummary(request.previousSummary, {
-    maxChars: request.previousSummary ? Math.trunc(remainingTotal / 4) : 0,
+  const previousSummaryText = sanitizeSessionSummaryText(request.previousSummaryText ?? "", {
+    maxChars: request.previousSummaryText ? Math.trunc(remainingTotal / 4) : 0,
   });
-  let remaining = Math.max(0, remainingTotal - jsonLength(previousSummary));
+  let remaining = Math.max(0, remainingTotal - previousSummaryText.length);
   const kept: Array<Record<string, unknown>> = [];
   for (const msg of [...request.messages].reverse()) {
     let content = sanitizeSessionSummaryText(String(msg.content ?? ""));
@@ -234,7 +223,7 @@ export function trimSessionSummaryInputs(
   }
   return {
     ...request,
-    previousSummary,
+    previousSummaryText,
     latestQuery,
     messages: kept.reverse(),
     budget,
@@ -290,7 +279,7 @@ export class HindsightApiSessionSummaryGenerator implements SessionSummaryGenera
     const body = JSON.stringify({
       session_id: request.sessionId,
       identity_scope: request.identityScope,
-      previous_summary: request.previousSummary ?? null,
+      previous_summary_text: request.previousSummaryText ?? null,
       latest_query: request.latestQuery ?? null,
       messages: (request.messages ?? []).map((m) => ({
         role: String(m.role ?? ""),
@@ -328,14 +317,12 @@ export class HindsightApiSessionSummaryGenerator implements SessionSummaryGenera
   }
 
   private _parseApiResponse(data: Record<string, unknown>): SessionSummaryResult {
-    const summaryJson = (data.summary_json as Record<string, unknown> | undefined) ?? {};
-    summaryJson.schemaVersion =
-      summaryJson.schemaVersion ?? SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION;
-
     const rawText = String(data.summary_text ?? "");
-    const summaryText = sanitizeSessionSummaryText(rawText, {
-      maxChars: DEFAULT_SESSION_SUMMARY_BUDGET.maxOutputChars,
-    });
+    const summaryText = sanitizeSessionSummaryText(rawText);
+    const summaryJson = {
+      schemaVersion: SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
+      summaryText,
+    };
 
     const status = data.status === "ready" ? "ready" : "error";
     const result: SessionSummaryResult = {
@@ -352,13 +339,7 @@ export class HindsightApiSessionSummaryGenerator implements SessionSummaryGenera
     return {
       summaryJson: {
         schemaVersion: SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
-        activeProjects: [],
-        semanticAnchors: [],
-        exactIdentifiers: [],
-        decisions: [],
-        blockers: [],
-        openQuestions: [],
-        completedTodos: [],
+        summaryText: "",
       },
       summaryText: "",
       schemaVersion: SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
@@ -374,19 +355,17 @@ export class FakeSessionSummaryGenerator implements SessionSummaryGenerator {
       const budget = resolveBudget(request.budget);
       const trimmed = trimSessionSummaryInputs(request, budget);
       const evidenceText = evidenceTextFromMessages(trimmed.messages);
+      const previous = sanitizeSessionSummaryText(trimmed.previousSummaryText ?? "");
+      const summaryText = sanitizeSessionSummaryText(
+        [previous, evidenceText].filter(Boolean).join("\n")
+      );
       const summaryJson = {
         schemaVersion: SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
-        activeProjects: activeProjects(evidenceText, trimmed.previousSummary),
-        semanticAnchors: semanticAnchors(evidenceText),
-        exactIdentifiers: exactIdentifiers(evidenceText),
-        decisions: matchingLines(evidenceText, ["decided", "decision", "use ", "chosen"]),
-        blockers: matchingLines(evidenceText, ["blocked", "failing", "failure", "error", "risk"]),
-        openQuestions: matchingLines(evidenceText, ["?", "open question", "unknown"]),
-        completedTodos: matchingLines(evidenceText, ["done", "completed", "fixed"]),
+        summaryText,
       };
       return {
         summaryJson,
-        summaryText: renderSessionSummary(summaryJson, { maxChars: budget.maxOutputChars }),
+        summaryText,
         schemaVersion: SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
         status: "ready",
       };
@@ -394,13 +373,7 @@ export class FakeSessionSummaryGenerator implements SessionSummaryGenerator {
       return {
         summaryJson: {
           schemaVersion: SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
-          activeProjects: [],
-          semanticAnchors: [],
-          exactIdentifiers: [],
-          decisions: [],
-          blockers: [],
-          openQuestions: [],
-          completedTodos: [],
+          summaryText: "",
         },
         summaryText: "",
         schemaVersion: SESSION_SUMMARY_GENERATOR_SCHEMA_VERSION,
@@ -437,64 +410,6 @@ function stripOperationalMetadataJsonObjects(text: string): string {
   });
 }
 
-function activeProjects(
-  evidenceText: string,
-  previousSummary?: Record<string, unknown> | null
-): string[] {
-  const candidates: string[] = [];
-  const lowerEvidence = evidenceText.toLowerCase();
-  for (const value of asStringList(previousSummary?.activeProjects)) {
-    if (lowerEvidence.includes(value.toLowerCase())) candidates.push(value);
-  }
-  for (const match of evidenceText.matchAll(PROJECT_CUE_RE)) {
-    candidates.push(match[1]);
-  }
-  for (const line of evidenceText.split(/\r?\n/)) {
-    if (looksLikeMetadataAssignment(line)) continue;
-    for (const ident of line.matchAll(IDENTIFIER_RE)) {
-      if (ident[0].includes("-") && !isOperationalIdentifier(ident[0])) candidates.push(ident[0]);
-    }
-  }
-  return dedupe(candidates, 8);
-}
-
-function semanticAnchors(evidenceText: string): string[] {
-  return dedupe(
-    evidenceText
-      .split(/\r?\n/)
-      .map((line) => line.trim().replace(/^[- ]+/, ""))
-      .filter((line) => line.length >= 8 && !looksLikeMetadataAssignment(line))
-      .map((line) => line.slice(0, 180)),
-    8
-  );
-}
-
-function exactIdentifiers(evidenceText: string): string[] {
-  return dedupe(
-    evidenceText
-      .split(/\r?\n/)
-      .filter((line) => !looksLikeMetadataAssignment(line))
-      .flatMap((line) => [...line.matchAll(IDENTIFIER_RE)].map((match) => match[0]))
-      .filter((ident) => !isOperationalIdentifier(ident)),
-    16
-  );
-}
-
-function matchingLines(evidenceText: string, needles: string[]): string[] {
-  return dedupe(
-    evidenceText
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(
-        (line) =>
-          needles.some((needle) => line.toLowerCase().includes(needle)) &&
-          !looksLikeMetadataAssignment(line)
-      )
-      .map((line) => line.slice(0, 180)),
-    8
-  );
-}
-
 function looksLikeMetadataAssignment(text: string): boolean {
   const stripped = text.trim().replace(/,$/, "");
   try {
@@ -512,10 +427,6 @@ function looksLikeMetadataAssignment(text: string): boolean {
   return OPERATIONAL_METADATA_KEYS.has(normalizeMetadataKey(key));
 }
 
-function isOperationalIdentifier(value: string): boolean {
-  return OPERATIONAL_METADATA_KEYS.has(normalizeMetadataKey(value));
-}
-
 function normalizeMetadataKey(value: unknown): string {
   return String(value)
     .trim()
@@ -524,65 +435,6 @@ function normalizeMetadataKey(value: unknown): string {
     .toLowerCase()
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "");
-}
-
-function trimPreviousSummary(
-  previousSummary: Record<string, unknown> | null | undefined,
-  options: { maxChars: number }
-): Record<string, unknown> | null {
-  if (!previousSummary || options.maxChars <= 2) return null;
-  const sanitized: Record<string, unknown> = {};
-  if (previousSummary.schemaVersion !== undefined) {
-    const candidate = { schemaVersion: previousSummary.schemaVersion };
-    if (jsonLength(candidate) <= options.maxChars) Object.assign(sanitized, candidate);
-  }
-  for (const key of [
-    "activeProjects",
-    "exactIdentifiers",
-    "semanticAnchors",
-    "decisions",
-    "blockers",
-    "openQuestions",
-    "completedTodos",
-  ]) {
-    const kept: string[] = [];
-    for (const value of asStringList(previousSummary[key])) {
-      const text = sanitizeSessionSummaryText(value);
-      if (!text) continue;
-      const candidate = { ...sanitized, [key]: [...kept, text] };
-      if (jsonLength(candidate) > options.maxChars) break;
-      kept.push(text);
-    }
-    if (kept.length > 0) sanitized[key] = kept;
-  }
-  return Object.keys(sanitized).length > 0 ? sanitized : null;
-}
-
-function jsonLength(value: unknown): number {
-  if (value == null) return 0;
-  return JSON.stringify(value).length;
-}
-
-function asStringList(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.map((item) => String(item).trim()).filter((item) => item.length > 0)
-    : [];
-}
-
-function dedupe(values: string[], limit: number): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const value of values) {
-    const text = sanitizeSessionSummaryText(String(value))
-      .trim()
-      .replace(/[ .,;]+$/, "");
-    const key = text.toLowerCase();
-    if (!text || seen.has(key)) continue;
-    seen.add(key);
-    out.push(text);
-    if (out.length >= limit) break;
-  }
-  return out;
 }
 
 function effectiveRecallQueryChars(budget: SessionSummaryBudget): number {
@@ -598,8 +450,5 @@ function renderBudgetedSummaryVariant(
 ): string {
   if (options.maxChars <= 0) return "";
   const full = renderSessionSummary(summaryJson, options);
-  if (full.length < options.maxChars) return full;
-  const anchors = asStringList(summaryJson.semanticAnchors);
-  if (anchors.length === 0) return full;
-  return renderSessionSummary({ semanticAnchors: anchors }, options) || full;
+  return full.slice(0, options.maxChars).trimEnd();
 }

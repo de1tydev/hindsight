@@ -3631,21 +3631,30 @@ def _register_routes(app: FastAPI):
         session_id: str
         identity_scope: str = ""
         bank_id: str | None = None
-        previous_summary: dict | None = None
+        previous_summary_text: str | None = None
         latest_query: str | None = None
-        messages: list[dict] = Field(default_factory=list)
+        messages: list[SessionSummaryMessage] = Field(default_factory=list)
         metadata: dict | None = None
         budget: dict | None = None
+
+    class SessionSummaryResponse(BaseModel):
+        status: str
+        schema_version: int = 2
+        summary_text: str = ""
+        model_info: dict[str, Any] = Field(default_factory=dict)
+        error: str | None = None
 
     @app.post(
         "/v1/session-summary/generate",
         summary="Generate a rolling session summary",
         description=(
-            "Generate a compact session summary JSON from recent conversation messages. "
+            "Generate compact plain-text rolling session summary from recent conversation messages. "
             "Uses the server-side LLM with session_summary > retain > global priority."
         ),
         tags=["Session Summary"],
         operation_id="generate_session_summary",
+        response_model=SessionSummaryResponse,
+        response_model_exclude_none=True,
     )
     async def api_generate_session_summary(
         request: SessionSummaryRequest,
@@ -3683,9 +3692,9 @@ def _register_routes(app: FastAPI):
             "session_id": request.session_id,
             "identity_scope": request.identity_scope,
             "bank_id": request.bank_id,
-            "previous_summary": request.previous_summary,
+            "previous_summary_text": request.previous_summary_text,
             "latest_query": request.latest_query,
-            "messages": request.messages,
+            "messages": [message.model_dump() for message in request.messages],
             "metadata": request.metadata,
             "budget": request.budget,
         }

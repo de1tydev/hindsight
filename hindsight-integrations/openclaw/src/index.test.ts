@@ -1849,19 +1849,8 @@ describe("session summary hook lifecycle", () => {
       ok: true,
       json: async () => ({
         status: "ready",
-        schema_version: 1,
-        summary_json: {
-          schemaVersion: 1,
-          activeProjects: ["project zephyr"],
-          semanticAnchors: ["TypeScript decision"],
-          exactIdentifiers: [],
-          decisions: ["use TypeScript for project zephyr"],
-          blockers: [],
-          openQuestions: [],
-          completedTodos: [],
-        },
-        summary_text:
-          "Active projects: project zephyr\nDecisions: use TypeScript for project zephyr",
+        schema_version: 2,
+        summary_text: "project zephyr 继续采用 TypeScript。",
         model_info: { provider: "mock", model: "mock-model" },
       }),
     });
@@ -1939,18 +1928,8 @@ describe("session summary hook lifecycle", () => {
           ok: true,
           json: async () => ({
             status: "ready",
-            schema_version: 1,
-            summary_json: {
-              schemaVersion: 1,
-              activeProjects: [project],
-              semanticAnchors: [],
-              exactIdentifiers: [],
-              decisions: [],
-              blockers: [],
-              openQuestions: [],
-              completedTodos: [],
-            },
-            summary_text: `Active projects: ${project}`,
+            schema_version: 2,
+            summary_text: `继续讨论 ${project}。`,
             model_info: { provider: "mock", model: "mock-model" },
           }),
         };
@@ -2054,18 +2033,8 @@ describe("session summary hook lifecycle", () => {
           ok: true,
           json: async () => ({
             status: "ready",
-            schema_version: 1,
-            summary_json: {
-              schemaVersion: 1,
-              activeProjects: [project],
-              semanticAnchors: [],
-              exactIdentifiers: [],
-              decisions: [],
-              blockers: [],
-              openQuestions: [],
-              completedTodos: [],
-            },
-            summary_text: `Active projects: ${project}`,
+            schema_version: 2,
+            summary_text: `继续讨论 ${project}。`,
             model_info: { provider: "mock", model: "mock-model" },
           }),
         };
@@ -2184,18 +2153,8 @@ describe("session summary hook lifecycle", () => {
           ok: true,
           json: async () => ({
             status: "ready",
-            schema_version: 1,
-            summary_json: {
-              schemaVersion: 1,
-              activeProjects: ["stable-project"],
-              semanticAnchors: [],
-              exactIdentifiers: [],
-              decisions: [],
-              blockers: [],
-              openQuestions: [],
-              completedTodos: [],
-            },
-            summary_text: "Active projects: stable-project",
+            schema_version: 2,
+            summary_text: "继续讨论 stable-project。",
             model_info: { provider: "mock", model: "m" },
           }),
         });
@@ -2335,18 +2294,8 @@ describe("session summary hook lifecycle", () => {
       ok: true,
       json: async () => ({
         status: "ready",
-        schema_version: 1,
-        summary_json: {
-          schemaVersion: 1,
-          activeProjects: ["reload-race-project"],
-          semanticAnchors: ["summary generation awaited during reload"],
-          exactIdentifiers: [],
-          decisions: [],
-          blockers: [],
-          openQuestions: [],
-          completedTodos: [],
-        },
-        summary_text: "Active projects: reload-race-project",
+        schema_version: 2,
+        summary_text: "继续讨论 reload-race-project。",
         model_info: { provider: "mock", model: "m" },
       }),
     });
@@ -2434,18 +2383,8 @@ describe("session summary hook lifecycle", () => {
       ok: true,
       json: async () => ({
         status: "ready",
-        schema_version: 1,
-        summary_json: {
-          schemaVersion: 1,
-          activeProjects: ["stale-path-project"],
-          semanticAnchors: [],
-          exactIdentifiers: [],
-          decisions: [],
-          blockers: [],
-          openQuestions: [],
-          completedTodos: [],
-        },
-        summary_text: "Active projects: stale-path-project",
+        schema_version: 2,
+        summary_text: "继续讨论 stale-path-project。",
         model_info: { provider: "mock", model: "m" },
       }),
     });
@@ -2684,8 +2623,7 @@ describe("makeSessionSummaryGenerator", () => {
       ok: true,
       json: async () => ({
         status: "ready",
-        schema_version: 1,
-        summary_json: { schemaVersion: 1, activeProjects: [] },
+        schema_version: 2,
         summary_text: "",
         model_info: { provider: "mock", model: "m" },
       }),
