@@ -44,8 +44,6 @@ export interface SessionSummaryBudget {
   maxOutputChars: number;
   maxRecallQueryChars: number;
   recallQueryBudgetRatio: number;
-  maxPromptInjectChars: number;
-  maxRetainContextChars: number;
   minLatestQueryReserveChars: number;
   dropCompletedTodosAfterTurns: number;
 }
@@ -53,8 +51,6 @@ export interface SessionSummaryBudget {
 export interface SessionSummaryBudgetedText {
   outputText: string;
   recallQueryText: string;
-  promptInjectText: string;
-  retainContextText: string;
 }
 
 export interface SessionSummaryWindowBounds {
@@ -69,8 +65,6 @@ export const DEFAULT_SESSION_SUMMARY_BUDGET: SessionSummaryBudget = {
   maxOutputChars: 2_000,
   maxRecallQueryChars: 800,
   recallQueryBudgetRatio: 0.25,
-  maxPromptInjectChars: 1_200,
-  maxRetainContextChars: 1_200,
   minLatestQueryReserveChars: 400,
   dropCompletedTodosAfterTurns: 20,
 };
@@ -255,12 +249,6 @@ export function buildSessionSummaryBudgetedText(
     outputText: renderSessionSummary(summaryJson, { maxChars: budget.maxOutputChars }),
     recallQueryText: renderBudgetedSummaryVariant(summaryJson, {
       maxChars: effectiveRecallQueryChars(budget),
-    }),
-    promptInjectText: renderBudgetedSummaryVariant(summaryJson, {
-      maxChars: budget.maxPromptInjectChars,
-    }),
-    retainContextText: renderBudgetedSummaryVariant(summaryJson, {
-      maxChars: budget.maxRetainContextChars,
     }),
   };
 }

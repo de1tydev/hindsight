@@ -1581,6 +1581,17 @@ function makeHookApi(rawConfig: Record<string, unknown>): {
   };
 }
 
+function stubRecallClient(results: MemoryResult[] = []): { recall: ReturnType<typeof vi.fn> } {
+  const recall = vi.fn().mockResolvedValue({ results });
+  const client = { recall };
+  vi.stubGlobal("__hindsightClient", {
+    waitForReady: vi.fn().mockResolvedValue(undefined),
+    getClientForContext: vi.fn().mockResolvedValue(client),
+    getClient: vi.fn(() => client),
+  });
+  return { recall };
+}
+
 describe("getPluginConfig — session summary generator", () => {
   it("defaults summary cadence and budgets without enabling lifecycle behavior", () => {
     const cfg = getPluginConfig(makeApi({ retainEveryNTurns: 1 }));
@@ -1591,8 +1602,6 @@ describe("getPluginConfig — session summary generator", () => {
     expect(cfg.sessionSummaryEnabled).toBe(false);
     expect(cfg.sessionSummaryStorePath).toBeUndefined();
     expect(cfg.sessionSummaryEnrichRecallQuery).toBe(false);
-    expect(cfg.sessionSummaryEnrichRetainContext).toBe(false);
-    expect(cfg.sessionSummaryInjectPrompt).toBe(false);
     expect(cfg.sessionSummaryUpdateEveryNTurns).toBeUndefined();
     expect(cfg.sessionSummaryMinUpdateEveryNTurns).toBe(2);
     expect(cfg.sessionSummaryTimeoutMs).toBe(20_000);
@@ -1600,8 +1609,6 @@ describe("getPluginConfig — session summary generator", () => {
     expect(cfg.sessionSummaryMaxOutputChars).toBe(2_000);
     expect(cfg.sessionSummaryMaxRecallQueryChars).toBe(800);
     expect(cfg.sessionSummaryRecallQueryBudgetRatio).toBe(0.25);
-    expect(cfg.sessionSummaryMaxPromptInjectChars).toBe(1_200);
-    expect(cfg.sessionSummaryMaxRetainContextChars).toBe(1_200);
     expect(cfg.sessionSummaryMinLatestQueryReserveChars).toBe(400);
     expect(cfg.sessionSummaryDropCompletedTodosAfterTurns).toBe(20);
   });
@@ -1618,8 +1625,6 @@ describe("getPluginConfig — session summary generator", () => {
         sessionSummaryEnabled: true,
         sessionSummaryStorePath: "/tmp/hindsight-summary.sqlite",
         sessionSummaryEnrichRecallQuery: true,
-        sessionSummaryEnrichRetainContext: true,
-        sessionSummaryInjectPrompt: true,
         sessionSummaryGeneratorProvider: "openai-compatible",
         sessionSummaryGeneratorModel: "summary-model",
         sessionSummaryGeneratorBaseUrl: "http://summary.example/v1",
@@ -1632,8 +1637,6 @@ describe("getPluginConfig — session summary generator", () => {
         sessionSummaryMaxOutputChars: 432,
         sessionSummaryMaxRecallQueryChars: 321,
         sessionSummaryRecallQueryBudgetRatio: 2,
-        sessionSummaryMaxPromptInjectChars: 222,
-        sessionSummaryMaxRetainContextChars: 333,
         sessionSummaryMinLatestQueryReserveChars: 111,
         sessionSummaryDropCompletedTodosAfterTurns: 5,
       })
@@ -1645,8 +1648,6 @@ describe("getPluginConfig — session summary generator", () => {
     expect(cfg.sessionSummaryEnabled).toBe(true);
     expect(cfg.sessionSummaryStorePath).toBe("/tmp/hindsight-summary.sqlite");
     expect(cfg.sessionSummaryEnrichRecallQuery).toBe(true);
-    expect(cfg.sessionSummaryEnrichRetainContext).toBe(true);
-    expect(cfg.sessionSummaryInjectPrompt).toBe(true);
     expect(cfg.sessionSummaryGeneratorProvider).toBe("openai-compatible");
     expect(cfg.sessionSummaryGeneratorModel).toBe("summary-model");
     expect(cfg.sessionSummaryGeneratorBaseUrl).toBe("http://summary.example/v1");
@@ -1659,8 +1660,6 @@ describe("getPluginConfig — session summary generator", () => {
     expect(cfg.sessionSummaryMaxOutputChars).toBe(432);
     expect(cfg.sessionSummaryMaxRecallQueryChars).toBe(321);
     expect(cfg.sessionSummaryRecallQueryBudgetRatio).toBe(1);
-    expect(cfg.sessionSummaryMaxPromptInjectChars).toBe(222);
-    expect(cfg.sessionSummaryMaxRetainContextChars).toBe(333);
     expect(cfg.sessionSummaryMinLatestQueryReserveChars).toBe(111);
     expect(cfg.sessionSummaryDropCompletedTodosAfterTurns).toBe(5);
   });
@@ -1682,12 +1681,12 @@ describe("getPluginConfig — session summary generator", () => {
 });
 
 describe("session summary lifecycle helpers", () => {
-  it("is inactive unless enabled and at least one consumption or update flag is set", () => {
+  it("is inactive unless enabled and recall enrichment or update cadence is set", () => {
     expect(isSessionSummaryLifecycleActive({ sessionSummaryEnabled: true })).toBe(false);
     expect(
       isSessionSummaryLifecycleActive({
         sessionSummaryEnabled: true,
-        sessionSummaryInjectPrompt: true,
+        sessionSummaryEnrichRecallQuery: true,
       })
     ).toBe(true);
     expect(
@@ -1779,20 +1778,16 @@ describe("session summary lifecycle helpers", () => {
       sessionSummaryMaxInputChars: 500,
       sessionSummaryMaxRecallQueryChars: 100,
       sessionSummaryRecallQueryBudgetRatio: 0.2,
-      sessionSummaryMaxPromptInjectChars: 80,
-      sessionSummaryMaxRetainContextChars: 90,
     });
 
     expect(budget.maxInputChars).toBe(500);
     expect(budget.maxRecallQueryChars).toBe(100);
     expect(budget.recallQueryBudgetRatio).toBe(0.2);
-    expect(budget.maxPromptInjectChars).toBe(80);
-    expect(budget.maxRetainContextChars).toBe(90);
   });
 });
 
 describe("session summary hook lifecycle", () => {
-  it("updates rolling summary via API on agent_end and injects it before prompt build without recall", async () => {
+  it("updates rolling summary via API on agent_end and uses it for the next recall query", async () => {
     // Stub global fetch so the HindsightApiSessionSummaryGenerator has a real transport
     // without hitting a real server. The summary content is fixed by the stub.
     const mockFetch = vi.fn().mockResolvedValue({
@@ -1820,11 +1815,11 @@ describe("session summary hook lifecycle", () => {
     const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-"));
     tempDirs.push(dir);
     const handle = makeHookApi({
-      autoRecall: false,
+      autoRecall: true,
       autoRetain: false,
       dynamicBankId: true,
       sessionSummaryEnabled: true,
-      sessionSummaryInjectPrompt: true,
+      sessionSummaryEnrichRecallQuery: true,
       sessionSummaryStorePath: join(dir, "summary.sqlite"),
       hindsightApiUrl: "http://hindsight-test:9077",
     });
@@ -1838,6 +1833,7 @@ describe("session summary hook lifecycle", () => {
       sessionId: "real-session-U777-a",
       sessionKey: "agent:main:telegram:direct:U777",
     };
+    const { recall } = stubRecallClient();
     await handle.trigger(
       "agent_end",
       {
@@ -1859,16 +1855,19 @@ describe("session summary hook lifecycle", () => {
       sessionKey: "agent:main:telegram:direct:U777",
     });
 
-    const result = (await handle.trigger(
+    const result = await handle.trigger(
       "before_prompt_build",
       { rawMessage: "What did we decide?", prompt: "What did we decide?", messages: [] },
       ctx
-    )) as { prependSystemContext?: string; prependContext?: string } | undefined;
+    );
 
-    expect(result?.prependContext).toBeUndefined();
-    expect(result?.prependSystemContext).toContain("<hindsight_session_summary>");
-    expect(result?.prependSystemContext).toContain("project zephyr");
-    expect(result?.prependSystemContext).not.toContain("<hindsight_memories>");
+    expect(result).toBeUndefined();
+    expect(recall).toHaveBeenCalledTimes(1);
+    const [recallRequest] = recall.mock.calls[0] as [{ query: string }];
+    expect(recallRequest.query).toContain("What did we decide?");
+    expect(recallRequest.query).toContain("Rolling session summary:");
+    expect(recallRequest.query).toContain("project zephyr");
+    expect(recallRequest.query).not.toContain("<hindsight_session_summary>");
 
     await handle.stop();
     vi.unstubAllGlobals();
@@ -1906,15 +1905,16 @@ describe("session summary hook lifecycle", () => {
     const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-session-id-scope-"));
     tempDirs.push(dir);
     const handle = makeHookApi({
-      autoRecall: false,
+      autoRecall: true,
       autoRetain: false,
       dynamicBankId: true,
       sessionSummaryEnabled: true,
-      sessionSummaryInjectPrompt: true,
+      sessionSummaryEnrichRecallQuery: true,
       sessionSummaryStorePath: join(dir, "summary.sqlite"),
       hindsightApiUrl: "http://hindsight-test:9077",
     });
     hindsightOpenclawPlugin(handle.api);
+    const { recall } = stubRecallClient();
 
     const commonCtx = {
       agentId: "main",
@@ -1945,12 +1945,13 @@ describe("session summary hook lifecycle", () => {
       alphaCtx
     );
 
-    const betaBeforeUpdate = (await handle.trigger(
+    await handle.trigger(
       "before_prompt_build",
       { rawMessage: "What is active?", prompt: "What is active?", messages: [] },
       betaCtx
-    )) as { prependSystemContext?: string } | undefined;
-    expect(betaBeforeUpdate?.prependSystemContext).toBeUndefined();
+    );
+    let [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
+    expect(recallRequest.query).not.toContain("topic-alpha");
 
     await handle.trigger(
       "agent_end",
@@ -1965,21 +1966,23 @@ describe("session summary hook lifecycle", () => {
       betaCtx
     );
 
-    const betaAfterUpdate = (await handle.trigger(
+    await handle.trigger(
       "before_prompt_build",
       { rawMessage: "What is active?", prompt: "What is active?", messages: [] },
       betaCtx
-    )) as { prependSystemContext?: string } | undefined;
-    expect(betaAfterUpdate?.prependSystemContext).toContain("topic-beta");
-    expect(betaAfterUpdate?.prependSystemContext).not.toContain("topic-alpha");
+    );
+    [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
+    expect(recallRequest.query).toContain("topic-beta");
+    expect(recallRequest.query).not.toContain("topic-alpha");
 
-    const alphaAfterBetaUpdate = (await handle.trigger(
+    await handle.trigger(
       "before_prompt_build",
       { rawMessage: "What is active?", prompt: "What is active?", messages: [] },
       alphaCtx
-    )) as { prependSystemContext?: string } | undefined;
-    expect(alphaAfterBetaUpdate?.prependSystemContext).toContain("topic-alpha");
-    expect(alphaAfterBetaUpdate?.prependSystemContext).not.toContain("topic-beta");
+    );
+    [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
+    expect(recallRequest.query).toContain("topic-alpha");
+    expect(recallRequest.query).not.toContain("topic-beta");
 
     await handle.stop();
     vi.unstubAllGlobals();
@@ -2022,15 +2025,16 @@ describe("session summary hook lifecycle", () => {
     const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-retain-ready-"));
     tempDirs.push(dir);
     const handle = makeHookApi({
-      autoRecall: false,
+      autoRecall: true,
       autoRetain: false,
       dynamicBankId: true,
       sessionSummaryEnabled: true,
-      sessionSummaryInjectPrompt: true,
+      sessionSummaryEnrichRecallQuery: true,
       sessionSummaryStorePath: join(dir, "summary.sqlite"),
       hindsightApiUrl: "http://hindsight-test:9077",
     });
     hindsightOpenclawPlugin(handle.api);
+    const { recall } = stubRecallClient();
 
     const ctx: PluginHookAgentContext = {
       agentId: "main",
@@ -2074,14 +2078,16 @@ describe("session summary hook lifecycle", () => {
       ctx
     );
 
-    // Summary should still show "stable-project" from the original ready record
-    const result = (await handle.trigger(
+    // Summary should still enrich recall with "stable-project" from the original ready record.
+    const result = await handle.trigger(
       "before_prompt_build",
       { rawMessage: "Status?", prompt: "Status?", messages: [] },
       ctx
-    )) as { prependSystemContext?: string } | undefined;
+    );
 
-    expect(result?.prependSystemContext).toContain("stable-project");
+    expect(result).toBeUndefined();
+    const [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
+    expect(recallRequest.query).toContain("stable-project");
 
     await handle.stop();
     vi.unstubAllGlobals();
@@ -2100,15 +2106,16 @@ describe("session summary hook lifecycle", () => {
     const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-reload-"));
     tempDirs.push(dir);
     const handle = makeHookApi({
-      autoRecall: false,
+      autoRecall: true,
       autoRetain: false,
       dynamicBankId: true,
       sessionSummaryEnabled: true,
-      sessionSummaryInjectPrompt: true,
+      sessionSummaryEnrichRecallQuery: true,
       sessionSummaryStorePath: join(dir, "summary.sqlite"),
       hindsightApiUrl: "http://hindsight-test:9077",
     });
     hindsightOpenclawPlugin(handle.api);
+    const { recall } = stubRecallClient();
 
     const ctx: PluginHookAgentContext = {
       agentId: "main",
@@ -2158,13 +2165,15 @@ describe("session summary hook lifecycle", () => {
     });
     await update;
 
-    const result = (await handle.trigger(
+    const result = await handle.trigger(
       "before_prompt_build",
       { rawMessage: "Status?", prompt: "Status?", messages: [] },
       ctx
-    )) as { prependSystemContext?: string } | undefined;
+    );
 
-    expect(result?.prependSystemContext).toContain("reload-race-project");
+    expect(result).toBeUndefined();
+    const [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
+    expect(recallRequest.query).toContain("reload-race-project");
     vi.unstubAllGlobals();
   });
 
@@ -2184,15 +2193,16 @@ describe("session summary hook lifecycle", () => {
     const newStorePath = join(dir, "new-summary.sqlite");
 
     const oldHandle = makeHookApi({
-      autoRecall: false,
+      autoRecall: true,
       autoRetain: false,
       dynamicBankId: true,
       sessionSummaryEnabled: true,
-      sessionSummaryInjectPrompt: true,
+      sessionSummaryEnrichRecallQuery: true,
       sessionSummaryStorePath: oldStorePath,
       hindsightApiUrl: "http://hindsight-test:9077",
     });
     hindsightOpenclawPlugin(oldHandle.api);
+    const { recall } = stubRecallClient();
 
     const ctx: PluginHookAgentContext = {
       agentId: "main",
@@ -2222,7 +2232,7 @@ describe("session summary hook lifecycle", () => {
       autoRetain: false,
       dynamicBankId: true,
       sessionSummaryEnabled: true,
-      sessionSummaryInjectPrompt: true,
+      sessionSummaryEnrichRecallQuery: true,
       sessionSummaryStorePath: newStorePath,
       hindsightApiUrl: "http://hindsight-test:9077",
     });
@@ -2254,12 +2264,14 @@ describe("session summary hook lifecycle", () => {
     });
     await staleUpdate;
 
-    const staleResult = (await oldHandle.trigger(
+    const staleResult = await oldHandle.trigger(
       "before_prompt_build",
       { rawMessage: "Status?", prompt: "Status?", messages: [] },
       ctx
-    )) as { prependSystemContext?: string } | undefined;
-    expect(staleResult?.prependSystemContext).toBeUndefined();
+    );
+    expect(staleResult).toBeUndefined();
+    const [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
+    expect(recallRequest.query).not.toContain("stale-path-project");
 
     await newHandle.stop();
     vi.unstubAllGlobals();
@@ -2440,7 +2452,7 @@ describe("makeSessionSummaryGenerator", () => {
     const config = getPluginConfig(
       makeApi({
         sessionSummaryEnabled: true,
-        sessionSummaryInjectPrompt: true,
+        sessionSummaryEnrichRecallQuery: true,
         hindsightApiUrl: "http://hindsight:9077",
       })
     );
@@ -2461,7 +2473,7 @@ describe("makeSessionSummaryGenerator", () => {
     const config = getPluginConfig(
       makeApi({
         sessionSummaryEnabled: true,
-        sessionSummaryInjectPrompt: true,
+        sessionSummaryEnrichRecallQuery: true,
         // No hindsightApiUrl
       })
     );
@@ -2484,7 +2496,7 @@ describe("makeSessionSummaryGenerator", () => {
     const config = getPluginConfig(
       makeApi({
         sessionSummaryEnabled: true,
-        sessionSummaryInjectPrompt: true,
+        sessionSummaryEnrichRecallQuery: true,
         hindsightApiUrl: "http://hindsight:9077",
         hindsightApiToken: "test-bearer-token",
       })
@@ -2507,7 +2519,7 @@ describe("makeSessionSummaryGenerator", () => {
     const config = getPluginConfig(
       makeApi({
         sessionSummaryEnabled: true,
-        sessionSummaryInjectPrompt: true,
+        sessionSummaryEnrichRecallQuery: true,
         hindsightApiUrl: "http://hindsight:9077",
         hindsightApiToken: "super-secret-token-abc",
       })
