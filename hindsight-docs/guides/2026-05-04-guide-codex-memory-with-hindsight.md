@@ -94,7 +94,7 @@ If the second run can answer with details from the first run, your setup is work
 ## Common mistakes
 
 - Installing the hook bundle on an older Codex version that does not support hooks
-- Forgetting to turn on `codex_hooks = true` in `~/.codex/config.toml`
+- Forgetting to turn on `hooks = true` in `~/.codex/config.toml`
 - Keeping `dynamicBankId` off when you expected memory isolation per project
 
 ## FAQ

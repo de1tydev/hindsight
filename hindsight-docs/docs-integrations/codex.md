@@ -171,7 +171,7 @@ With this config, running Codex in `~/projects/api` and `~/projects/frontend` st
 
 ## Troubleshooting
 
-**Hooks not firing**: Check that `~/.codex/config.toml` contains `codex_hooks = true` under `[features]`. Re-run the installer to fix this automatically.
+**Hooks not firing**: Check that `~/.codex/config.toml` contains `hooks = true` under `[features]`. Re-run the installer to fix this automatically.
 
 **No memories recalled**: Recall returns results only after something has been retained. Either complete one Codex session first, or seed your bank manually using the [cookbook example](https://github.com/vectorize-io/hindsight-cookbook/tree/main/applications/codex-memory).
 

@@ -1917,6 +1917,70 @@ describe("session summary hook lifecycle", () => {
     vi.unstubAllGlobals();
   });
 
+  it("uses rolling summary as recall fallback when the latest message is too short", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        status: "ready",
+        schema_version: 2,
+        summary_text: "当前在修 OpenClaw recall query fallback。",
+        model_info: { provider: "mock", model: "mock-model" },
+      }),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-short-"));
+    tempDirs.push(dir);
+    const handle = makeHookApi({
+      autoRecall: true,
+      autoRetain: false,
+      dynamicBankId: true,
+      sessionSummaryEnabled: true,
+      sessionSummaryEnrichRecallQuery: true,
+      sessionSummaryStorePath: join(dir, "summary.sqlite"),
+      hindsightApiUrl: "http://hindsight-test:9077",
+    });
+    hindsightOpenclawPlugin(handle.api);
+
+    const ctx: PluginHookAgentContext = {
+      agentId: "main",
+      messageProvider: "telegram",
+      channelId: "direct:U888",
+      senderId: "U888",
+      sessionId: "real-session-U888-a",
+      sessionKey: "agent:main:telegram:direct:U888",
+    };
+    const { recall } = stubRecallClient();
+    await handle.trigger(
+      "agent_end",
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "We are investigating OpenClaw memory recall." },
+          { role: "assistant", content: "Got it." },
+          { role: "user", content: "We are fixing OpenClaw recall query fallback." },
+          { role: "assistant", content: "Noted." },
+        ],
+      },
+      ctx
+    );
+
+    await handle.trigger(
+      "before_prompt_build",
+      { rawMessage: "？", prompt: "？", messages: [] },
+      ctx
+    );
+
+    expect(recall).toHaveBeenCalledTimes(1);
+    const [recallRequest] = recall.mock.calls[0] as [{ query: string }];
+    expect(recallRequest.query).toContain("Rolling session summary:");
+    expect(recallRequest.query).toContain("OpenClaw recall query fallback");
+    expect(recallRequest.query).not.toContain("？");
+
+    await handle.stop();
+    vi.unstubAllGlobals();
+  });
+
   it("does not reuse a summary across different sessionIds with the same sessionKey", async () => {
     const mockFetch = vi
       .fn()
