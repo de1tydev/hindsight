@@ -2683,6 +2683,7 @@ export default function (api: MoltbotPluginAPI) {
           pluginConfig.sessionSummaryEnrichRecallQuery === true
             ? readSessionSummary(resolvedCtxForRecall, pluginConfig)
             : null;
+        const summaryTextForRecall = getSessionSummarySurfaceText(summaryRecord, pluginConfig);
 
         // Skip auto-recall when disabled (agent has its own recall tool).
         if (!pluginConfig.autoRecall) {
@@ -2703,15 +2704,25 @@ export default function (api: MoltbotPluginAPI) {
           `[Hindsight] extractRecallQuery input lengths - raw: ${event.rawMessage?.length ?? 0}, prompt: ${event.prompt?.length ?? 0}`
         );
         const extracted = extractRecallQuery(event.rawMessage, event.prompt);
-        if (!extracted) {
-          debug("[Hindsight] extractRecallQuery returned null, skipping recall");
+        const hasSummaryRecallFallback =
+          pluginConfig.sessionSummaryEnrichRecallQuery === true && summaryTextForRecall.length > 0;
+        if (!extracted && !hasSummaryRecallFallback) {
+          debug(
+            "[Hindsight] extractRecallQuery returned null and no summary fallback is available, skipping recall"
+          );
           return;
         }
-        if (isEphemeralOperationalText(extracted)) {
+        if (extracted && isEphemeralOperationalText(extracted)) {
           debug("[Hindsight] Recall query is operational/ephemeral noise, skipping recall");
           return;
         }
-        debug(`[Hindsight] extractRecallQuery result length: ${extracted.length}`);
+        if (extracted) {
+          debug(`[Hindsight] extractRecallQuery result length: ${extracted.length}`);
+        } else {
+          debug(
+            "[Hindsight] extractRecallQuery returned null, using rolling session summary fallback"
+          );
+        }
         const recallContextTurns = pluginConfig.recallContextTurns ?? 1;
         const recallMaxQueryChars = pluginConfig.recallMaxQueryChars ?? 800;
         const sessionMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
@@ -2725,20 +2736,23 @@ export default function (api: MoltbotPluginAPI) {
           );
         }
         const recallRoles = pluginConfig.recallRoles ?? ["user", "assistant"];
-        const composedPrompt =
-          pluginConfig.sessionSummaryEnrichRecallQuery === true
+        const composedPrompt = extracted
+          ? pluginConfig.sessionSummaryEnrichRecallQuery === true
             ? composeRecallQueryLatestFirst(
                 extracted,
                 sessionMessages,
                 recallContextTurns,
                 recallRoles
               )
-            : composeRecallQuery(extracted, sessionMessages, recallContextTurns, recallRoles);
-        let prompt = truncateRecallQuery(composedPrompt, extracted, recallMaxQueryChars);
+            : composeRecallQuery(extracted, sessionMessages, recallContextTurns, recallRoles)
+          : "";
+        let prompt = extracted
+          ? truncateRecallQuery(composedPrompt, extracted, recallMaxQueryChars)
+          : "";
         if (pluginConfig.sessionSummaryEnrichRecallQuery === true) {
           prompt = composeSummaryRecallQuery({
             latestQuery: prompt,
-            summaryText: getSessionSummarySurfaceText(summaryRecord, pluginConfig),
+            summaryText: summaryTextForRecall,
             maxChars: recallMaxQueryChars,
             budget: getSessionSummaryBudgetFromConfig(pluginConfig),
           });
@@ -2747,6 +2761,10 @@ export default function (api: MoltbotPluginAPI) {
         // Final defensive cap
         if (prompt.length > recallMaxQueryChars) {
           prompt = prompt.substring(0, recallMaxQueryChars);
+        }
+        if (!prompt.trim()) {
+          debug("[Hindsight] Recall query is empty after summary/query assembly, skipping recall");
+          return;
         }
 
         // Wait for client to be ready

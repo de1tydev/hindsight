@@ -60,7 +60,7 @@ Every session starts from nothing. Codex doesn't know which libraries your proje
 curl -fsSL https://hindsight.vectorize.io/get-codex | bash
 ```
 
-The installer guides you through choosing local or cloud mode and writes the hook scripts to `~/.hindsight/codex/`. It also enables `codex_hooks = true` in your `~/.codex/config.toml` automatically.
+The installer guides you through choosing local or cloud mode and writes the hook scripts to `~/.hindsight/codex/`. It also enables `hooks = true` in your `~/.codex/config.toml` automatically.
 
 If you choose Hindsight Cloud during setup, there's nothing else to install — no local daemon, no `uvx` required.
 
@@ -165,7 +165,7 @@ Example `retainMission` for a focused memory bank:
 
 ## Pitfalls
 
-**Hooks not firing.** The installer sets `codex_hooks = true` in `~/.codex/config.toml` automatically, but if you installed manually or the file already existed, this may have been missed. Check the file and add the setting under `[features]` if it's missing.
+**Hooks not firing.** The installer sets `hooks = true` in `~/.codex/config.toml` automatically, but if you installed manually or the file already existed, this may have been missed. Check the file and add the setting under `[features]` if it's missing.
 
 **No memories recalled in the first session.** Recall returns results only after something has been retained. Complete one session first, or seed your bank manually using the [cookbook example](https://github.com/vectorize-io/hindsight-cookbook/tree/main/applications/codex-memory).
 

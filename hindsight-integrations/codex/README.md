@@ -29,7 +29,7 @@ curl -fsSL https://hindsight.vectorize.io/get-codex | bash
 The installer:
 1. Downloads scripts to `~/.hindsight/codex/scripts/`
 2. Writes `~/.codex/hooks.json` with absolute paths to the scripts
-3. Adds `codex_hooks = true` to `~/.codex/config.toml`
+3. Adds `hooks = true` to `~/.codex/config.toml`
 
 ### Uninstall
 
@@ -128,4 +128,4 @@ This creates banks like `codex::my-project` automatically, using the working dir
 
 **Server not starting**: Set `hindsightApiUrl` to use an external server, or ensure `uvx` is on PATH for local daemon mode.
 
-**Hooks not firing**: Check that `~/.codex/config.toml` contains `codex_hooks = true` under `[features]`, and that your Codex CLI version supports hooks (v0.116.0+).
+**Hooks not firing**: Check that `~/.codex/config.toml` contains `hooks = true` under `[features]`, and that your Codex CLI version supports hooks (v0.116.0+).
