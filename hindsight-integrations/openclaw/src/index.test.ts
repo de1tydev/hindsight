@@ -1,4 +1,5 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
+import { createRequire } from "module";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -48,6 +49,17 @@ import type {
   MoltbotPluginAPI,
   PluginHookAgentContext,
 } from "./types.js";
+
+const require = createRequire(import.meta.url);
+const openclawManifest = require("../openclaw.plugin.json") as {
+  configSchema?: {
+    properties?: {
+      retainContext?: {
+        default?: string;
+      };
+    };
+  };
+};
 
 // ---------------------------------------------------------------------------
 // stripMemoryTags
@@ -188,6 +200,16 @@ describe("extractRecallQuery", () => {
     const result = extractRecallQuery(undefined, prompt);
     expect(result).not.toContain("[from: Alice]");
     expect(result).toContain("What should I eat for lunch?");
+  });
+
+  it("strips Feishu runtime ids from recall query text", () => {
+    const rawMessage =
+      "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+      "ou_cb923a19782fe748cd9fff99454eee31: 这个修复是否进入生产？";
+
+    const result = extractRecallQuery(rawMessage, undefined);
+
+    expect(result).toBe("这个修复是否进入生产？");
   });
 
   it("handles full envelope with System lines, channel header, and from footer", () => {
@@ -480,6 +502,19 @@ describe("buildRetainRequest", () => {
     expect(request.context).toBe("Custom extraction guidance.");
   });
 
+  it("trims configured retain context before sending it", () => {
+    const request = buildRetainRequest(
+      "hello world",
+      1,
+      {},
+      { retainContext: "  Custom extraction guidance. \n" },
+      1700000000000,
+      { turnIndex: 1 }
+    );
+
+    expect(request.context).toBe("Custom extraction guidance.");
+  });
+
   it("falls back to per-turn doc id when appendSupported is false (older API)", () => {
     const request = buildRetainRequest(
       "hello world",
@@ -514,28 +549,6 @@ describe("buildRetainRequest", () => {
     expect(request.updateMode).toBeUndefined();
   });
 
-  it("uses per-turn document ids when retainDocumentScope is 'turn'", () => {
-    const request = buildRetainRequest(
-      "hello world",
-      2,
-      {
-        agentId: "main",
-        sessionKey: "agent:main:main",
-        messageProvider: "discord",
-        channelId: "channel:123",
-        senderId: "user:456",
-      },
-      {
-        retainSource: "openclaw",
-        retainDocumentScope: "turn",
-      },
-      1700000000000,
-      { turnIndex: 7 }
-    );
-
-    expect(request.documentId).toBe("openclaw:agent:main:main:turn:000007");
-  });
-
   it("uses window ids and metadata for chunked retention", () => {
     const request = buildRetainRequest(
       "hello world",
@@ -548,7 +561,6 @@ describe("buildRetainRequest", () => {
       },
       {
         retainSource: "openclaw",
-        retainDocumentScope: "turn",
       },
       1700000000000,
       {
@@ -1115,6 +1127,26 @@ describe("composeRecallQuery", () => {
     expect(query).toContain("assistant: Got it, dark mode noted.");
     // latest message should appear after prior context
     expect(query.indexOf("Prior context:")).toBeLessThan(query.indexOf("What theme do I prefer?"));
+  });
+
+  it("strips Feishu runtime ids from prior recall context", () => {
+    const messages = [
+      {
+        role: "user",
+        content:
+          "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+          "ou_cb923a19782fe748cd9fff99454eee31: 我在修 retain 污染",
+      },
+      { role: "assistant", content: "收到。" },
+      { role: "user", content: "现在状态呢？" },
+    ];
+
+    const query = composeRecallQuery("现在状态呢？", messages, 2);
+
+    expect(query).toContain("user: 我在修 retain 污染");
+    expect(query).not.toContain("message_id");
+    expect(query).not.toContain("om_x100b6d3512c5ccb0c084ad240a38842");
+    expect(query).not.toContain("ou_cb923a19782fe748cd9fff99454eee31");
   });
 
   it("respects recallRoles when building prior context", () => {
@@ -2591,11 +2623,22 @@ describe("getPluginConfig — retainContext", () => {
     expect(cfg.retainContext).toBe("Treat IDs as routing metadata.");
   });
 
+  it("trims an explicit retainContext", () => {
+    const cfg = getPluginConfig(makeApi({ retainContext: " Treat IDs as routing metadata. \n" }));
+    expect(cfg.retainContext).toBe("Treat IDs as routing metadata.");
+  });
+
   it("falls back to the default when retainContext is blank or non-string", () => {
     expect(getPluginConfig(makeApi({ retainContext: "" })).retainContext).toBe(
       DEFAULT_RETAIN_CONTEXT
     );
     expect(getPluginConfig(makeApi({ retainContext: 42 })).retainContext).toBe(
+      DEFAULT_RETAIN_CONTEXT
+    );
+  });
+
+  it("keeps the plugin manifest default in sync with the code default", () => {
+    expect(openclawManifest.configSchema?.properties?.retainContext?.default).toBe(
       DEFAULT_RETAIN_CONTEXT
     );
   });

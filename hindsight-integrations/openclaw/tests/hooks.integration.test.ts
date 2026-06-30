@@ -502,6 +502,8 @@ describe("agent_end hook", () => {
     // Default retainFormat is 'json' with Anthropic-shaped typed blocks.
     const [, content] = retainSpy.mock.calls[0];
     const parsed = JSON.parse(content);
+    // Routing metadata is no longer prepended as a system message in the
+    // transcript — it now travels via the retain API `context` field (#1968).
     expect(parsed).toEqual([
       { role: "user", content: [{ type: "text", text: "I love TypeScript." }] },
       { role: "assistant", content: [{ type: "text", text: "TypeScript is great!" }] },

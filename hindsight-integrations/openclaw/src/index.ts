@@ -23,7 +23,6 @@ import {
 import { composeSummaryRecallQuery } from "./session-summary-assembly.js";
 import { createHash } from "crypto";
 import { dirname, join } from "path";
-import { fileURLToPath } from "url";
 import * as log from "./logger.js";
 import { configureLogger, setApiLogger, stopLogger } from "./logger.js";
 import { mkdirSync } from "fs";
@@ -885,10 +884,6 @@ if (typeof global !== "undefined") {
     getPluginConfig: () => currentPluginConfig,
   };
 }
-
-// Get directory of current module
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 // Default bank name (fallback when channel context not available)
 const DEFAULT_BANK_NAME = "openclaw";
@@ -1955,7 +1950,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         : undefined,
     retainContext:
       typeof config.retainContext === "string" && config.retainContext.trim().length > 0
-        ? config.retainContext
+        ? config.retainContext.trim()
         : DEFAULT_RETAIN_CONTEXT,
     excludeProviders: Array.isArray(config.excludeProviders)
       ? Array.from(
@@ -3110,12 +3105,7 @@ ${memoriesFormatted}
         const retention = prepareRetentionTranscript(
           messagesToRetain,
           pluginConfig,
-          retainFullWindow,
-          {
-            senderId: resolvedCtxForRetain?.senderId,
-            channelId: effectiveCtxForRetain?.channelId,
-            provider: effectiveCtxForRetain?.messageProvider,
-          }
+          retainFullWindow
         );
         if (!retention) {
           debug("[Hindsight Hook] No messages to retain (filtered/short/no-user)");
@@ -3311,11 +3301,10 @@ export function buildRetainRequest(
     tags?: string[];
     /**
      * Whether the live Hindsight API supports `update_mode: 'append'`. When
-     * true with `retainDocumentScope: 'session'`, the request gets a stable
-     * per-session document id and `updateMode: 'append'` so each retain
-     * concatenates to the existing document. When false, falls back to a
-     * unique per-turn document id so prior turns aren't overwritten.
-     * Defaults to false (conservative).
+     * true, the request gets a stable per-session document id and
+     * `updateMode: 'append'` so each retain concatenates to the existing
+     * document. When false, falls back to a unique per-turn document id so
+     * prior turns aren't overwritten. Defaults to false (conservative).
      */
     appendSupported?: boolean;
   }
@@ -3325,12 +3314,12 @@ export function buildRetainRequest(
   const turnIndex = options?.turnIndex ?? nextDocumentSequence(resolvedCtx);
   const retentionScope = options?.retentionScope || "turn";
   const documentBase = getSessionDocumentBase(resolvedCtx);
-  const documentScope = pluginConfig.retainDocumentScope ?? "session";
   const documentKind = retentionScope === "window" ? "window" : "turn";
-  // Session-scope only stays session-scope when the API can append; otherwise
-  // every retain on the same id silently overwrites prior turns (behavior
-  // pre-#932). Force per-turn ids on legacy APIs.
-  const useSessionScopedDoc = documentScope === "session" && options?.appendSupported === true;
+  // Retains are session-scoped: all turns accumulate under one document id when
+  // the API can append. On legacy APIs without append support, every retain on
+  // the same id would silently overwrite prior turns (behavior pre-#932), so
+  // fall back to per-turn ids there.
+  const useSessionScopedDoc = options?.appendSupported === true;
   const documentId = useSessionScopedDoc
     ? documentBase
     : `${documentBase}:${documentKind}:${String(turnIndex).padStart(6, "0")}`;
@@ -3348,7 +3337,7 @@ export function buildRetainRequest(
     documentId: documentId,
     context:
       typeof pluginConfig.retainContext === "string" && pluginConfig.retainContext.trim().length > 0
-        ? pluginConfig.retainContext
+        ? pluginConfig.retainContext.trim()
         : DEFAULT_RETAIN_CONTEXT,
     metadata: {
       retained_at: new Date(now).toISOString(),
