@@ -5,6 +5,8 @@ import type {
   PluginToolContext,
   MemoryResult,
   RetainRequest,
+  MentalModelSearchResponse,
+  MentalModelSearchResult,
 } from "./types.js";
 import { HindsightServer, type Logger } from "@vectorize-io/hindsight-all";
 import { HindsightClient, type HindsightClientOptions } from "@vectorize-io/hindsight-client";
@@ -98,6 +100,7 @@ const banksWithDefaultsApplied = new Set<string>();
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from "./types.js";
 const inflightRecalls = new Map<string, Promise<RecallResponse>>();
+const inflightMentalModelSearches = new Map<string, Promise<MentalModelSearchResponse>>();
 
 // Lightweight bank-scoped facade over HindsightClient. Created per-request via
 // getClientForContext() so hook bodies can keep their bankId-implicit style
@@ -117,6 +120,15 @@ export interface BankScopedClient {
     },
     timeoutMs?: number
   ): Promise<RecallResponse>;
+  searchMentalModels(
+    req: {
+      query: string;
+      maxResults?: number;
+      maxTokens?: number;
+      minRelevance?: number;
+    },
+    timeoutMs?: number
+  ): Promise<MentalModelSearchResponse>;
   setMissions(opts: BankMissionsUpdate): Promise<void>;
 }
 
@@ -145,7 +157,7 @@ function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
         budget: req.budget,
         types: req.types,
         preferObservations: req.preferObservations,
-      });
+      } as any);
       if (!timeoutMs) return call;
       // The generated client doesn't accept a per-call AbortSignal, so we race
       // against a TimeoutError here. The before_prompt_build caller already
@@ -160,6 +172,48 @@ function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
           )
         ),
       ]);
+    },
+    async searchMentalModels(req, timeoutMs) {
+      if (!clientOptions) {
+        throw new Error("Hindsight client options unavailable");
+      }
+      const controller = new AbortController();
+      const timer = timeoutMs
+        ? setTimeout(
+            () =>
+              controller.abort(new DOMException("Mental model search timed out", "TimeoutError")),
+            timeoutMs
+          )
+        : undefined;
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+      };
+      if (clientOptions.apiKey) {
+        headers.Authorization = `Bearer ${clientOptions.apiKey}`;
+      }
+      try {
+        const response = await fetch(
+          `${clientOptions.baseUrl.replace(/\/$/, "")}/v1/default/banks/${encodeURIComponent(bankId)}/mental-models/search`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              query: req.query,
+              max_results: req.maxResults ?? 3,
+              max_tokens: req.maxTokens ?? 1024,
+              min_relevance: req.minRelevance ?? 0.35,
+            }),
+            signal: controller.signal,
+          }
+        );
+        if (!response.ok) {
+          throw new Error(`Mental model search failed: HTTP ${response.status}`);
+        }
+        return (await response.json()) as MentalModelSearchResponse;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     },
     async setMissions(opts) {
       // createBank upserts each mission column the request explicitly sets;
@@ -1269,6 +1323,19 @@ export function formatMemories(results: MemoryResult[]): string {
     .join("\n\n");
 }
 
+export function formatMentalModels(models: MentalModelSearchResult[]): string {
+  if (!models || models.length === 0) return "";
+  return models
+    .map((model) => {
+      const freshness = model.may_be_stale
+        ? "may be stale; verify against recalled memories and current reality"
+        : "current at the bank write watermark";
+      const truncated = model.truncated ? " (truncated to the configured budget)" : "";
+      return `### ${model.name}\nRelevance: ${model.relevance.toFixed(3)}; freshness: ${freshness}${truncated}\n\n${model.content}`;
+    })
+    .join("\n\n");
+}
+
 // Providers that authenticate via OAuth or run locally — no API key needed.
 const NO_KEY_REQUIRED_PROVIDERS = new Set(["ollama", "openai-codex", "claude-code"]);
 
@@ -1616,6 +1683,17 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         )
       : ["heartbeat"],
     autoRecall: config.autoRecall !== false, // Default: true (on) — backward compatible
+    autoRecallMentalModels: config.autoRecallMentalModels === true,
+    mentalModelMaxResults:
+      typeof config.mentalModelMaxResults === "number" && config.mentalModelMaxResults >= 1
+        ? config.mentalModelMaxResults
+        : 3,
+    mentalModelMaxTokens:
+      typeof config.mentalModelMaxTokens === "number" && config.mentalModelMaxTokens >= 1
+        ? config.mentalModelMaxTokens
+        : 1024,
+    mentalModelMinRelevance:
+      typeof config.mentalModelMinRelevance === "number" ? config.mentalModelMinRelevance : 0.35,
     dynamicBankGranularity: Array.isArray(config.dynamicBankGranularity)
       ? config.dynamicBankGranularity
       : DEFAULT_DYNAMIC_BANK_GRANULARITY,
@@ -2270,11 +2348,11 @@ export default function (api: MoltbotPluginAPI) {
         const recallKey = `${bankId}::${queryHash}`;
         const existing = inflightRecalls.get(recallKey);
         let recallPromise: Promise<RecallResponse>;
+        const recallTimeoutMs = pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS;
         if (existing) {
           debug(`[Hindsight] Reusing in-flight recall for bank ${bankId}`);
           recallPromise = existing;
         } else {
-          const recallTimeoutMs = pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS;
           recallPromise = client.recall(
             {
               query: prompt,
@@ -2289,11 +2367,52 @@ export default function (api: MoltbotPluginAPI) {
           void recallPromise.catch(() => {}).finally(() => inflightRecalls.delete(recallKey));
         }
 
+        let mentalModelPromise: Promise<MentalModelSearchResponse> = Promise.resolve({ items: [] });
+        const existingMentalModels = inflightMentalModelSearches.get(recallKey);
+        if (pluginConfig.autoRecallMentalModels) {
+          if (existingMentalModels) {
+            mentalModelPromise = existingMentalModels;
+          } else {
+            mentalModelPromise = client.searchMentalModels(
+              {
+                query: prompt,
+                maxResults: pluginConfig.mentalModelMaxResults,
+                maxTokens: pluginConfig.mentalModelMaxTokens,
+                minRelevance: pluginConfig.mentalModelMinRelevance,
+              },
+              recallTimeoutMs
+            );
+            inflightMentalModelSearches.set(recallKey, mentalModelPromise);
+            void mentalModelPromise
+              .catch(() => {})
+              .finally(() => inflightMentalModelSearches.delete(recallKey));
+          }
+        }
+
         const recallStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
-        const response = await recallPromise;
+        const [recallOutcome, mentalModelOutcome] = await Promise.allSettled([
+          recallPromise,
+          mentalModelPromise,
+        ]);
         const recallElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - recallStart : 0;
 
-        if (!response.results || response.results.length === 0) {
+        if (recallOutcome.status === "rejected") {
+          log.warn(
+            `ordinary memory recall failed; continuing with any matched mental models: ${String(recallOutcome.reason)}`
+          );
+        }
+        if (mentalModelOutcome.status === "rejected") {
+          log.warn(
+            `mental model search failed; continuing with ordinary memories: ${String(mentalModelOutcome.reason)}`
+          );
+        }
+
+        const response = recallOutcome.status === "fulfilled" ? recallOutcome.value : undefined;
+        const mentalModels =
+          mentalModelOutcome.status === "fulfilled" ? (mentalModelOutcome.value.items ?? []) : [];
+        const recalledResults = response?.results ?? [];
+
+        if (recalledResults.length === 0 && mentalModels.length === 0) {
           if (pluginConfig.debugPerfTiming) {
             log.info(
               formatHookPerf("before_prompt_build", Date.now() - perfHookStart, {
@@ -2303,34 +2422,49 @@ export default function (api: MoltbotPluginAPI) {
               })
             );
           }
-          debug("[Hindsight] No memories found for auto-recall");
+          debug("[Hindsight] No mental models or memories found for auto-recall");
           return;
         }
 
-        debug(
-          `[Hindsight] Raw recall response (${response.results.length} results before topK):\n${response.results.map((r: any, i: number) => `  [${i}] score=${r.score?.toFixed(3) ?? "n/a"} type=${r.type ?? "n/a"}: ${JSON.stringify(r.content ?? r.text ?? r).substring(0, 200)}`).join("\n")}`
-        );
+        if (recalledResults.length > 0) {
+          debug(
+            `[Hindsight] Raw recall response (${recalledResults.length} results before topK):\n${recalledResults.map((r: any, i: number) => `  [${i}] score=${r.score?.toFixed(3) ?? "n/a"} type=${r.type ?? "n/a"}: ${JSON.stringify(r.content ?? r.text ?? r).substring(0, 200)}`).join("\n")}`
+          );
+        }
 
         const results = pluginConfig.recallTopK
-          ? response.results.slice(0, pluginConfig.recallTopK)
-          : response.results;
+          ? recalledResults.slice(0, pluginConfig.recallTopK)
+          : recalledResults;
 
         debug(
           `[Hindsight] After topK (${pluginConfig.recallTopK ?? "unlimited"}): ${results.length} results injected`
         );
 
-        // Format memories as JSON with all fields from recall
-        const memoriesFormatted = formatMemories(results);
+        const contextParts: string[] = [];
+        if (mentalModels.length > 0) {
+          contextParts.push(
+            "Matched user-curated mental models. Use these first. A model marked as possibly stale is " +
+              "guidance, not current ground truth; verify it against lower-level memories and live evidence.\n\n" +
+              formatMentalModels(mentalModels)
+          );
+        }
+        if (results.length > 0) {
+          contextParts.push(formatMemories(results));
+        }
 
         const contextMessage = `<hindsight_memories>
 ${pluginConfig.recallPromptPreamble || DEFAULT_RECALL_PROMPT_PREAMBLE}
 Current time - ${formatCurrentTimeForRecall()}
 
-${memoriesFormatted}
+${contextParts.join("\n\n")}
 </hindsight_memories>`;
 
-        debug(`[Hindsight] Auto-recall: Injecting ${results.length} memories from bank ${bankId}`);
-        log.info(`injecting ${results.length} memories into context (bank: ${bankId})`);
+        debug(
+          `[Hindsight] Auto-recall: Injecting ${mentalModels.length} mental models and ${results.length} memories from bank ${bankId}`
+        );
+        log.info(
+          `injecting ${mentalModels.length} mental models and ${results.length} memories into context (bank: ${bankId})`
+        );
         log.trackRecall(bankId, results.length);
 
         if (pluginConfig.debugPerfTiming) {

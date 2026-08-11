@@ -5,6 +5,7 @@ import {
   extractRecallQuery,
   formatCurrentTimeForRecall,
   formatMemories,
+  formatMentalModels,
   prepareRetentionTranscript,
   sliceLastTurnsByUserBoundary,
   composeRecallQuery,
@@ -30,7 +31,12 @@ import {
   formatHookPerf,
   DEFAULT_RETAIN_CONTEXT,
 } from "./index.js";
-import type { PluginConfig, MemoryResult, MoltbotPluginAPI } from "./types.js";
+import type {
+  PluginConfig,
+  MemoryResult,
+  MentalModelSearchResult,
+  MoltbotPluginAPI,
+} from "./types.js";
 
 const require = createRequire(import.meta.url);
 const openclawManifest = require("../openclaw.plugin.json") as {
@@ -299,6 +305,26 @@ describe("formatMemories", () => {
 
   it("returns empty string for empty memories", () => {
     expect(formatMemories([])).toBe("");
+  });
+});
+
+describe("formatMentalModels", () => {
+  it("marks conservative freshness and preserves relevance", () => {
+    const models: MentalModelSearchResult[] = [
+      {
+        id: "model-1",
+        name: "Deployment model",
+        content: "Verify the active runtime first.",
+        tags: [],
+        relevance: 0.9234,
+        may_be_stale: true,
+      },
+    ];
+
+    const output = formatMentalModels(models);
+    expect(output).toContain("### Deployment model");
+    expect(output).toContain("Relevance: 0.923");
+    expect(output).toContain("may be stale");
   });
 });
 
@@ -1646,6 +1672,31 @@ describe("getPluginConfig — preferObservations (#2977)", () => {
     expect(getPluginConfig(makeApi({ preferObservations: false })).preferObservations).toBe(false);
     expect(getPluginConfig(makeApi({ preferObservations: "true" })).preferObservations).toBe(false);
     expect(getPluginConfig(makeApi({ preferObservations: 1 })).preferObservations).toBe(false);
+  });
+});
+
+describe("getPluginConfig — mental model auto-recall", () => {
+  it("is opt-in with bounded defaults", () => {
+    const defaults = getPluginConfig(makeApi({}));
+    expect(defaults.autoRecallMentalModels).toBe(false);
+    expect(defaults.mentalModelMaxResults).toBe(3);
+    expect(defaults.mentalModelMaxTokens).toBe(1024);
+    expect(defaults.mentalModelMinRelevance).toBe(0.35);
+  });
+
+  it("accepts explicit settings", () => {
+    const cfg = getPluginConfig(
+      makeApi({
+        autoRecallMentalModels: true,
+        mentalModelMaxResults: 2,
+        mentalModelMaxTokens: 768,
+        mentalModelMinRelevance: 0.5,
+      })
+    );
+    expect(cfg.autoRecallMentalModels).toBe(true);
+    expect(cfg.mentalModelMaxResults).toBe(2);
+    expect(cfg.mentalModelMaxTokens).toBe(768);
+    expect(cfg.mentalModelMinRelevance).toBe(0.5);
   });
 });
 

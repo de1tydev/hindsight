@@ -86,6 +86,41 @@ class TestRecallHook:
         assert "Paris is the capital of France" in context
         assert "<hindsight_memories>" in context
 
+    def test_injects_matched_mental_models_before_memories(self, monkeypatch, tmp_path):
+        memory = make_memory("Lower-level deployment evidence", "observation")
+
+        def respond(req, timeout=None):
+            if req.full_url.endswith("/mental-models/search"):
+                return FakeHTTPResponse(
+                    {
+                        "items": [
+                            {
+                                "id": "model-1",
+                                "name": "Deployment mental model",
+                                "content": "Verify the active runtime before changing code.",
+                                "tags": [],
+                                "relevance": 0.92,
+                                "may_be_stale": True,
+                                "truncated": False,
+                            }
+                        ]
+                    }
+                )
+            return FakeHTTPResponse({"results": [memory]})
+
+        output = _run_hook(
+            "recall",
+            make_hook_input(prompt="How should I deploy this service?"),
+            monkeypatch,
+            tmp_path,
+            urlopen_side_effect=respond,
+            user_config={"autoRecallMentalModels": True},
+        )
+
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        assert context.index("Deployment mental model") < context.index("Lower-level deployment evidence")
+        assert "may be stale" in context
+
     def test_recall_min_scores_filters_low_scoring_memories(self, monkeypatch, tmp_path):
         low_semantic = make_memory("Marginal match")
         low_semantic["scores"] = {"semantic": 0.42, "reranker": 0.8}

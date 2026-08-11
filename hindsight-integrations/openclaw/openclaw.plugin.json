@@ -162,6 +162,31 @@
         "description": "Automatically recall memories on every prompt and inject them as context. Set to false when agent has its own recall tool.",
         "default": true
       },
+      "autoRecallMentalModels": {
+        "type": "boolean",
+        "description": "Semantically search matched user-curated mental models and inject them before ordinary memories.",
+        "default": false
+      },
+      "mentalModelMaxResults": {
+        "type": "integer",
+        "description": "Maximum number of matched mental models to inject per prompt.",
+        "minimum": 1,
+        "maximum": 20,
+        "default": 3
+      },
+      "mentalModelMaxTokens": {
+        "type": "integer",
+        "description": "Shared content-token budget for automatically injected mental models.",
+        "minimum": 1,
+        "default": 1024
+      },
+      "mentalModelMinRelevance": {
+        "type": "number",
+        "description": "Minimum vector relevance required for automatic mental-model injection.",
+        "minimum": -1,
+        "maximum": 1,
+        "default": 0.35
+      },
       "excludeProviders": {
         "type": "array",
         "items": {
@@ -461,6 +486,22 @@
     "autoRecall": {
       "label": "Auto-Recall",
       "placeholder": "true (inject memories on every prompt)"
+    },
+    "autoRecallMentalModels": {
+      "label": "Auto-Recall Mental Models",
+      "placeholder": "false (disabled by default)"
+    },
+    "mentalModelMaxResults": {
+      "label": "Mental Model Max Results",
+      "placeholder": "3"
+    },
+    "mentalModelMaxTokens": {
+      "label": "Mental Model Max Tokens",
+      "placeholder": "1024"
+    },
+    "mentalModelMinRelevance": {
+      "label": "Mental Model Min Relevance",
+      "placeholder": "0.35"
     },
     "excludeProviders": {
       "label": "Excluded Providers",

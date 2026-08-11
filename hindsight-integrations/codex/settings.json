@@ -10,6 +10,10 @@
   "recallBudget": "mid",
   "recallMaxTokens": 1024,
   "recallMinScores": {},
+  "autoRecallMentalModels": false,
+  "mentalModelMaxResults": 3,
+  "mentalModelMaxTokens": 1024,
+  "mentalModelMinRelevance": 0.35,
   "recallTimeout": 10,
   "recallTypes": [
     "world",

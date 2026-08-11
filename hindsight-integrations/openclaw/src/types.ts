@@ -63,6 +63,22 @@ export interface PluginHookAgentContext {
   senderId?: string;
 }
 
+export interface MentalModelSearchResult {
+  id: string;
+  name: string;
+  content: string;
+  tags: string[];
+  relevance: number;
+  updated_at?: string | null;
+  may_be_stale: boolean;
+  staleness_reason?: string | null;
+  truncated?: boolean;
+}
+
+export interface MentalModelSearchResponse {
+  items: MentalModelSearchResult[];
+}
+
 export interface PluginConfig {
   /**
    * Mission for the Reflect operation. Stamped onto the bank's `reflect_mission`
@@ -118,6 +134,10 @@ export interface PluginConfig {
   retainContext?: string; // Interpretation guidance sent via the retain API context field. Defaults to built-in OpenClaw transcript/routing metadata guidance.
   excludeProviders?: string[]; // Message providers to exclude from recall/retain (e.g. ['telegram', 'discord'])
   autoRecall?: boolean; // Auto-recall memories on every prompt (default: true). Set to false when agent has its own recall tool.
+  autoRecallMentalModels?: boolean; // Semantically search and inject matched mental models before ordinary memories. Default: false.
+  mentalModelMaxResults?: number; // Maximum matched mental models per prompt. Default: 3.
+  mentalModelMaxTokens?: number; // Shared content-token budget across matched mental models. Default: 1024.
+  mentalModelMinRelevance?: number; // Minimum vector relevance for automatic mental-model injection. Default: 0.35.
   dynamicBankGranularity?: Array<"agent" | "provider" | "channel" | "user">; // Fields for bank ID derivation. Default: ['agent', 'channel', 'user']
   autoRetain?: boolean; // Default: true
   retainRoles?: Array<"user" | "assistant" | "system" | "tool">; // Roles to include in retained transcript. Default: ['user', 'assistant']

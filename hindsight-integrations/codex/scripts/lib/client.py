@@ -95,6 +95,29 @@ class HindsightClient:
             body["types"] = types
         return self._request("POST", path, body, timeout=timeout)
 
+    def search_mental_models(
+        self,
+        bank_id: str,
+        query: str,
+        max_results: int = 3,
+        max_tokens: int = 1024,
+        min_relevance: float = 0.35,
+        timeout: int = 10,
+    ) -> dict:
+        """Semantically search bounded mental models for prompt injection."""
+        path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/mental-models/search"
+        return self._request(
+            "POST",
+            path,
+            {
+                "query": query,
+                "max_results": max_results,
+                "max_tokens": max_tokens,
+                "min_relevance": min_relevance,
+            },
+            timeout=timeout,
+        )
+
     def retain(
         self,
         bank_id: str,
