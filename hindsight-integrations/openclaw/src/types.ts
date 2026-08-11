@@ -56,7 +56,6 @@ export interface MoltbotConfig {
 
 export interface PluginHookAgentContext {
   agentId?: string;
-  sessionId?: string;
   sessionKey?: string;
   workspaceDir?: string;
   messageProvider?: string;
@@ -81,6 +80,25 @@ export interface PluginConfig {
    * `observations_mission` field on first use.
    */
   observationsMission?: string;
+  /**
+   * Fact extraction mode stamped onto dynamic/static banks on first use.
+   * Leave unset to keep the Hindsight server default for new banks.
+   */
+  retainExtractionMode?: "concise" | "verbose" | "custom" | "verbatim" | "chunks";
+  /** Toggle observation consolidation for new banks. */
+  enableObservations?: boolean;
+  /** Toggle automatic consolidation scheduling for new banks. */
+  enableAutoConsolidation?: boolean;
+  /** Reflect disposition traits (1–5) stamped on first bank use. */
+  dispositionSkepticism?: number;
+  dispositionLiteralism?: number;
+  dispositionEmpathy?: number;
+  /**
+   * Controlled vocabulary for entity labels. Either a list of attribute defs or
+   * a `{ attributes: [...] }` object — passed through to PATCH /banks/{id}/config
+   * as `entity_labels`. Other shapes are ignored (the server only accepts these two).
+   */
+  entityLabels?: unknown;
   embedPort?: number;
   daemonIdleTimeout?: number; // Seconds before daemon shuts down (0 = never)
   embedVersion?: string; // hindsight-embed version (default: "latest")
@@ -108,9 +126,8 @@ export interface PluginConfig {
   recallBudget?: "low" | "mid" | "high"; // Recall effort. Default: 'mid'
   recallMaxTokens?: number; // Max tokens for recall response. Default: 1024
   recallTypes?: Array<"world" | "experience" | "observation">; // Memory types to recall. Default: ['observation'] — surfaces only the consolidated, deduplicated view (raw world/experience facts can drive the same answer multiple times when many memories say the same thing).
+  preferObservations?: boolean; // When true, recall drops raw facts already consolidated into an observation while keeping unconsolidated ones. Pair with recallTypes including raw types to catch just-retained facts without duplicating consolidated content. Default: false.
   recallRoles?: Array<"user" | "assistant" | "system" | "tool">; // Roles to include when composing contextual recall query. Default: ['user', 'assistant']
-  includeSenderContext?: boolean; // Deprecated compatibility option. Sender/channel/provider stay in retain metadata/context and are not prepended to retained transcript content.
-  retainDocumentScope?: "session" | "turn"; // Granularity of the retained document_id. 'session' (default) groups all retains under a single document per OpenClaw session (`openclaw:{sessionKey}`). 'turn' produces a new document per retain (`openclaw:{sessionKey}:turn:NNNNNN` / `:window:NNNNNN`).
   retainEveryNTurns?: number; // Retain every Nth turn (1 = every turn, default: 1). Values > 1 enable chunked retention.
   retainOverlapTurns?: number; // Extra prior turns included when chunked retention fires (default: 0). Window = retainEveryNTurns + retainOverlapTurns.
   recallTopK?: number; // Max number of memories to inject. Default: unlimited
@@ -118,24 +135,7 @@ export interface PluginConfig {
   recallTimeoutMs?: number; // Timeout for auto-recall in milliseconds. Default: 10000
   recallMaxQueryChars?: number; // Max chars for composed recall query. Default: 800
   recallPromptPreamble?: string; // Prompt preamble placed above recalled memories. Default: built-in guidance text.
-  recallInjectionPosition?: "prepend" | "append" | "user"; // Where to inject recalled memories. 'prepend' = start of system prompt (default), 'append' = end of system prompt (preserves prompt cache), 'user' = before user message.
-  sessionSummaryEnabled?: boolean; // Enables rolling session summary lifecycle for configured update cadence and recall-query enrichment.
-  sessionSummaryStorePath?: string; // Optional SQLite path for rolling session summaries. Default: ~/.openclaw/data/hindsight-session-summaries.sqlite.
-  sessionSummaryEnrichRecallQuery?: boolean; // Adds rolling summary text after the latest recall query while preserving recallMaxQueryChars. Default: false.
-  sessionSummaryGeneratorProvider?: string; // Optional summary generator provider hint; Hindsight API performs final routing.
-  sessionSummaryGeneratorModel?: string; // Optional summary generator model hint; Hindsight API performs final routing.
-  sessionSummaryGeneratorBaseUrl?: string; // Optional summary generator base URL hint; Hindsight API performs final routing.
-  sessionSummaryGeneratorApiKeyEnv?: string; // Env var name for summary generator API key. Default: HINDSIGHT_LLM_API_KEY.
-  sessionSummaryReuseHindsightLlmConfig?: boolean; // Reuse llmProvider/llmModel/llmBaseUrl when summary fields are unset. Default: true.
-  sessionSummaryUpdateEveryNTurns?: number; // Optional summary refresh cadence independent from retainEveryNTurns.
-  sessionSummaryMinUpdateEveryNTurns?: number; // Minimum summary refresh cadence. Default: 2.
-  sessionSummaryTimeoutMs?: number; // Timeout for bounded summary generation/update work. Default: 20000.
-  sessionSummaryMaxInputChars?: number; // Max input chars for summary generation. Default: 16000.
-  sessionSummaryMaxOutputChars?: number; // Max rendered summary chars. Default: 2000.
-  sessionSummaryMaxRecallQueryChars?: number; // Budget for summary-derived recall query text. Default: 800.
-  sessionSummaryRecallQueryBudgetRatio?: number; // Fraction of summary input budget available to recall query text. Default: 0.25.
-  sessionSummaryMinLatestQueryReserveChars?: number; // Latest-query reserve during summary input trimming. Default: 400.
-  sessionSummaryDropCompletedTodosAfterTurns?: number; // Completed todo retention horizon. Default: 20.
+  recallInjectionPosition?: "prepend" | "append" | "user"; // Where to inject recalled memories. 'user' = before user message (default, preserves system prompt cache), 'prepend' = start of system prompt, 'append' = end of system prompt.
   ignoreSessionPatterns?: string[]; // Session key glob patterns to skip entirely (no recall, no retain). E.g. ["agent:main:**", "agent:*:cron:**"]
   statelessSessionPatterns?: string[]; // Session key glob patterns for read-only sessions (recall allowed, retain skipped). E.g. ["agent:*:subagent:**"]
   skipStatelessSessions?: boolean; // When true (default), stateless sessions also skip recall. When false, they recall but never retain.

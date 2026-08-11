@@ -2,6 +2,7 @@
 
 import json
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -13,6 +14,7 @@ from hindsight_api.mcp_tools import (
     parse_timestamp,
     register_mcp_tools,
 )
+from hindsight_api.models import RequestContext
 
 
 class TestParseTimestamp:
@@ -188,14 +190,27 @@ def mock_memory():
 
     # Tags & bank methods
     memory.list_tags = AsyncMock(return_value={"items": ["tag1", "tag2"], "total": 2})
+    memory._ensure_bank_exists = AsyncMock(return_value=True)
     memory.get_bank_profile = AsyncMock(return_value={"id": "test-bank", "name": "Test Bank", "mission": "Testing"})
     memory.get_bank_stats = AsyncMock(return_value={"nodes": 100, "links": 50})
-    memory.update_bank = AsyncMock(return_value={"id": "test-bank", "name": "Updated"})
     memory.delete_bank = AsyncMock(return_value={"deleted_memories": 10, "deleted_entities": 5})
 
-    # Config resolver (used by update_bank MCP tool for config fields)
+    # Only recall/reflect tools read from the resolver; update_bank now owns both
+    # the profile and the config write, so its assertions belong on that mock.
     memory._config_resolver = MagicMock()
-    memory._config_resolver.update_bank_config = AsyncMock()
+
+    async def _update_bank(
+        bank_id: str,
+        *,
+        name: str | None = None,
+        mission: str | None = None,
+        config_updates: dict[str, Any] | None = None,
+        create_if_missing: bool = True,
+        request_context: RequestContext,
+    ) -> dict[str, Any]:
+        return {"id": bank_id, "name": name or "Updated", "mission": mission or ""}
+
+    memory.update_bank = AsyncMock(side_effect=_update_bank)
     memory.list_banks = AsyncMock(return_value=[])
 
     return memory
@@ -711,6 +726,38 @@ class TestCreateMentalModel:
         )
         assert mock_memory.create_mental_model.call_args.kwargs["bank_id"] == "other-bank"
         assert mock_memory.submit_async_refresh_mental_model.call_args.kwargs["bank_id"] == "other-bank"
+
+    async def test_create_with_tags_match_persisted_in_trigger(self, mcp_server_with_mental_models, mock_memory):
+        """tags_match must be written into the trigger so the refresh path can read it (issue #2808)."""
+        await _tools(mcp_server_with_mental_models)["create_mental_model"].fn(
+            name="Current projects",
+            source_query="Which projects is the user working on?",
+            tags=["projects", "mental-model"],
+            tags_match="any",
+        )
+        trigger = mock_memory.create_mental_model.call_args.kwargs["trigger"]
+        assert trigger["tags_match"] == "any"
+
+    async def test_create_without_tags_match_omits_key(self, mcp_server_with_mental_models, mock_memory):
+        """Omitting tags_match must NOT write the key, preserving the engine's all_strict default."""
+        await _tools(mcp_server_with_mental_models)["create_mental_model"].fn(name="Test", source_query="query")
+        trigger = mock_memory.create_mental_model.call_args.kwargs["trigger"]
+        assert "tags_match" not in trigger
+
+    async def test_create_invalid_tags_match_returns_error(self, mcp_server_with_mental_models, mock_memory):
+        """An unknown tags_match value is rejected before touching the engine."""
+        result = await _tools(mcp_server_with_mental_models)["create_mental_model"].fn(
+            name="Test", source_query="query", tags_match="most"
+        )
+        assert "tags_match" in result
+        mock_memory.create_mental_model.assert_not_called()
+
+    async def test_create_tags_match_single_bank(self, mcp_server_single_bank, mock_memory):
+        await _tools(mcp_server_single_bank)["create_mental_model"].fn(
+            name="Test", source_query="query", tags=["a", "b"], tags_match="all"
+        )
+        trigger = mock_memory.create_mental_model.call_args.kwargs["trigger"]
+        assert trigger["tags_match"] == "all"
 
     async def test_create_single_bank(self, mcp_server_single_bank, mock_memory):
         result = await _tools(mcp_server_single_bank)["create_mental_model"].fn(name="Test", source_query="query")
@@ -1511,6 +1558,38 @@ class TestTagsAndBankTools:
         mcp = _make_mcp_server(mock_memory, {"get_bank"}, include_bank_id=True)
         result = await _tools(mcp)["get_bank"].fn()
         assert '"test-bank"' in result or "test-bank" in result
+        assert mock_memory.get_bank_profile.call_args.kwargs["create_if_missing"] is False
+
+    async def test_get_bank_missing_does_not_create(self, mock_memory):
+        mock_memory.get_bank_profile.return_value = None
+        mcp = _make_mcp_server(mock_memory, {"get_bank"}, include_bank_id=True)
+        result = await _tools(mcp)["get_bank"].fn(bank_id="missing-bank")
+        assert json.loads(result)["error"] == "Bank 'missing-bank' not found"
+        assert mock_memory.get_bank_profile.call_args.kwargs["create_if_missing"] is False
+
+    async def test_create_bank_uses_public_profile_api(self, mock_memory):
+        mcp = _make_mcp_server(mock_memory, {"create_bank"}, include_bank_id=True)
+        result = await _tools(mcp)["create_bank"].fn(bank_id="new-bank")
+        assert '"test-bank"' in result or "test-bank" in result
+        mock_memory.get_bank_profile.assert_awaited_once()
+        assert mock_memory.get_bank_profile.call_args.args[0] == "new-bank"
+        mock_memory.update_bank.assert_not_awaited()
+        mock_memory._ensure_bank_exists.assert_not_awaited()
+
+    async def test_create_bank_with_fields_uses_public_update_api(self, mock_memory):
+        mcp = _make_mcp_server(mock_memory, {"create_bank"}, include_bank_id=True)
+        result = await _tools(mcp)["create_bank"].fn(
+            bank_id="new-bank",
+            name="New Bank",
+            mission="Help the user",
+        )
+        assert json.loads(result)["name"] == "New Bank"
+        mock_memory.update_bank.assert_awaited_once()
+        assert mock_memory.update_bank.call_args.args[0] == "new-bank"
+        assert mock_memory.update_bank.call_args.kwargs["name"] == "New Bank"
+        assert mock_memory.update_bank.call_args.kwargs["mission"] == "Help the user"
+        mock_memory.get_bank_profile.assert_not_awaited()
+        mock_memory._ensure_bank_exists.assert_not_awaited()
 
     async def test_get_bank_stats(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"get_bank_stats"}, include_bank_id=True)
@@ -1520,14 +1599,13 @@ class TestTagsAndBankTools:
     async def test_update_bank(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
         result = await _tools(mcp)["update_bank"].fn(name="New Name", mission="New Mission")
-        # name is updated via engine
-        call_kwargs = mock_memory.update_bank.call_args.kwargs
-        assert call_kwargs["name"] == "New Name"
-        # mission is routed to config resolver as reflect_mission
-        config_call = mock_memory._config_resolver.update_bank_config.call_args
-        assert config_call.args[1] == {"reflect_mission": "New Mission"}
+        # name and config are applied by a single engine call
+        call = mock_memory.update_bank.call_args
+        assert call.kwargs["name"] == "New Name"
+        # mission is routed into config_updates as reflect_mission
+        assert call.kwargs["config_updates"] == {"reflect_mission": "New Mission"}
         # bank_id is the first positional arg
-        assert config_call.args[0] == "test-bank"
+        assert call.args[0] == "test-bank"
 
     async def test_delete_bank(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"delete_bank"}, include_bank_id=True)
@@ -1556,6 +1634,14 @@ class TestTagsAndBankTools:
         mcp = _make_mcp_server(mock_memory, {"get_bank"}, include_bank_id=False)
         result = await _tools(mcp)["get_bank"].fn()
         assert isinstance(result, dict)
+        assert mock_memory.get_bank_profile.call_args.kwargs["create_if_missing"] is False
+
+    async def test_get_bank_single_bank_missing_does_not_create(self, mock_memory):
+        mock_memory.get_bank_profile.return_value = None
+        mcp = _make_mcp_server(mock_memory, {"get_bank"}, include_bank_id=False)
+        result = await _tools(mcp)["get_bank"].fn()
+        assert result["error"] == "Bank 'test-bank' not found"
+        assert mock_memory.get_bank_profile.call_args.kwargs["create_if_missing"] is False
 
     async def test_delete_bank_single_bank(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"delete_bank"}, include_bank_id=False)
@@ -1644,27 +1730,26 @@ class TestUpdateBankVariants:
         assert "error" in result
 
     async def test_update_bank_config_updates_dict(self, mock_memory):
-        """config_updates dict is passed directly to config resolver."""
+        """Config updates use the engine's bank-creating config path."""
         mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
         await _tools(mcp)["update_bank"].fn(config_updates={"reflect_mission": "Guide reflect output"})
-        config_call = mock_memory._config_resolver.update_bank_config.call_args
-        assert config_call.args[1] == {"reflect_mission": "Guide reflect output"}
-        # name should NOT be updated when not provided
-        mock_memory.update_bank.assert_not_called()
+        mock_memory.update_bank.assert_awaited_once()
+        assert mock_memory.update_bank.call_args.args[0] == "test-bank"
+        assert mock_memory.update_bank.call_args.kwargs["name"] is None
+        assert mock_memory.update_bank.call_args.kwargs["config_updates"] == {"reflect_mission": "Guide reflect output"}
+        mock_memory.get_bank_profile.assert_not_called()
 
     async def test_update_bank_mission_maps_to_reflect_mission(self, mock_memory):
         """Deprecated mission param is mapped to reflect_mission in config."""
         mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
         await _tools(mcp)["update_bank"].fn(mission="My mission")
-        config_call = mock_memory._config_resolver.update_bank_config.call_args
-        assert config_call.args[1] == {"reflect_mission": "My mission"}
+        assert mock_memory.update_bank.call_args.kwargs["config_updates"] == {"reflect_mission": "My mission"}
 
     async def test_update_bank_config_reflect_mission_takes_precedence_over_mission(self, mock_memory):
         """When both mission and config_updates.reflect_mission are provided, config wins."""
         mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
         await _tools(mcp)["update_bank"].fn(mission="old", config_updates={"reflect_mission": "new"})
-        config_call = mock_memory._config_resolver.update_bank_config.call_args
-        assert config_call.args[1]["reflect_mission"] == "new"
+        assert mock_memory.update_bank.call_args.kwargs["config_updates"]["reflect_mission"] == "new"
 
     async def test_update_bank_multiple_config_fields(self, mock_memory):
         """Multiple config fields can be set in a single config_updates dict."""
@@ -1683,8 +1768,7 @@ class TestUpdateBankVariants:
                 "retain_structured_chunk_size": 5000,
             }
         )
-        config_call = mock_memory._config_resolver.update_bank_config.call_args
-        updates = config_call.args[1]
+        updates = mock_memory.update_bank.call_args.kwargs["config_updates"]
         assert updates["retain_mission"] == "Extract technical decisions"
         assert updates["disposition_skepticism"] == 5
         assert updates["disposition_literalism"] == 1
@@ -1703,17 +1787,18 @@ class TestUpdateBankVariants:
             name="My Bank",
             config_updates={"reflect_mission": "Reflect guide", "retain_mission": "Retain guide"},
         )
+        mock_memory.update_bank.assert_awaited_once()
         assert mock_memory.update_bank.call_args.kwargs["name"] == "My Bank"
-        updates = mock_memory._config_resolver.update_bank_config.call_args.args[1]
+        updates = mock_memory.update_bank.call_args.kwargs["config_updates"]
         assert updates["reflect_mission"] == "Reflect guide"
         assert updates["retain_mission"] == "Retain guide"
 
     async def test_update_bank_no_config_call_when_only_name(self, mock_memory):
-        """When only name is provided, config resolver should not be called."""
+        """When only name is provided, no config update is requested."""
         mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
         await _tools(mcp)["update_bank"].fn(name="Just Name")
         mock_memory.update_bank.assert_called_once()
-        mock_memory._config_resolver.update_bank_config.assert_not_called()
+        assert mock_memory.update_bank.call_args.kwargs["config_updates"] is None
 
     async def test_update_bank_config_updates_single_bank(self, mock_memory):
         """config_updates works in single-bank mode too."""
@@ -1722,8 +1807,7 @@ class TestUpdateBankVariants:
             config_updates={"retain_mission": "Extract everything", "disposition_empathy": 5}
         )
         assert isinstance(result, dict)
-        config_call = mock_memory._config_resolver.update_bank_config.call_args
-        updates = config_call.args[1]
+        updates = mock_memory.update_bank.call_args.kwargs["config_updates"]
         assert updates["retain_mission"] == "Extract everything"
         assert updates["disposition_empathy"] == 5
 
@@ -1731,12 +1815,11 @@ class TestUpdateBankVariants:
         """bank_id override routes config update to the correct bank."""
         mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
         await _tools(mcp)["update_bank"].fn(config_updates={"reflect_mission": "Test"}, bank_id="other-bank")
-        config_call = mock_memory._config_resolver.update_bank_config.call_args
-        assert config_call.args[0] == "other-bank"
+        assert mock_memory.update_bank.call_args.args[0] == "other-bank"
 
-    async def test_update_bank_config_resolver_validation_error(self, mock_memory):
-        """ValueError from config resolver (e.g. invalid field) is returned as error."""
-        mock_memory._config_resolver.update_bank_config.side_effect = ValueError(
+    async def test_update_bank_config_validation_error(self, mock_memory):
+        """ValueError from config validation (e.g. invalid field) is returned as error."""
+        mock_memory.update_bank.side_effect = ValueError(
             "Cannot override static (server-level) fields: ['database_url']"
         )
         mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
@@ -1754,7 +1837,7 @@ class TestUpdateBankVariants:
                 "entity_labels": ["PERSON", "ORG"],
             }
         )
-        updates = mock_memory._config_resolver.update_bank_config.call_args.args[1]
+        updates = mock_memory.update_bank.call_args.kwargs["config_updates"]
         assert updates["recall_budget_fixed_low"] == 100
         assert updates["consolidation_llm_batch_size"] == 8
         assert updates["entity_labels"] == ["PERSON", "ORG"]
@@ -1959,6 +2042,7 @@ def _reflect_mcp_with_trace(include_bank_id_param: bool):
         "based_on": {"world": []},
         "tool_trace": [{"tool": "recall", "output": "x" * 1000}],
         "llm_trace": [{"model": "test", "output": "y" * 1000}],
+        "directives_applied": [{"id": "d1", "name": "Tone", "content": "z" * 1000}],
     }
     memory = MagicMock()
     memory.reflect_async = AsyncMock(
@@ -1985,7 +2069,7 @@ def _reflect_result_data(result) -> dict:
 
 @pytest.mark.asyncio
 class TestReflectTraceOmission:
-    """reflect must not leak the agentic tool_trace/llm_trace into MCP responses by default."""
+    """reflect must not leak the agentic tool_trace/llm_trace/directives_applied into MCP responses by default."""
 
     @pytest.mark.parametrize("multi_bank", [True, False])
     async def test_trace_omitted_by_default(self, multi_bank):
@@ -1994,6 +2078,9 @@ class TestReflectTraceOmission:
         assert data["text"] == "answer"
         assert "tool_trace" not in data
         assert "llm_trace" not in data
+        # directives_applied is built "for the trace" and carries full directive content,
+        # so it must be omitted by default like the other trace fields.
+        assert "directives_applied" not in data
 
     @pytest.mark.parametrize("multi_bank", [True, False])
     async def test_trace_included_when_requested(self, multi_bank):
@@ -2001,6 +2088,7 @@ class TestReflectTraceOmission:
         data = _reflect_result_data(await _tools(mcp)["reflect"].fn(query="q", include_trace=True))
         assert "tool_trace" in data
         assert "llm_trace" in data
+        assert "directives_applied" in data
 
     @pytest.mark.parametrize("multi_bank", [True, False])
     async def test_based_on_flag_is_independent_of_trace(self, multi_bank):
@@ -2009,3 +2097,4 @@ class TestReflectTraceOmission:
         data = _reflect_result_data(await _tools(mcp)["reflect"].fn(query="q", include_based_on=True))
         assert "based_on" in data
         assert "tool_trace" not in data
+        assert "directives_applied" not in data

@@ -39,6 +39,18 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
+          id: 'developer/mental-models',
+          label: 'Mental Models',
+          customProps: { icon: 'lu-layers' },
+        },
+        {
+          type: 'doc',
+          id: 'developer/knowledge-pages',
+          label: 'Knowledge Pages',
+          customProps: { icon: 'lu-book-text' },
+        },
+        {
+          type: 'doc',
           id: 'developer/multilingual',
           label: 'Multilingual',
           customProps: { icon: 'lu-languages' },
@@ -97,6 +109,12 @@ const sidebars: SidebarsConfig = {
           id: 'developer/api/mental-models',
           label: 'Mental Models',
           customProps: { icon: 'lu-layers' },
+        },
+        {
+          type: 'doc',
+          id: 'developer/api/knowledge-pages',
+          label: 'Knowledge Pages',
+          customProps: { icon: 'lu-book-text' },
         },
         {
           type: 'doc',
@@ -231,6 +249,12 @@ const sidebars: SidebarsConfig = {
           id: 'developer/admin-cli',
           label: 'Admin CLI',
           customProps: { icon: 'lu-terminal' },
+        },
+        {
+          type: 'doc',
+          id: 'developer/oracle',
+          label: 'Oracle Database',
+          customProps: { icon: 'lu-database' },
         },
         {
           type: 'doc',

@@ -12,8 +12,6 @@ from pathlib import Path
 from typing import Optional
 
 DEFAULT_TIMEOUT = 15  # seconds
-HEALTH_CHECK_RETRIES = 3
-HEALTH_CHECK_DELAY = 2  # seconds
 
 
 def _plugin_version() -> str:
@@ -72,26 +70,6 @@ class HindsightClient:
                 pass
             raise RuntimeError(f"HTTP {e.code} from {url}: {body_text}") from e
 
-    def health_check(self, timeout: int = 5) -> bool:
-        """Check if the Hindsight server is reachable.
-
-        Mirrors Openclaw's checkExternalApiHealth: retries up to 3 times
-        with 2s delay between attempts.
-        """
-        import time
-
-        for attempt in range(1, HEALTH_CHECK_RETRIES + 1):
-            try:
-                url = f"{self.api_url}/health"
-                req = urllib.request.Request(url, headers=self._headers(), method="GET")
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    if resp.status == 200:
-                        return True
-            except Exception:
-                pass
-            if attempt < HEALTH_CHECK_RETRIES:
-                time.sleep(HEALTH_CHECK_DELAY)
-        return False
 
     def recall(
         self,
@@ -148,31 +126,6 @@ class HindsightClient:
             "async": True,
         }
         return self._request("POST", path, body, timeout=timeout)
-
-    def generate_session_summary(
-        self,
-        session_id: str,
-        identity_scope: str,
-        bank_id: Optional[str] = None,
-        previous_summary_text: Optional[str] = None,
-        latest_query: Optional[str] = None,
-        messages: Optional[list] = None,
-        metadata: Optional[dict] = None,
-        budget: Optional[dict] = None,
-        timeout: int = 20,
-    ) -> dict:
-        """Generate a rolling session summary using the server-side LLM."""
-        body = {
-            "session_id": session_id,
-            "identity_scope": identity_scope,
-            "bank_id": bank_id,
-            "previous_summary_text": previous_summary_text,
-            "latest_query": latest_query,
-            "messages": messages or [],
-            "metadata": metadata or {},
-            "budget": budget or {},
-        }
-        return self._request("POST", "/v1/session-summary/generate", body, timeout=timeout)
 
     def set_bank_mission(
         self, bank_id: str, mission: str, retain_mission: Optional[str] = None, timeout: int = 15

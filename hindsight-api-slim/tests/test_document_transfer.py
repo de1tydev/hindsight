@@ -21,7 +21,16 @@ from hindsight_api.engine.db_utils import acquire_with_retry
 from hindsight_api.engine.schema import fq_table
 from hindsight_api.engine.transfer import import_documents
 from hindsight_api.engine.transfer.importer import parse_archive
-from hindsight_api.engine.transfer.schema import SCHEMA_VERSION, TransferManifest
+from hindsight_api.engine.transfer.schema import (
+    SCHEMA_VERSION,
+    TransferCausalRelation,
+    TransferChunk,
+    TransferDocument,
+    TransferFact,
+    TransferManifest,
+    TransferObservation,
+    TransferObservationSource,
+)
 from hindsight_api.extensions import (
     OperationValidatorExtension,
     RecallContext,
@@ -91,23 +100,104 @@ async def _import(memory, bank_id, archive, request_context, on_conflict="skip")
     return status["result_metadata"]
 
 
+@pytest.mark.asyncio
+async def test_import_filters_degenerate_fact_without_shifting_archive_ordinals(memory, request_context):
+    """A rejected archive fact must not shift chunks, causal links, or observation sources."""
+    dst = _unique_bank("transfer_degenerate_alignment")
+    document_id = "doc-alignment"
+    initial_text = "Alignment test initial event"
+    middle_text = "Alignment test surviving middle event"
+    later_text = "Alignment test later consequence"
+    observation_text = "Alignment test imported observation"
+    document = TransferDocument(
+        id=document_id,
+        original_text="Four extracted facts, one of which is degenerate.",
+        chunks=[TransferChunk(chunk_index=index, chunk_text=f"chunk-{index}") for index in range(4)],
+        facts=[
+            TransferFact(text=initial_text, fact_type="world", chunk_index=0),
+            TransferFact(text="...", fact_type="world", chunk_index=1),
+            TransferFact(text=middle_text, fact_type="world", chunk_index=2),
+            TransferFact(
+                text=later_text,
+                fact_type="world",
+                chunk_index=3,
+                causal_relations=[
+                    TransferCausalRelation(relation_type="caused_by", target_fact_index=2),
+                    TransferCausalRelation(relation_type="causes", target_fact_index=2),
+                    TransferCausalRelation(relation_type="prevents", target_fact_index=1),
+                ],
+            ),
+        ],
+    )
+    observation = TransferObservation(
+        text=observation_text,
+        sources=[TransferObservationSource(document_id=document_id, fact_index=3)],
+    )
+    manifest = TransferManifest(
+        source_bank_id="source",
+        document_count=1,
+        fact_count=4,
+        observation_count=1,
+    )
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w") as archive:
+        archive.writestr("manifest.json", manifest.model_dump_json())
+        archive.writestr("documents/000000.json", document.model_dump_json())
+        archive.writestr("observations.json", json.dumps([observation.model_dump(mode="json")]))
+
+    try:
+        result = await _import(memory, dst, archive_buffer.getvalue(), request_context)
+        assert result["facts_imported"] == 3
+        assert result["observations_imported"] == 1
+
+        chunks = await memory.list_document_chunks(dst, document_id, limit=10, request_context=request_context)
+        assert sorted(chunk["chunk_index"] for chunk in chunks["items"]) == [0, 1, 2, 3]
+
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            units = await conn.fetch(
+                f"SELECT id, text, chunk_id, fact_type, source_memory_ids "
+                f"FROM {fq_table('memory_units')} WHERE bank_id = $1",
+                dst,
+            )
+            causal_links = await conn.fetch(
+                f"SELECT ml.link_type, source.text AS source_text, target.text AS target_text "
+                f"FROM {fq_table('memory_links')} ml "
+                f"JOIN {fq_table('memory_units')} source ON source.id = ml.from_unit_id "
+                f"JOIN {fq_table('memory_units')} target ON target.id = ml.to_unit_id "
+                f"WHERE ml.bank_id = $1 AND ml.link_type = ANY($2)",
+                dst,
+                ["caused_by", "causes", "prevents"],
+            )
+
+        units_by_text = {unit["text"]: unit for unit in units}
+        assert "..." not in units_by_text
+        assert units_by_text[initial_text]["chunk_id"] == f"{dst}_{document_id}_0"
+        assert units_by_text[middle_text]["chunk_id"] == f"{dst}_{document_id}_2"
+        assert units_by_text[later_text]["chunk_id"] == f"{dst}_{document_id}_3"
+        assert {str(source_id) for source_id in units_by_text[observation_text]["source_memory_ids"]} == {
+            str(units_by_text[later_text]["id"])
+        }
+        assert {(row["link_type"], row["source_text"], row["target_text"]) for row in causal_links} == {
+            ("caused_by", later_text, middle_text),
+            ("causes", later_text, middle_text),
+        }
+    finally:
+        await memory.delete_bank(dst, request_context=request_context)
+
+
 def test_export_bank_covers_schema():
     """Every bank-scoped table must be classified by export_bank — logical, carried,
     history, or explicitly skipped — so a future migration can't silently drop one."""
     from hindsight_api.admin.cli import BACKUP_TABLES
-    from hindsight_api.engine.transfer.export import (
-        _BANK_ROW_TABLES,
-        _CARRIED_HISTORY_TABLES,
-        _HISTORY_TABLES,
-        _REPLAYED_TABLES,
-        _SKIP_TABLES,
-    )
+    from hindsight_api.engine.transfer.export import _BANK_ROW_TABLES, _REPLAYED_TABLES, _SKIP_TABLES
+    from hindsight_api.engine.transfer.schema import CARRIED_HISTORY_TABLES, HISTORY_TABLES
 
     buckets = [
         set(_REPLAYED_TABLES),
         set(_BANK_ROW_TABLES),
-        set(_CARRIED_HISTORY_TABLES),
-        set(_HISTORY_TABLES),
+        set(CARRIED_HISTORY_TABLES),
+        set(HISTORY_TABLES),
         set(_SKIP_TABLES),
     ]
     classified = set().union(*buckets)
@@ -117,6 +207,84 @@ def test_export_bank_covers_schema():
     )
     # No table may appear in two buckets.
     assert sum(len(b) for b in buckets) == len(classified), "a table is classified in more than one bucket"
+
+
+def test_export_jsonb_coercion_preserves_decoded_scalar_string():
+    """Admin connections decode JSONB before the transfer exporter sees it."""
+    from hindsight_api.engine.transfer.export import _as_jsonb
+
+    assert _as_jsonb("combined") == "combined"
+    assert _as_jsonb('"combined"') == "combined"
+    assert _as_jsonb('{"scope": "combined"}') == {"scope": "combined"}
+
+
+def test_legacy_bank_archive_defaults_to_decoded_json_rows():
+    """Released v1 bank archives came from the codec-enabled admin CLI."""
+    from hindsight_api.engine.transfer.importer import _resolve_bank_rows_json_encoding
+
+    manifest = TransferManifest(source_bank_id="legacy", archive_type="bank")
+
+    assert manifest.bank_rows_json_encoding is None
+    assert _resolve_bank_rows_json_encoding(manifest) == "decoded"
+
+
+@pytest.mark.asyncio
+async def test_restore_rows_normalizes_jsonb_strings(memory):
+    """JSONB restore follows archive provenance instead of guessing from strings."""
+    from hindsight_api.engine.transfer.importer import _restore_rows
+
+    decoded_request_id = uuid.uuid4()
+    serialized_request_id = uuid.uuid4()
+    backend = await memory._get_backend()
+    async with acquire_with_retry(backend) as conn:
+        try:
+            await _restore_rows(
+                conn,
+                "llm_requests",
+                [
+                    {
+                        "id": str(decoded_request_id),
+                        "status": "completed",
+                        "input": "I am an already-decoded scalar",
+                        "output": '{"answer":"JSON-looking decoded scalar"}',
+                        "llm_info": {"shape": "decoded-object"},
+                    }
+                ],
+                bank_rows_json_encoding="decoded",
+            )
+            await _restore_rows(
+                conn,
+                "llm_requests",
+                [
+                    {
+                        "id": str(serialized_request_id),
+                        "status": "completed",
+                        "input": json.dumps("serialized scalar"),
+                        "output": json.dumps({"answer": "serialized object"}),
+                    }
+                ],
+                bank_rows_json_encoding="serialized",
+            )
+            decoded_row = await conn.fetchrow(
+                f"SELECT input::text, output::text, llm_info::text FROM {fq_table('llm_requests')} WHERE id = $1",
+                decoded_request_id,
+            )
+            serialized_row = await conn.fetchrow(
+                f"SELECT input::text, output::text FROM {fq_table('llm_requests')} WHERE id = $1",
+                serialized_request_id,
+            )
+            assert decoded_row is not None
+            assert json.loads(decoded_row["input"]) == "I am an already-decoded scalar"
+            assert json.loads(decoded_row["output"]) == '{"answer":"JSON-looking decoded scalar"}'
+            assert json.loads(decoded_row["llm_info"]) == {"shape": "decoded-object"}
+            assert serialized_row is not None
+            assert json.loads(serialized_row["input"]) == "serialized scalar"
+            assert json.loads(serialized_row["output"]) == {"answer": "serialized object"}
+        finally:
+            await conn.execute(
+                f"DELETE FROM {fq_table('llm_requests')} WHERE id = ANY($1)",
+                [decoded_request_id, serialized_request_id],
+            )
 
 
 @pytest.mark.asyncio
@@ -151,6 +319,7 @@ async def test_export_bank_contents(memory, request_context):
             webhooks = json.loads(zf.read("webhooks.json"))
 
         assert manifest.archive_type == "bank"
+        assert manifest.bank_rows_json_encoding == "serialized"
         assert manifest.document_count == 1
         assert manifest.webhook_count == 1
         assert "mental_models.json" in names and "directives.json" in names
@@ -190,7 +359,7 @@ async def _bank_content_snapshot(memory, bank_id):
             f"SELECT name, disposition, mission, config FROM {fq_table('banks')} WHERE bank_id = $1", bank_id
         )
         docs = await conn.fetch(
-            f"SELECT id, original_text, tags FROM {fq_table('documents')} WHERE bank_id = $1", bank_id
+            f"SELECT id, original_text, tags, created_at FROM {fq_table('documents')} WHERE bank_id = $1", bank_id
         )
         facts = await conn.fetch(
             f"SELECT text, fact_type, context FROM {fq_table('memory_units')} "
@@ -222,7 +391,9 @@ async def _bank_content_snapshot(memory, bank_id):
         )
     return {
         "bank": (bank["name"], _as_json(bank["disposition"]), bank["mission"], _as_json(bank["config"])),
-        "documents": sorted((d["id"], d["original_text"], tuple(sorted(d["tags"] or []))) for d in docs),
+        "documents": sorted(
+            (d["id"], d["original_text"], tuple(sorted(d["tags"] or [])), d["created_at"]) for d in docs
+        ),
         "facts": sorted((f["text"], f["fact_type"], f["context"]) for f in facts),
         "observations": sorted((o["text"], o["proof_count"]) for o in obs),
         "entities": sorted(e["canonical_name"].lower() for e in ents),
@@ -234,6 +405,143 @@ async def _bank_content_snapshot(memory, bank_id):
         ),
         "null_embeddings": null_emb,
     }
+
+
+async def _fact_lifecycle(memory, bank_id):
+    """Sorted (text, created_at, consolidated_at, consolidation_failed_at) for
+    every world/experience fact — the exact per-fact consolidation lifecycle a
+    whole-bank transfer must preserve."""
+    backend = await memory._get_backend()
+    async with acquire_with_retry(backend) as conn:
+        rows = await conn.fetch(
+            f"SELECT text, created_at, consolidated_at, consolidation_failed_at "
+            f"FROM {fq_table('memory_units')} "
+            f"WHERE bank_id = $1 AND fact_type IN ('world', 'experience')",
+            bank_id,
+        )
+    return sorted((r["text"], r["created_at"], r["consolidated_at"], r["consolidation_failed_at"]) for r in rows)
+
+
+async def _eligible_fact_count(memory, bank_id):
+    """Facts the maintenance reconciler would treat as unconsolidated backlog —
+    the exact predicate of ``banks_needing_consolidation()``."""
+    backend = await memory._get_backend()
+    async with acquire_with_retry(backend) as conn:
+        return await conn.fetchval(
+            f"SELECT COUNT(*) FROM {fq_table('memory_units')} "
+            f"WHERE bank_id = $1 AND fact_type IN ('world', 'experience') "
+            f"AND consolidated_at IS NULL AND consolidation_failed_at IS NULL",
+            bank_id,
+        )
+
+
+async def _observation_count(memory, bank_id):
+    backend = await memory._get_backend()
+    async with acquire_with_retry(backend) as conn:
+        return await conn.fetchval(
+            f"SELECT COUNT(*) FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'observation'",
+            bank_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_bank_import_preserves_consolidation_lifecycle(memory, request_context):
+    """Whole-bank import restores each fact's consolidation lifecycle verbatim, so
+    previously-consolidated and previously-failed facts are never re-consolidated
+    and the reconciler sees no phantom backlog. Regression for #2965.
+
+    Crucially the source has consolidated facts that do NOT back any surviving
+    observation, plus a ``consolidation_failed_at`` fact — state the old
+    observation-lineage reconstruction could not recover, so those facts became
+    re-eligible and the target re-derived observations."""
+    bank = _unique_bank("bank_lifecycle")
+    try:
+        await _retain(
+            memory,
+            bank,
+            "Alice works at Google. Bob works at Microsoft. Carol lives in Paris.",
+            request_context,
+            "doc-1",
+        )
+        backend = await memory._get_backend()
+
+        # Deterministic baseline: drop any auto-consolidation observations so the
+        # only observation is the one created explicitly below.
+        async with acquire_with_retry(backend) as conn:
+            await conn.execute(
+                f"DELETE FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'observation'",
+                bank,
+            )
+
+        async with acquire_with_retry(backend) as conn:
+            wf_ids = [
+                r["id"]
+                for r in await conn.fetch(
+                    f"SELECT id FROM {fq_table('memory_units')} "
+                    f"WHERE bank_id = $1 AND fact_type IN ('world', 'experience') ORDER BY created_at, id",
+                    bank,
+                )
+            ]
+        assert len(wf_ids) >= 3, "need enough facts to exercise the lineage gap"
+
+        # One surviving observation over the first two facts. The helper now self-acquires a
+        # short-lived connection (the embed runs off-connection), so pass the backend, not a conn.
+        obs_source_ids = [uuid.UUID(str(i)) for i in wf_ids[:2]]
+        await _create_observation_directly(
+            pool=backend,
+            memory_engine=memory,
+            bank_id=bank,
+            source_memory_ids=obs_source_ids,
+            observation_text="Alice and Bob are colleagues.",
+        )
+
+        # Fully-processed source (zero eligible): every fact is consolidated except
+        # the last — deliberately NOT an observation source — which records a
+        # consolidation failure. Most consolidated facts do not back the
+        # observation, exactly the lineage gap the fix must preserve.
+        consolidated_ts = datetime(2020, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        failed_ts = datetime(2020, 6, 7, 8, 9, 10, tzinfo=timezone.utc)
+        failed_fact_id = wf_ids[-1]
+        assert uuid.UUID(str(failed_fact_id)) not in obs_source_ids
+        async with acquire_with_retry(backend) as conn:
+            await conn.execute(
+                f"UPDATE {fq_table('memory_units')} "
+                f"SET consolidated_at = $2, consolidation_failed_at = NULL "
+                f"WHERE bank_id = $1 AND fact_type IN ('world', 'experience') AND id != $3",
+                bank,
+                consolidated_ts,
+                failed_fact_id,
+            )
+            await conn.execute(
+                f"UPDATE {fq_table('memory_units')} "
+                f"SET consolidated_at = NULL, consolidation_failed_at = $2 "
+                f"WHERE bank_id = $1 AND id = $3",
+                bank,
+                failed_ts,
+                failed_fact_id,
+            )
+
+        source_lifecycle = await _fact_lifecycle(memory, bank)
+        source_obs_count = await _observation_count(memory, bank)
+        assert source_obs_count == 1
+        assert await _eligible_fact_count(memory, bank) == 0
+
+        from hindsight_api.engine.transfer import export_bank
+
+        async with acquire_with_retry(backend) as conn:
+            archive = await export_bank(conn, bank)
+        # Delete then restore into the same id — exact round-trip.
+        await memory.delete_bank(bank, request_context=request_context)
+        await memory.import_bank_async(archive, request_context)
+
+        # Lifecycle preserved verbatim: consolidated stays consolidated (same
+        # timestamp — not now()), the failed fact keeps consolidation_failed_at.
+        assert await _fact_lifecycle(memory, bank) == source_lifecycle
+        # No phantom backlog for the reconciler, observation not re-derived.
+        assert await _eligible_fact_count(memory, bank) == 0
+        assert await _observation_count(memory, bank) == source_obs_count
+    finally:
+        await memory.delete_bank(bank, request_context=request_context)
 
 
 @pytest.mark.asyncio
@@ -568,6 +876,57 @@ async def test_full_roundtrip_integrity(memory, request_context):
 
 
 @pytest.mark.asyncio
+async def test_transfer_preserves_legacy_causal_links(memory, request_context):
+    """Legacy causal edges survive export/import without becoming retain inputs."""
+    src = _unique_bank("transfer_legacy_causal_src")
+    dst = _unique_bank("transfer_legacy_causal_dst")
+    legacy_types = ("causes", "enables", "prevents")
+    try:
+        await _retain(
+            memory,
+            src,
+            "Alice completed the design. Bob began implementation after the design.",
+            request_context,
+            "doc-legacy-causal",
+        )
+        units = await memory.list_memory_units(src, fact_type="world", request_context=request_context)
+        assert len(units["items"]) >= 2
+        from_unit_id = uuid.UUID(str(units["items"][0]["id"]))
+        to_unit_id = uuid.UUID(str(units["items"][1]["id"]))
+        from_text = units["items"][0]["text"]
+        to_text = units["items"][1]["text"]
+
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            await conn.executemany(
+                f"INSERT INTO {fq_table('memory_links')} "
+                "(from_unit_id, to_unit_id, link_type, entity_id, bank_id, weight) "
+                "VALUES ($1, $2, $3, NULL, $4, 1.0)",
+                [(from_unit_id, to_unit_id, link_type, src) for link_type in legacy_types],
+            )
+
+        archive = await memory.export_documents_async(src, request_context)
+        await _import(memory, dst, archive, request_context)
+
+        async with acquire_with_retry(backend) as conn:
+            imported_types = await conn.fetch(
+                f"SELECT ml.link_type, source.text AS source_text, target.text AS target_text "
+                f"FROM {fq_table('memory_links')} ml "
+                f"JOIN {fq_table('memory_units')} source ON source.id = ml.from_unit_id "
+                f"JOIN {fq_table('memory_units')} target ON target.id = ml.to_unit_id "
+                "WHERE ml.bank_id = $1 AND ml.link_type = ANY($2)",
+                dst,
+                list(legacy_types),
+            )
+        assert {(row["link_type"], row["source_text"], row["target_text"]) for row in imported_types} == {
+            (link_type, from_text, to_text) for link_type in legacy_types
+        }
+    finally:
+        await memory.delete_bank(src, request_context=request_context)
+        await memory.delete_bank(dst, request_context=request_context)
+
+
+@pytest.mark.asyncio
 async def test_export_import_observations(memory, request_context):
     """With include_observations, observations transfer and their sources re-link."""
     src = _unique_bank("transfer_obs_src")
@@ -579,11 +938,25 @@ async def test_export_import_observations(memory, request_context):
         source_ids = [uuid.UUID(str(i["id"])) for i in units["items"][:2]]
         assert len(source_ids) == 2
 
-        # Create a real observation over those source facts.
+        # Create a real observation over those source facts. The helper self-acquires a
+        # short-lived connection now (the embed runs off-connection), so pass the backend.
         backend = await memory._get_backend()
+        archived_event_date = datetime(2001, 2, 3, 4, 5, 6, tzinfo=timezone.utc)
+        await _create_observation_directly(
+            pool=backend,
+            memory_engine=memory,
+            bank_id=src,
+            source_memory_ids=source_ids,
+            observation_text="Alice and Bob are colleagues.",
+        )
         async with acquire_with_retry(backend) as conn:
-            async with conn.transaction():
-                await _create_observation_directly(conn, memory, src, source_ids, "Alice and Bob are colleagues.")
+            await conn.execute(
+                f"UPDATE {fq_table('memory_units')} SET event_date = $1 "
+                f"WHERE bank_id = $2 AND fact_type = 'observation' AND text = $3",
+                archived_event_date,
+                src,
+                "Alice and Bob are colleagues.",
+            )
 
         # Export WITHOUT observations -> none in the archive (the bank may also
         # contain auto-consolidation observations; the flag is what gates them).
@@ -598,6 +971,7 @@ async def test_export_import_observations(memory, request_context):
         assert parsed.manifest.observation_count == len(parsed.observations) >= 1
         mine = next((o for o in parsed.observations if o.text == "Alice and Bob are colleagues."), None)
         assert mine is not None
+        assert mine.event_date == archived_event_date
         assert len(mine.sources) == 2  # both sources resolved within the export
         assert "embedding" not in archive.decode("utf-8", errors="ignore")
 
@@ -611,12 +985,13 @@ async def test_export_import_observations(memory, request_context):
         # and those source facts are marked consolidated.
         async with acquire_with_retry(backend) as conn:
             obs_row = await conn.fetchrow(
-                f"SELECT source_memory_ids FROM {fq_table('memory_units')} "
+                f"SELECT source_memory_ids, event_date FROM {fq_table('memory_units')} "
                 f"WHERE bank_id = $1 AND fact_type = 'observation' AND text = $2",
                 dst,
                 "Alice and Bob are colleagues.",
             )
             assert obs_row is not None
+            assert obs_row["event_date"] == archived_event_date
             dst_sources = list(obs_row["source_memory_ids"] or [])
             assert len(dst_sources) == 2
             consolidated = await conn.fetchval(
@@ -901,3 +1276,80 @@ async def test_import_rejects_invalid_on_conflict(memory, request_context):
             archive_bytes=buffer.getvalue(),
             on_conflict="bogus",
         )
+
+
+@pytest.mark.asyncio
+async def test_bank_import_classifies_label_entities(memory, request_context):
+    """An imported bank's label entities are stored with entity_kind='label'.
+
+    Regression for #3236. `import_bank_async` resolved the target bank's config
+    before restoring the archive's bank row — and import refuses to write into an
+    existing bank, so `entity_labels` was necessarily empty for the whole import.
+    Every label entity was then classified as regular, which exposes label values
+    to fuzzy merging (#3187) and leaves them inside the trigram index the partial
+    index (#3208) exists to keep them out of, so an imported bank silently lost
+    that fix. Measured on a real 12k-entity export: 5,355 of its entities were
+    label values and every one of them came back as 'regular'.
+    """
+    bank = _unique_bank("bank_label_kind")
+    label_entity = "brief_bio:enjoys long walks on the beach"
+    regular_entity = "Alice"
+    try:
+        await memory.get_bank_profile(bank_id=bank, request_context=request_context)
+        await memory._config_resolver.update_bank_config(
+            bank,
+            {"entity_labels": [{"key": "brief_bio", "type": "text", "description": "one-line bio"}]},
+        )
+        await _retain(memory, bank, "Alice enjoys long walks.", request_context, "doc-1")
+
+        backend = await memory._get_backend()
+        # Link the entities to a fact directly: the mock LLM's extraction does not
+        # emit a label-shaped entity, and what matters here is what the *import*
+        # makes of the entities the archive carries (export derives a fact's
+        # entities from unit_entities, so linking is what puts them in the archive).
+        async with acquire_with_retry(backend) as conn:
+            # Must be an exported fact type attached to a document, or export
+            # never sees the link and the archive carries no entities at all.
+            unit_id = await conn.fetchval(
+                f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 "
+                "AND document_id IS NOT NULL AND fact_type IN ('world', 'experience') LIMIT 1",
+                bank,
+            )
+            assert unit_id is not None, "no facts to attach entities to"
+            for name in (label_entity, regular_entity):
+                # Retain may already have created the regular one.
+                entity_id = await conn.fetchval(
+                    f"SELECT id FROM {fq_table('entities')} WHERE bank_id = $1 AND LOWER(canonical_name) = LOWER($2)",
+                    bank,
+                    name,
+                ) or await conn.fetchval(
+                    f"INSERT INTO {fq_table('entities')} (bank_id, canonical_name) VALUES ($1, $2) RETURNING id",
+                    bank,
+                    name,
+                )
+                await conn.execute(
+                    f"INSERT INTO {fq_table('unit_entities')} (unit_id, entity_id) VALUES ($1, $2) "
+                    "ON CONFLICT DO NOTHING",
+                    unit_id,
+                    entity_id,
+                )
+
+        from hindsight_api.engine.transfer import export_bank
+
+        async with acquire_with_retry(backend) as conn:
+            archive = await export_bank(conn, bank)
+        await memory.delete_bank(bank, request_context=request_context)
+        await memory.import_bank_async(archive, request_context)
+
+        async with acquire_with_retry(backend) as conn:
+            kinds = {
+                row["canonical_name"]: row["entity_kind"]
+                for row in await conn.fetch(
+                    f"SELECT canonical_name, entity_kind FROM {fq_table('entities')} WHERE bank_id = $1",
+                    bank,
+                )
+            }
+        assert kinds.get(label_entity) == "label", kinds
+        assert kinds.get(regular_entity) == "regular", kinds
+    finally:
+        await memory.delete_bank(bank, request_context=request_context)

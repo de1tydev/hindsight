@@ -14,6 +14,8 @@ import subprocess
 import sys
 import sysconfig
 import time
+from collections.abc import Mapping
+from importlib.util import find_spec
 from pathlib import Path
 from typing import IO, Optional
 
@@ -51,12 +53,29 @@ def _safe_positive_float(value: float, fallback: float) -> float:
     return value if math.isfinite(value) and value > 0 else fallback
 
 
+def _parse_non_negative_int(value: str | None, default: int, name: str) -> int:
+    """Parse a non-negative integer, falling back for invalid or negative values."""
+    try:
+        parsed = int(value) if value is not None else default
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, value, default)
+        return default
+    if parsed < 0:
+        logger.warning("Invalid %s=%r; using %d", name, value, default)
+        return default
+    return parsed
+
+
 # Constants
 # Allow CI/Windows to extend the startup budget — pg0-embedded's Windows wheel
 # unpacks and runs initdb on first boot, which takes noticeably longer on cold
 # runners than POSIX.
 DAEMON_STARTUP_TIMEOUT = int(os.getenv("HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT", "180"))
 DEFAULT_DAEMON_IDLE_TIMEOUT = 0  # 0 = disabled (no auto-exit)
+ENV_DAEMON_LOG_MAX_BYTES = "HINDSIGHT_EMBED_DAEMON_LOG_MAX_BYTES"
+ENV_DAEMON_LOG_BACKUP_COUNT = "HINDSIGHT_EMBED_DAEMON_LOG_BACKUP_COUNT"
+DEFAULT_DAEMON_LOG_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_DAEMON_LOG_BACKUP_COUNT = 3
 # When another process is concurrently starting the daemon, the TCP port can be
 # bound before /health returns 200. Give that warming daemon a short grace window
 # before treating the listener as stale/foreign and attempting to reclaim it.
@@ -109,6 +128,30 @@ class DaemonEmbedManager(EmbedManager):
     def __init__(self):
         """Initialize the daemon embed manager."""
         self._profile_manager = ProfileManager()
+
+    @staticmethod
+    def _rotate_daemon_log(log_path: Path, max_bytes: int, backup_count: int) -> None:
+        """Rotate a full daemon log before a new daemon opens it.
+
+        Startup is serialized by the profile lock, and this runs only after
+        any stale daemon has been stopped. That keeps child processes from
+        writing to a renamed inode during rotation. Rotation only occurs at
+        startup; an already-running daemon is left untouched.
+        """
+        if max_bytes == 0 or not log_path.exists() or log_path.stat().st_size < max_bytes:
+            return
+
+        if backup_count == 0:
+            log_path.write_bytes(b"")
+            return
+
+        oldest = log_path.with_name(f"{log_path.name}.{backup_count}")
+        oldest.unlink(missing_ok=True)
+        for index in range(backup_count - 1, 0, -1):
+            source = log_path.with_name(f"{log_path.name}.{index}")
+            if source.exists():
+                source.replace(log_path.with_name(f"{log_path.name}.{index + 1}"))
+        log_path.replace(log_path.with_name(f"{log_path.name}.1"))
 
     def _sanitize_profile_name(self, profile: str | None) -> str:
         """Sanitize profile name for use in database names and file paths."""
@@ -166,23 +209,27 @@ class DaemonEmbedManager(EmbedManager):
         return None
 
     @staticmethod
-    def _windows_gui_interpreter() -> str | None:
+    def _windows_gui_interpreter(preferred_dir: Path | None = None) -> str | None:
         """Path to the GUI-subsystem Python (pythonw.exe), or None.
 
         Returns None on non-Windows, or when pythonw.exe can't be located next
-        to the running interpreter.
+        to the preferred scripts directory or running interpreter.
 
         On Windows 11 with Windows Terminal as the default terminal app,
         spawning the console-subsystem (CUI, subsystem 3) hindsight-api.exe
         launcher makes ConPTY pop a visible terminal tab on daemon start, even
         with DETACHED_PROCESS / CREATE_NO_WINDOW (issue #1885). Launching the
         daemon through the GUI-subsystem (subsystem 2) pythonw.exe interpreter
-        never allocates a console, so no window appears. pythonw.exe sits next
-        to sys.executable, whose environment is the one we just confirmed has
-        hindsight-api installed, so `pythonw.exe -m hindsight_api.main` resolves.
+        never allocates a console, so no window appears. Prefer the scripts dir
+        that contains hindsight-api.exe because wrapper entry points can make
+        sys.executable point at a different launcher directory (issue #2389).
         """
         if platform.system() != "Windows":
             return None
+        if preferred_dir is not None:
+            pythonw = preferred_dir / "pythonw.exe"
+            if pythonw.exists():
+                return str(pythonw)
         pythonw = Path(sys.executable).with_name("pythonw.exe")
         return str(pythonw) if pythonw.exists() else None
 
@@ -198,7 +245,30 @@ class DaemonEmbedManager(EmbedManager):
         override = self._profile_manager.load_profile_config(profile).get(env_key)
         return override or os.getenv(env_key) or __version__
 
-    def _find_api_command(self, api_version: str) -> list[str]:
+    @staticmethod
+    def _needs_local_sentence_transformers(env: Mapping[str, str] | None = None) -> bool:
+        """Return True when the daemon config will load the local ST providers."""
+        env = env or os.environ
+        embeddings_provider = env.get("HINDSIGHT_API_EMBEDDINGS_PROVIDER", "local")
+        reranker_provider = env.get("HINDSIGHT_API_RERANKER_PROVIDER", "local")
+        return embeddings_provider == "local" or reranker_provider == "local"
+
+    @staticmethod
+    def _can_use_installed_api_binary(env: Mapping[str, str] | None = None) -> bool:
+        """Avoid slim sibling binaries when default local ML deps are unavailable."""
+        if not DaemonEmbedManager._needs_local_sentence_transformers(env):
+            return True
+        if find_spec("sentence_transformers") is not None:
+            return True
+        logger.warning(
+            "Installed hindsight-api binary is missing local ML dependencies; "
+            "falling back to uvx hindsight-api for the local daemon. Set "
+            "HINDSIGHT_API_EMBEDDINGS_PROVIDER and HINDSIGHT_API_RERANKER_PROVIDER "
+            "to non-local providers to use a slim install."
+        )
+        return False
+
+    def _find_api_command(self, api_version: str, env: Mapping[str, str] | None = None) -> list[str]:
         """Find the command to run hindsight-api (api_version used only for the uvx fallback)."""
         # Check if we're in development mode
         dev_command = self._dev_api_command()
@@ -217,11 +287,11 @@ class DaemonEmbedManager(EmbedManager):
 
         scripts_dir = Path(sysconfig.get_path("scripts"))
         candidate = scripts_dir / binary_name
-        if candidate.exists():
+        if candidate.exists() and self._can_use_installed_api_binary(env):
             # The console exe lives in sys.executable's scripts dir, so
             # hindsight_api is importable by the GUI interpreter; prefer it on
             # Windows to avoid ConPTY popping a terminal tab (issue #1885).
-            gui_python = self._windows_gui_interpreter()
+            gui_python = self._windows_gui_interpreter(scripts_dir)
             if gui_python is not None:
                 return [gui_python, "-m", "hindsight_api.main"]
             return [str(candidate)]
@@ -234,6 +304,12 @@ class DaemonEmbedManager(EmbedManager):
         for bin_dir in ("bin", "Scripts"):
             candidate = package_root / bin_dir / binary_name
             if candidate.exists():
+                # A hindsight-api binary bundled into a --target layout is a
+                # deliberate slim-bundle install; use it unconditionally. Falling
+                # back to uvx here reintroduces issue #1240 (the Windows embed
+                # smoke test enforces this). The #2676 "missing local ML deps ->
+                # uvx" fallback intentionally applies only to the sysconfig-scripts
+                # path above (standard venv installs), not to a --target bundle.
                 return [str(candidate)]
 
         # Fall back to uvx for the installed version (resolved by the caller).
@@ -492,10 +568,24 @@ class DaemonEmbedManager(EmbedManager):
 
         # Create log directory
         daemon_log.parent.mkdir(parents=True, exist_ok=True)
+        max_bytes = _parse_non_negative_int(
+            env.get(ENV_DAEMON_LOG_MAX_BYTES),
+            DEFAULT_DAEMON_LOG_MAX_BYTES,
+            ENV_DAEMON_LOG_MAX_BYTES,
+        )
+        backup_count = _parse_non_negative_int(
+            env.get(ENV_DAEMON_LOG_BACKUP_COUNT),
+            DEFAULT_DAEMON_LOG_BACKUP_COUNT,
+            ENV_DAEMON_LOG_BACKUP_COUNT,
+        )
+        try:
+            self._rotate_daemon_log(daemon_log, max_bytes=max_bytes, backup_count=backup_count)
+        except OSError as exc:
+            logger.warning("Could not rotate daemon log %s: %s", daemon_log, exc)
         env["HINDSIGHT_API_DAEMON_LOG"] = str(daemon_log)
 
         # Build command
-        cmd = self._find_api_command(self._component_version(profile, "HINDSIGHT_EMBED_API_VERSION")) + [
+        cmd = self._find_api_command(self._component_version(profile, "HINDSIGHT_EMBED_API_VERSION"), env=env) + [
             "--daemon",
             "--idle-timeout",
             str(idle_timeout),

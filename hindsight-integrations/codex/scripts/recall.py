@@ -36,14 +36,40 @@ from lib.content import (
     truncate_recall_query,
 )
 from lib.daemon import get_api_url
-from lib.session_summary import (
-    enrich_recall_query_with_summary,
-    read_session_summary,
-    summary_text_from_state,
-)
 from lib.state import write_state
 
 LAST_RECALL_STATE = "last_recall.json"
+
+
+def filter_by_min_scores(results: list[dict], min_scores: dict, config: dict) -> list[dict]:
+    """Drop recall results whose numeric scores are below configured floors."""
+    if not min_scores:
+        return results
+
+    floors = {}
+    for field, floor in min_scores.items():
+        try:
+            floors[field] = float(floor)
+        except (TypeError, ValueError):
+            debug_log(config, f"Ignoring invalid recallMinScores floor for '{field}': {floor!r}")
+    if not floors:
+        return results
+
+    def passes_floors(result: dict) -> bool:
+        scores = result.get("scores") or {}
+        for field, floor in floors.items():
+            value = scores.get(field)
+            # Missing/None scores pass (fail-open): BM25-only hits lack semantic
+            # scores, and passthrough rerankers report null.
+            if isinstance(value, (int, float)) and value < floor:
+                return False
+        return True
+
+    before_count = len(results)
+    filtered = [result for result in results if passes_floors(result)]
+    dropped_count = before_count - len(filtered)
+    debug_log(config, f"Score floors dropped {dropped_count}/{before_count} results")
+    return filtered
 
 
 def main():
@@ -105,14 +131,6 @@ def main():
     else:
         query = prompt
 
-    summary_text = ""
-    if config.get("sessionSummaryEnabled"):
-        summary_state = read_session_summary(hook_input.get("session_id", "unknown"))
-        summary_text = summary_text_from_state(summary_state)
-        if summary_text:
-            query = enrich_recall_query_with_summary(query, summary_text)
-            debug_log(config, f"Session summary enriched recall query ({len(summary_text)} chars)")
-
     query = truncate_recall_query(query, prompt, recall_max_query_chars)
     if len(query) > recall_max_query_chars:
         query = query[:recall_max_query_chars]
@@ -138,6 +156,8 @@ def main():
         return
 
     results = response.get("results", [])
+    results = filter_by_min_scores(results, config.get("recallMinScores") or {}, config)
+
     if not results:
         debug_log(config, "No memories found")
         return

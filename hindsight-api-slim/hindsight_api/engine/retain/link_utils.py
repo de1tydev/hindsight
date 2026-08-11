@@ -4,10 +4,20 @@ Link creation utilities for temporal, semantic, and entity links.
 
 import logging
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC
 
 from ..._vector_index import ann_search_tuning_settings, configured_vector_extension
+from ..causal_links import (
+    CANONICAL_CAUSAL_LINK_TYPES,
+    CAUSAL_LINK_TYPES,
+    DEFAULT_CAUSAL_LINK_WEIGHT,
+    LEGACY_CAUSAL_LINK_TYPES,
+    CausalLinkDescriptor,
+)
+from ..db.base import DatabaseConnection
+from ..db.ops import DataAccessOps
 from ..memory_engine import fq_table
+from .types import CausalRelation, EntityResolutionResult
 
 logger = logging.getLogger(__name__)
 
@@ -109,101 +119,6 @@ def _normalize_datetime(dt):
     return dt
 
 
-def compute_temporal_links(
-    new_units: dict,
-    candidates: list,
-    time_window_hours: int = 24,
-) -> list:
-    """
-    Compute temporal links between new units and candidate neighbors.
-
-    This is a pure function that takes query results and returns link tuples,
-    making it easy to test without database access.
-
-    Args:
-        new_units: Dict mapping unit_id (str) to event_date (datetime)
-        candidates: List of dicts with 'id' and 'event_date' keys (candidate neighbors)
-        time_window_hours: Time window in hours for temporal links
-
-    Returns:
-        List of tuples: (from_unit_id, to_unit_id, 'temporal', weight, None)
-    """
-    if not new_units:
-        return []
-
-    links = []
-    for unit_id, unit_event_date in new_units.items():
-        # Units without event_date can't form temporal links
-        if unit_event_date is None:
-            continue
-        # Normalize unit_event_date for consistent comparison
-        unit_event_date_norm = _normalize_datetime(unit_event_date)
-
-        # Calculate time window bounds with overflow protection
-        try:
-            time_lower = unit_event_date_norm - timedelta(hours=time_window_hours)
-        except OverflowError:
-            time_lower = datetime.min.replace(tzinfo=UTC)
-        try:
-            time_upper = unit_event_date_norm + timedelta(hours=time_window_hours)
-        except OverflowError:
-            time_upper = datetime.max.replace(tzinfo=UTC)
-
-        # Filter candidates within this unit's time window
-        matching_neighbors = [
-            (row["id"], row["event_date"])
-            for row in candidates
-            if time_lower <= _normalize_datetime(row["event_date"]) <= time_upper
-        ][:10]  # Limit to top 10
-
-        for recent_id, recent_event_date in matching_neighbors:
-            # Calculate temporal proximity weight
-            time_diff_hours = abs(
-                (unit_event_date_norm - _normalize_datetime(recent_event_date)).total_seconds() / 3600
-            )
-            weight = max(0.3, 1.0 - (time_diff_hours / time_window_hours))
-            links.append((unit_id, str(recent_id), "temporal", weight, None))
-
-    return _cap_links_per_unit(links)
-
-
-def compute_temporal_query_bounds(
-    new_units: dict,
-    time_window_hours: int = 24,
-) -> tuple:
-    """
-    Compute the min/max date bounds for querying temporal neighbors.
-
-    Args:
-        new_units: Dict mapping unit_id (str) to event_date (datetime)
-        time_window_hours: Time window in hours
-
-    Returns:
-        Tuple of (min_date, max_date) with overflow protection
-    """
-    if not new_units:
-        return None, None
-
-    # Normalize all dates to be timezone-aware to avoid comparison issues
-    # Filter out None values — units without event_date can't form temporal links
-    all_dates = [_normalize_datetime(d) for d in new_units.values() if d is not None]
-
-    if not all_dates:
-        return None, None
-
-    try:
-        min_date = min(all_dates) - timedelta(hours=time_window_hours)
-    except OverflowError:
-        min_date = datetime.min.replace(tzinfo=UTC)
-
-    try:
-        max_date = max(all_dates) + timedelta(hours=time_window_hours)
-    except OverflowError:
-        max_date = datetime.max.replace(tzinfo=UTC)
-
-    return min_date, max_date
-
-
 def _log(log_buffer, message, level="info"):
     """Helper to log to buffer if available, otherwise use logger.
 
@@ -300,7 +215,7 @@ async def resolve_entities_only(
     llm_entities: list[list[dict]],
     log_buffer: list[str] = None,
     entity_labels: list | None = None,
-) -> tuple[list[str], list[tuple], dict[str, list[str]]]:
+) -> EntityResolutionResult:
     """
     Phase 1 of entity processing: resolve entity names to canonical IDs.
 
@@ -321,10 +236,10 @@ async def resolve_entities_only(
         entity_labels: Optional entity label taxonomy
 
     Returns:
-        Tuple of (resolved_entity_ids, entity_to_unit, unit_to_entity_ids) where:
-        - resolved_entity_ids: list of entity IDs in same order as flattened entities
-        - entity_to_unit: maps flat index to (unit_id, local_index, fact_date)
-        - unit_to_entity_ids: maps unit_id to list of resolved entity IDs
+        EntityResolutionResult carrying the resolved entity identities (id +
+        stored canonical name, in flattened order), the flat-index → unit map,
+        and the unit → entity-id map used to remap placeholder unit IDs in
+        Phase 2.
     """
     all_entities_flat, _all_entities, entity_to_unit = _prepare_entities_for_resolution(
         unit_ids, sentences, fact_dates, llm_entities, log_buffer
@@ -332,10 +247,10 @@ async def resolve_entities_only(
 
     if not all_entities_flat:
         _log(log_buffer, "  [6.2] Entity resolution (batched): 0 entities", level="debug")
-        return [], [], {}
+        return EntityResolutionResult(resolved_entities=[], entity_to_unit=[], unit_to_entity_ids={})
 
     step_start = time.time()
-    resolved_entity_ids = await entity_resolver.resolve_entities_batch(
+    resolved_entities = await entity_resolver.resolve_entities_batch(
         bank_id=bank_id,
         entities_data=all_entities_flat,
         context=context,
@@ -354,7 +269,7 @@ async def resolve_entities_only(
     for idx, (unit_id, _local_idx, _fact_date) in enumerate(entity_to_unit):
         if unit_id not in unit_to_entity_ids:
             unit_to_entity_ids[unit_id] = []
-        unit_to_entity_ids[unit_id].append(resolved_entity_ids[idx])
+        unit_to_entity_ids[unit_id].append(resolved_entities[idx].entity_id)
 
     _log(
         log_buffer,
@@ -362,7 +277,11 @@ async def resolve_entities_only(
         level="debug",
     )
 
-    return resolved_entity_ids, entity_to_unit, unit_to_entity_ids
+    return EntityResolutionResult(
+        resolved_entities=resolved_entities,
+        entity_to_unit=entity_to_unit,
+        unit_to_entity_ids=unit_to_entity_ids,
+    )
 
 
 async def create_temporal_links_batch_per_fact(
@@ -512,7 +431,8 @@ async def compute_semantic_links_ann(
     embeddings: list[list[float]],
     fact_types: list[str] | None = None,
     top_k: int = 50,
-    threshold: float = 0.7,
+    *,
+    threshold: float,
     log_buffer: list[str] = None,
 ) -> list[tuple]:
     """
@@ -653,12 +573,13 @@ def compute_semantic_links_within_batch(
     unit_ids: list[str],
     embeddings: list[list[float]],
     top_k: int = 50,
-    threshold: float = 0.7,
+    *,
+    threshold: float,
 ) -> list[tuple]:
     """
     Compute semantic links between units within the same batch (no DB needed).
 
-    Uses numpy dot product on embeddings already in memory — instant.
+    Uses cosine similarity on embeddings already in memory — instant.
 
     Args:
         unit_ids: Unit IDs (real IDs from insert_facts_batch)
@@ -675,15 +596,25 @@ def compute_semantic_links_within_batch(
     import numpy as np
 
     links = []
-    new_embeddings_matrix = np.array(embeddings)
+    new_embeddings_matrix = np.asarray(embeddings, dtype=float)
+    norms = np.linalg.norm(new_embeddings_matrix, axis=1)
+    valid_embeddings = np.isfinite(new_embeddings_matrix).all(axis=1) & np.isfinite(norms) & (norms > 0)
+    normalized_embeddings = np.zeros_like(new_embeddings_matrix)
+    normalized_embeddings[valid_embeddings] = (
+        new_embeddings_matrix[valid_embeddings] / norms[valid_embeddings, np.newaxis]
+    )
 
     for i, unit_id in enumerate(unit_ids):
+        if not valid_embeddings[i]:
+            continue
+
         other_indices = [j for j in range(len(unit_ids)) if j != i]
         if not other_indices:
             continue
 
-        other_embeddings = new_embeddings_matrix[other_indices]
-        similarities = np.dot(other_embeddings, new_embeddings_matrix[i])
+        other_embeddings = normalized_embeddings[other_indices]
+        similarities = np.dot(other_embeddings, normalized_embeddings[i])
+        similarities[~valid_embeddings[other_indices]] = -np.inf
 
         above_threshold = np.where(similarities >= threshold)[0]
         if len(above_threshold) > 0:
@@ -703,7 +634,8 @@ async def create_semantic_links_batch(
     unit_ids: list[str],
     embeddings: list[list[float]],
     top_k: int = 50,
-    threshold: float = 0.7,
+    *,
+    threshold: float,
     log_buffer: list[str] = None,
     pre_computed_ann_links: list[tuple] | None = None,
     ops=None,
@@ -738,7 +670,12 @@ async def create_semantic_links_batch(
 
         # Within-batch similarities (numpy, no DB)
         batch_start = time_mod.time()
-        within_batch_links = compute_semantic_links_within_batch(unit_ids, embeddings, top_k, threshold)
+        within_batch_links = compute_semantic_links_within_batch(
+            unit_ids,
+            embeddings,
+            top_k,
+            threshold=threshold,
+        )
         all_links.extend(within_batch_links)
         _log(
             log_buffer,
@@ -771,28 +708,61 @@ async def create_semantic_links_batch(
 
 
 async def create_causal_links_batch(
-    conn,
+    conn: DatabaseConnection,
     bank_id: str,
     unit_ids: list[str],
-    causal_relations_per_fact: list[list[dict]],
-    ops=None,
+    causal_relations_per_fact: list[list[CausalRelation]],
+    ops: DataAccessOps | None = None,
 ) -> int:
-    """
-    Create causal links between facts based on LLM-extracted causal relationships.
+    """Create canonical causal links for the retain pipeline.
 
-    Args:
-        conn: Database connection
-        unit_ids: List of unit IDs (in same order as causal_relations_per_fact)
-        causal_relations_per_fact: List of causal relations for each fact.
-            Each element is a list of dicts with:
-            - target_fact_index: Index into unit_ids for the target fact
-            - relation_type: "caused_by"
+    Retain must only create the backward-looking ``caused_by`` form. Historical
+    types are restored exclusively through ``restore_legacy_causal_links_batch``.
+    """
+    return await _write_causal_links_batch(
+        conn,
+        bank_id,
+        unit_ids,
+        causal_relations_per_fact,
+        CANONICAL_CAUSAL_LINK_TYPES,
+        ops=ops,
+    )
+
+
+async def restore_legacy_causal_links_batch(
+    conn: DatabaseConnection,
+    bank_id: str,
+    unit_ids: list[str],
+    causal_relations_per_fact: list[list[CausalRelation]],
+    ops: DataAccessOps | None = None,
+) -> int:
+    """Restore historical causal links while importing a transfer archive.
+
+    This is deliberately separate from the retain writer: retrieval continues
+    reading historical types, but only transfer import may create them.
+    """
+    return await _write_causal_links_batch(
+        conn,
+        bank_id,
+        unit_ids,
+        causal_relations_per_fact,
+        LEGACY_CAUSAL_LINK_TYPES,
+        ops=ops,
+    )
+
+
+async def _write_causal_links_batch(
+    conn: DatabaseConnection,
+    bank_id: str,
+    unit_ids: list[str],
+    causal_relations_per_fact: list[list[CausalRelation]],
+    allowed_relation_types: frozenset[str],
+    ops: DataAccessOps | None = None,
+) -> int:
+    """Write causal links after the caller has selected its allowed taxonomy.
 
     Returns:
         Number of causal links created
-
-    Causal link type:
-    - "caused_by": This fact was caused by the target fact
     """
     if not unit_ids or not causal_relations_per_fact:
         return 0
@@ -809,15 +779,13 @@ async def create_causal_links_batch(
             from_unit_id = unit_ids[fact_idx]
 
             for relation in causal_relations:
-                target_idx = relation["target_fact_index"]
-                relation_type = relation["relation_type"]
+                target_idx = relation.target_fact_index
+                relation_type = relation.relation_type
 
-                # Validate relation_type - only "caused_by" is supported (DB constraint)
-                valid_types = {"caused_by"}
-                if relation_type not in valid_types:
+                if relation_type not in allowed_relation_types:
                     logger.error(
                         f"Invalid relation_type '{relation_type}' (type: {type(relation_type).__name__}) "
-                        f"from fact {fact_idx}. Must be one of: {valid_types}. "
+                        f"from fact {fact_idx}. Must be one of: {allowed_relation_types}. "
                         f"Relation data: {relation}"
                     )
                     continue
@@ -848,3 +816,108 @@ async def create_causal_links_batch(
 
         traceback.print_exc()
         raise
+
+
+async def snapshot_causal_links(conn: DatabaseConnection, bank_id: str, unit_id: str) -> list[CausalLinkDescriptor]:
+    """Collect the causal edges that must survive a unit's move to the archive.
+
+    Causal edges are retain-time extraction output: unlike temporal/semantic
+    links they can't be recomputed from dates or embeddings, and nothing
+    rebuilds them (graph maintenance only relinks temporal/semantic, and
+    consolidation regenerates observations, not raw-fact edges). Invalidation
+    removes the live row, so the FK cascade takes every incident edge with it —
+    hence this snapshot, parked on the archive row (#2864).
+
+    The snapshot merges two sources:
+
+    * the unit's currently materialized causal edges, and
+    * descriptors already parked on *archived* peers that name this unit — an
+      edge whose other endpoint was invalidated first is no longer in
+      ``memory_links``, so the peer's snapshot is the only copy left.
+
+    Keeping a copy on every archived endpoint makes revert order irrelevant:
+    whichever endpoint comes back last sees both sides live and rematerializes.
+
+    Returns:
+        The descriptors to store on the archive row (deduplicated across both
+        sources by the UNION).
+    """
+    rows = await conn.fetch(
+        f"""
+        SELECT from_unit_id, to_unit_id, link_type, weight
+        FROM {fq_table("memory_links")}
+        WHERE (from_unit_id = $1 OR to_unit_id = $1)
+          AND bank_id = $2
+          AND link_type = ANY($3::text[])
+        UNION
+        SELECT d.from_unit_id, d.to_unit_id, d.link_type, d.weight
+        FROM {fq_table("invalidated_memory_units")} a
+        CROSS JOIN LATERAL jsonb_to_recordset(a.causal_links)
+            AS d(from_unit_id uuid, to_unit_id uuid, link_type text, weight float8)
+        WHERE a.bank_id = $2
+          AND a.causal_links <> '[]'::jsonb
+          AND (d.from_unit_id = $1 OR d.to_unit_id = $1)
+          -- Same guard as CausalLinkDescriptor.from_json_dict: the column is
+          -- schemaless JSON, and a malformed entry would otherwise be copied
+          -- forward as a NULL-endpoint descriptor.
+          AND d.from_unit_id IS NOT NULL
+          AND d.to_unit_id IS NOT NULL
+          AND d.link_type = ANY($3::text[])
+        """,
+        unit_id,
+        bank_id,
+        list(CAUSAL_LINK_TYPES),
+    )
+    return [
+        CausalLinkDescriptor(
+            from_unit_id=str(row["from_unit_id"]),
+            to_unit_id=str(row["to_unit_id"]),
+            link_type=row["link_type"],
+            weight=float(row["weight"]) if row["weight"] is not None else DEFAULT_CAUSAL_LINK_WEIGHT,
+        )
+        for row in rows
+    ]
+
+
+async def rematerialize_causal_links(
+    conn: DatabaseConnection,
+    bank_id: str,
+    stored_descriptors: list,
+    ops: DataAccessOps | None = None,
+) -> int:
+    """Recreate archived causal edges whose endpoints are both live again.
+
+    Counterpart of :func:`snapshot_causal_links`, called when a fact reverts to
+    ``valid``. Descriptors whose peer is still archived (or was permanently
+    deleted) are silently dropped from this insert: the bulk writer only takes
+    links whose endpoints exist in ``memory_units``. That is the point — a
+    still-archived peer keeps its own copy of the descriptor and materializes
+    the edge when *it* reverts.
+
+    Insertion is ``ON CONFLICT DO NOTHING``, so repeated invalidate/revert
+    cycles never duplicate an edge.
+
+    Args:
+        stored_descriptors: The archive row's ``causal_links`` payload, already
+            decoded from JSON. Entries that don't parse as a causal edge are
+            skipped (see :meth:`CausalLinkDescriptor.from_json_dict`).
+
+    Returns:
+        Number of descriptors submitted (not all of which may materialize).
+    """
+    parsed = [CausalLinkDescriptor.from_json_dict(raw) for raw in stored_descriptors]
+    links = [
+        (
+            descriptor.from_unit_id,
+            descriptor.to_unit_id,
+            descriptor.link_type,
+            descriptor.weight,
+            None,
+        )
+        for descriptor in parsed
+        if descriptor is not None
+    ]
+    if not links:
+        return 0
+    await _bulk_insert_links(conn, links, bank_id=bank_id, ops=ops)
+    return len(links)

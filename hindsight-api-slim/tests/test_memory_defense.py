@@ -23,6 +23,7 @@ from hindsight_api.extensions.memory_defense import (
     apply_redaction,
     parse_policy,
 )
+from tests.conftest import enable_audit_default
 
 # ---------------------------------------------------------------------------
 # Policy parsing (unit)
@@ -334,6 +335,9 @@ def _make_minimal_engine():
     mock_embeddings = MagicMock()
     mock_embeddings.dimension = 384
 
+    from hindsight_api.config import clear_config_cache
+    from hindsight_api.engine.memory_engine import MemoryEngine
+
     with patch.dict(
         os.environ,
         {
@@ -343,11 +347,17 @@ def _make_minimal_engine():
         },
         clear=False,
     ):
-        from hindsight_api.config import clear_config_cache
-        from hindsight_api.engine.memory_engine import MemoryEngine
-
         clear_config_cache()
-        return MemoryEngine(db_url="postgresql://localhost/hindsight_test", embeddings=mock_embeddings)
+        engine = MemoryEngine(db_url="postgresql://localhost/hindsight_test", embeddings=mock_embeddings)
+
+    # Constructing the engine above repopulated the process-global config cache
+    # from the patched env (provider="none" forces retain_extraction_mode="chunks").
+    # Now that the patched env is gone, drop that cache so the leaked "none"/chunks
+    # config does not bleed into other tests on this xdist worker — their retains
+    # would silently skip entity extraction (0 unit_entities) and fail unrelated
+    # assertions. The next get_config() rebuilds from the real env.
+    clear_config_cache()
+    return engine
 
 
 def test_engine_memory_defense_shares_ext_ctx() -> None:
@@ -592,9 +602,12 @@ async def test_retain_writes_audit_log(api_client, memory) -> None:
     action taken and what matched (when audit logging is enabled)."""
     import asyncio
 
-    # Audit logging is a static, server-level switch that defaults off; enable it
-    # on the test engine's logger for this case only.
+    # Audit logging is hierarchical (env -> tenant -> bank) and defaults off.
+    # Enable it deployment-wide for this case: the logger flag covers actions
+    # with no bank in scope, enable_audit_default sets the resolver default the
+    # per-bank gate reads.
     memory._audit_logger._enabled = True
+    enable_audit_default(memory, True)
     try:
         bank = "md-audit"
         await api_client.put(f"/v1/default/banks/{bank}", json={})

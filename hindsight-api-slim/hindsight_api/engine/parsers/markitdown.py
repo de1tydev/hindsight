@@ -5,12 +5,34 @@ import logging
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from hindsight_api.config import DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT
 
 from .base import FileParser
 
+if TYPE_CHECKING:
+    from markitdown import StreamInfo
+
 logger = logging.getLogger(__name__)
+
+# Extensions whose markitdown converters decode the raw bytes as text. markitdown
+# samples only the first chunk for charset detection, so a UTF-8 file with a long
+# ASCII-only prefix is mis-detected as ASCII; the JSON/ipynb converter then crashes
+# decoding the first multibyte byte. Passing an explicit UTF-8 hint when the bytes
+# are valid UTF-8 sidesteps the faulty detection without affecting other encodings.
+_TEXT_EXTENSIONS = {
+    ".json",
+    ".jsonl",
+    ".ipynb",
+    ".txt",
+    ".text",
+    ".md",
+    ".markdown",
+    ".csv",
+    ".html",
+    ".htm",
+}
 
 
 @dataclass(frozen=True)
@@ -50,6 +72,7 @@ class MarkitdownParser(FileParser):
         ocr_base_url: str | None = None,
         ocr_model: str | None = None,
         ocr_prompt: str | None = None,
+        ocr_default_headers: dict[str, str] | None = None,
     ):
         """Initialize markitdown parser."""
         # Lazy import to avoid requiring markitdown for all users
@@ -67,6 +90,7 @@ class MarkitdownParser(FileParser):
                 base_url=ocr_base_url,
                 model=ocr_model,
                 prompt=ocr_prompt,
+                default_headers=ocr_default_headers,
             )
             self._markitdown = MarkItDown(
                 llm_client=ocr_options.llm_client,
@@ -83,6 +107,7 @@ class MarkitdownParser(FileParser):
         base_url: str | None,
         model: str | None,
         prompt: str | None,
+        default_headers: dict[str, str] | None,
     ) -> MarkitdownOcrOptions:
         """Build MarkItDown options for OpenAI-compatible image OCR."""
         if not model or not model.strip():
@@ -107,8 +132,15 @@ class MarkitdownParser(FileParser):
         except ImportError as e:
             raise RuntimeError("openai package is required when Markitdown OCR is enabled.") from e
 
+        client_kwargs: dict[str, object] = {
+            "api_key": api_key,
+            "base_url": base_url.strip(),
+        }
+        if default_headers:
+            client_kwargs["default_headers"] = default_headers
+
         return MarkitdownOcrOptions(
-            llm_client=OpenAI(api_key=api_key, base_url=base_url.strip()),
+            llm_client=OpenAI(**client_kwargs),
             llm_model=model.strip(),
             llm_prompt=prompt or DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT,
         )
@@ -134,8 +166,9 @@ class MarkitdownParser(FileParser):
             tmp_path = tmp.name
 
         try:
-            # Parse using markitdown
-            result = self._markitdown.convert(tmp_path)
+            # Parse using markitdown, passing an explicit charset hint for text
+            # files to avoid markitdown's sample-based (and crash-prone) detection.
+            result = self._markitdown.convert(tmp_path, stream_info=self._utf8_stream_info(file_data, filename))
 
             if not result or not result.text_content:
                 raise RuntimeError(f"No content extracted from '{filename}'")
@@ -152,6 +185,27 @@ class MarkitdownParser(FileParser):
                 Path(tmp_path).unlink()
             except Exception:
                 pass
+
+    @staticmethod
+    def _utf8_stream_info(file_data: bytes, filename: str) -> "StreamInfo | None":
+        """Return a UTF-8 charset hint for text files that decode cleanly as UTF-8.
+
+        Returns None for binary files or non-UTF-8 text so markitdown falls back
+        to its own detection.
+        """
+        if Path(filename).suffix.lower() not in _TEXT_EXTENSIONS:
+            return None
+        try:
+            # file_data may arrive as a non-``bytes`` buffer (e.g. a memoryview or
+            # a native/Rust-backed buffer object) that has no ``.decode``; coerce
+            # through the buffer protocol before the UTF-8 probe. The ``tmp.write``
+            # in the caller already relies only on the same buffer protocol.
+            bytes(file_data).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        from markitdown import StreamInfo
+
+        return StreamInfo(charset="utf-8")
 
     @staticmethod
     def _is_image_file(filename: str) -> bool:

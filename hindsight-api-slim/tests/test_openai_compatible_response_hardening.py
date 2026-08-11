@@ -1,10 +1,16 @@
+import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic import BaseModel
 
-from hindsight_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM, ProviderResponseError
+from hindsight_api.engine.providers.openai_compatible_llm import (
+    OpenAICompatibleLLM,
+    ProviderResponseError,
+)
+from hindsight_api.worker.stage import StageHolder, bind_holder, set_stage
 
 
 class SimpleJsonResponse(BaseModel):
@@ -32,6 +38,41 @@ def _response(*, content: str | None = '{"ok": true}', choices=None, error=None)
     )
     response.choices = [choice]
     return response
+
+
+@pytest.mark.asyncio
+async def test_attempt_stage_is_published_only_after_permits_are_acquired():
+    llm = _llm()
+    holder = StageHolder()
+    waiting_for_permit = asyncio.Event()
+    release_permit = asyncio.Event()
+
+    @asynccontextmanager
+    async def blocked_attempt_context():
+        waiting_for_permit.set()
+        await release_permit.wait()
+        yield
+
+    async def create(**_kwargs):
+        assert holder.stage == "llm.openai.memory.attempt=1/1"
+        return _response(content="ok")
+
+    llm._client.chat.completions.create = AsyncMock(side_effect=create)
+
+    async def invoke():
+        bind_holder(holder)
+        set_stage("llm.openai.memory.queued")
+        return await llm.call(
+            messages=[{"role": "user", "content": "hello"}],
+            max_retries=0,
+            attempt_context=blocked_attempt_context,
+        )
+
+    task = asyncio.create_task(invoke())
+    await asyncio.wait_for(waiting_for_permit.wait(), timeout=1)
+    assert holder.stage == "llm.openai.memory.queued"
+    release_permit.set()
+    assert await task == "ok"
 
 
 @pytest.mark.asyncio
@@ -68,6 +109,42 @@ async def test_json_object_call_strips_gemma_thought_tags_before_parsing():
         )
 
     assert result.ok is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["qwen/qwen3.6-35b-a3b", "openai/gpt-oss-120b"])
+async def test_openrouter_verification_uses_larger_reasoning_safe_budget(model: str):
+    llm = OpenAICompatibleLLM(
+        provider="openrouter",
+        api_key="test-key",
+        base_url="",
+        model=model,
+    )
+    create = AsyncMock(return_value=_response(content="ok"))
+    llm._client.chat.completions.create = create
+
+    with patch("hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector"):
+        await llm.verify_connection()
+
+    sent = create.call_args.kwargs
+    assert sent["model"] == model
+    assert sent["messages"] == [{"role": "user", "content": "Say 'ok'"}]
+    assert sent["max_tokens"] == 512
+    assert "max_completion_tokens" not in sent
+
+
+@pytest.mark.asyncio
+async def test_verification_uses_larger_budget_for_other_compatible_gateways():
+    llm = _llm()
+    create = AsyncMock(return_value=_response(content="ok"))
+    llm._client.chat.completions.create = create
+
+    with patch("hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector"):
+        await llm.verify_connection()
+
+    sent = create.call_args.kwargs
+    assert sent["max_tokens"] == 512
+    assert "max_completion_tokens" not in sent
 
 
 @pytest.mark.asyncio

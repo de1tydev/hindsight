@@ -19,7 +19,7 @@ Webhooks are registered per memory bank and fire automatically when matching eve
 A delivery is considered failed if your endpoint returns a non-2xx status code or does not respond within the configured timeout (default 30 seconds). After 6 failed attempts, the delivery is marked as permanently failed and no further retries are made.
 
 > **ℹ️ At-least-once delivery**
-> 
+>
 Webhook delivery tasks are queued in the same database transaction as the primary operation (e.g. the retain or consolidation write). This means if the server crashes after committing but before sending, the delivery task survives and will be retried. As a result, **your endpoint may receive the same event more than once** — use the `operation_id` field to deduplicate if needed.
 ## Event Types
 
@@ -73,7 +73,8 @@ Fired once per document after a retain operation completes (both synchronous and
   "timestamp": "2026-03-04T12:00:01Z",
   "data": {
     "document_id": "doc-abc123",
-    "tags": ["meeting", "q1-2026"]
+    "tags": ["meeting", "q1-2026"],
+    "memory_unit_count": 12
   }
 }
 ```
@@ -84,11 +85,13 @@ Fired once per document after a retain operation completes (both synchronous and
 |-------|------|-------------|
 | `document_id` | `string \| null` | The document ID if one was provided in the retain request |
 | `tags` | `string[] \| null` | Document-level tags applied during retain |
+| `memory_unit_count` | `number \| null` | Memory units the document owns after this retain. `null` when the request carried no `document_id`. |
 
 **Notes:**
 - For async retain (`async: true`), `operation_id` matches the `operation_id` returned by the retain API.
 - For sync retain, `operation_id` is a generated identifier for tracing purposes.
 - One event is fired per content item in the retain request.
+- `memory_unit_count: 0` means fact extraction returned nothing for the document. The retain still succeeded and the text is stored, but `recall` and `reflect` search memories — so the document is not retrievable until it is [reprocessed](../retain.md#when-a-mission-excludes-everything-in-a-document). Watch this field to catch a retain mission that excludes more than intended.
 
 ---
 
@@ -129,4 +132,3 @@ Fired when a bank's [Memory Defense](../memory-defense/index.md) policy acts on 
 
 **Notes:**
 - A `redact` event means the secret was scrubbed and the redacted memory was still stored. A `block` event means the item was dropped; if every item in the retain request is blocked, the retain call returns `422`.
-

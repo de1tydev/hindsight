@@ -32,6 +32,12 @@ import type {
   CreateDirectiveData,
   CreateDirectiveErrors,
   CreateDirectiveResponses,
+  CreateKnowledgeFolderData,
+  CreateKnowledgeFolderErrors,
+  CreateKnowledgeFolderResponses,
+  CreateKnowledgePageData,
+  CreateKnowledgePageErrors,
+  CreateKnowledgePageResponses,
   CreateMentalModelData,
   CreateMentalModelErrors,
   CreateMentalModelResponses,
@@ -50,21 +56,33 @@ import type {
   DeleteDocumentData,
   DeleteDocumentErrors,
   DeleteDocumentResponses,
+  DeleteKnowledgeNodeData,
+  DeleteKnowledgeNodeErrors,
+  DeleteKnowledgeNodeResponses,
   DeleteMentalModelData,
   DeleteMentalModelErrors,
   DeleteMentalModelResponses,
+  DeleteOperationData,
+  DeleteOperationErrors,
+  DeleteOperationResponses,
   DeleteWebhookData,
   DeleteWebhookErrors,
   DeleteWebhookResponses,
   DryRunExtractMemoriesData,
   DryRunExtractMemoriesErrors,
   DryRunExtractMemoriesResponses,
+  DryRunRefreshMentalModelData,
+  DryRunRefreshMentalModelErrors,
+  DryRunRefreshMentalModelResponses,
   ExportBankTemplateData,
   ExportBankTemplateErrors,
   ExportBankTemplateResponses,
   ExportDocumentsData,
   ExportDocumentsErrors,
   ExportDocumentsResponses,
+  ExportKnowledgeBaseData,
+  ExportKnowledgeBaseErrors,
+  ExportKnowledgeBaseResponses,
   FileRetainData,
   FileRetainErrors,
   FileRetainResponses,
@@ -97,6 +115,12 @@ import type {
   GetGraphData,
   GetGraphErrors,
   GetGraphResponses,
+  GetKnowledgeBaseTreeData,
+  GetKnowledgeBaseTreeErrors,
+  GetKnowledgeBaseTreeResponses,
+  GetKnowledgePageData,
+  GetKnowledgePageErrors,
+  GetKnowledgePageResponses,
   GetMemoriesTimeseriesData,
   GetMemoriesTimeseriesErrors,
   GetMemoriesTimeseriesResponses,
@@ -199,6 +223,9 @@ import type {
   RetryOperationData,
   RetryOperationErrors,
   RetryOperationResponses,
+  SearchKnowledgeBaseData,
+  SearchKnowledgeBaseErrors,
+  SearchKnowledgeBaseResponses,
   TestBankLlmData,
   TestBankLlmErrors,
   TestBankLlmResponses,
@@ -220,6 +247,9 @@ import type {
   UpdateDocumentData,
   UpdateDocumentErrors,
   UpdateDocumentResponses,
+  UpdateKnowledgeNodeData,
+  UpdateKnowledgeNodeErrors,
+  UpdateKnowledgeNodeResponses,
   UpdateMemoryData,
   UpdateMemoryErrors,
   UpdateMemoryResponses,
@@ -303,7 +333,7 @@ export const getGraph = <ThrowOnError extends boolean = false>(
 /**
  * List memory units
  *
- * List memory units with pagination and optional full-text search. Supports filtering by type. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).
+ * List memory units with pagination and optional full-text search. Supports filtering by type, source document, and linked entity ID. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).
  */
 export const listMemories = <ThrowOnError extends boolean = false>(
   options: Options<ListMemoriesData, ThrowOnError>
@@ -642,6 +672,27 @@ export const refreshMentalModel = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh", ...options });
 
 /**
+ * Dry-run mental model refresh (preview, no persistence)
+ *
+ * Preview what a refresh would do to this mental model WITHOUT changing it — no content, structured document, watermark, or last_refreshed_at is written. Returns the mode the refresh ran in and why (delta silently falls back to full when there is no baseline or the source query changed), the resolved tag scope and time window it read, how many facts retrieval returned versus how many the reflect agent actually used, the delta operations it emitted, and a unified diff from the stored content to the content it would write.
+ *
+ * This is the production refresh pipeline with two writes skipped — the content and the watermark — and nothing about it is configurable, so what it reports is what the next refresh will do. Because nothing is persisted, a delta dry run reads exactly the window the next real refresh would, and repeating it reads that same window again.
+ *
+ * It costs the same LLM tokens as a refresh and is validated the same way.
+ */
+export const dryRunRefreshMentalModel = <ThrowOnError extends boolean = false>(
+  options: Options<DryRunRefreshMentalModelData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    DryRunRefreshMentalModelResponses,
+    DryRunRefreshMentalModelErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/dry-run-refresh",
+    ...options,
+  });
+
+/**
  * Clear mental model content
  *
  * Clear a mental model's content so the next refresh performs a full re-synthesis. This is useful for delta-mode models that have accumulated drift over many incremental refreshes. After clearing, call the /refresh endpoint to trigger a clean full rebuild.
@@ -652,6 +703,138 @@ export const clearMentalModel = <ThrowOnError extends boolean = false>(
   (options.client ?? client).post<ClearMentalModelResponses, ClearMentalModelErrors, ThrowOnError>({
     url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/clear",
     ...options,
+  });
+
+/**
+ * Get the knowledge-base tree
+ *
+ * Return the knowledge base as a nested tree of folders and pages.
+ */
+export const getKnowledgeBaseTree = <ThrowOnError extends boolean = false>(
+  options: Options<GetKnowledgeBaseTreeData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    GetKnowledgeBaseTreeResponses,
+    GetKnowledgeBaseTreeErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/knowledge-base/tree", ...options });
+
+/**
+ * Create a knowledge-base folder
+ *
+ * Create a folder, optionally nested under a parent folder.
+ */
+export const createKnowledgeFolder = <ThrowOnError extends boolean = false>(
+  options: Options<CreateKnowledgeFolderData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    CreateKnowledgeFolderResponses,
+    CreateKnowledgeFolderErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/knowledge-base/folders",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Create a knowledge-base page
+ *
+ * Create a page (a mental model + tree node). Content is generated asynchronously; use the returned operation_id to track completion.
+ */
+export const createKnowledgePage = <ThrowOnError extends boolean = false>(
+  options: Options<CreateKnowledgePageData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    CreateKnowledgePageResponses,
+    CreateKnowledgePageErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/knowledge-base/pages",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Export the knowledge base as a markdown bundle
+ *
+ * Return a portable markdown bundle: a nested index.md, one <id>.md per page, and history logs.
+ */
+export const exportKnowledgeBase = <ThrowOnError extends boolean = false>(
+  options: Options<ExportKnowledgeBaseData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    ExportKnowledgeBaseResponses,
+    ExportKnowledgeBaseErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/knowledge-base/export", ...options });
+
+/**
+ * Hybrid search over knowledge pages (BM25 + vector)
+ *
+ * Doc-level hybrid search across a bank's knowledge pages: a full-text (BM25) match and a vector-similarity match, Reciprocal-Rank-Fusion fused. No reranker — tuned for latency.
+ */
+export const searchKnowledgeBase = <ThrowOnError extends boolean = false>(
+  options: Options<SearchKnowledgeBaseData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    SearchKnowledgeBaseResponses,
+    SearchKnowledgeBaseErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/knowledge-base/search", ...options });
+
+/**
+ * Get a knowledge-base page
+ *
+ * Return a single page as a markdown document (frontmatter + markdown body).
+ */
+export const getKnowledgePage = <ThrowOnError extends boolean = false>(
+  options: Options<GetKnowledgePageData, ThrowOnError>
+) =>
+  (options.client ?? client).get<GetKnowledgePageResponses, GetKnowledgePageErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/knowledge-base/pages/{page_id}",
+    ...options,
+  });
+
+/**
+ * Delete a knowledge-base node
+ *
+ * Delete a folder or page and its whole subtree (pages' mental models are removed too).
+ */
+export const deleteKnowledgeNode = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteKnowledgeNodeData, ThrowOnError>
+) =>
+  (options.client ?? client).delete<
+    DeleteKnowledgeNodeResponses,
+    DeleteKnowledgeNodeErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}", ...options });
+
+/**
+ * Rename/move a knowledge-base node or update a page's options
+ *
+ * Rename a node (set `name`), move it under another folder (set `parent_id`, null for the root), and/or update a page's options (`source_query`, `tags`, `max_tokens`). Changing `source_query` schedules an async refresh so the page rebuilds against the new question.
+ */
+export const updateKnowledgeNode = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateKnowledgeNodeData, ThrowOnError>
+) =>
+  (options.client ?? client).patch<
+    UpdateKnowledgeNodeResponses,
+    UpdateKnowledgeNodeErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 /**
@@ -730,7 +913,7 @@ export const updateDirective = <ThrowOnError extends boolean = false>(
 /**
  * List documents
  *
- * List documents with pagination and optional search. Documents are the source content from which memory units are extracted.
+ * List documents with pagination and optional search, most recently written first (`updated_at` descending). Documents are the source content from which memory units are extracted.
  */
 export const listDocuments = <ThrowOnError extends boolean = false>(
   options: Options<ListDocumentsData, ThrowOnError>
@@ -877,7 +1060,7 @@ export const cancelOperation = <ThrowOnError extends boolean = false>(
 /**
  * Get operation status
  *
- * Get the status of a specific async operation. Returns 'pending', 'completed', or 'failed'. Completed operations are removed from storage, so 'completed' means the operation finished successfully.
+ * Get the status of a specific async operation. Returns 'pending', 'processing', 'completed', 'failed', or 'cancelled'. Completed operations remain queryable with their payload for the configured retention window and are pruned afterward.
  */
 export const getOperationStatus = <ThrowOnError extends boolean = false>(
   options: Options<GetOperationStatusData, ThrowOnError>
@@ -898,6 +1081,19 @@ export const retryOperation = <ThrowOnError extends boolean = false>(
 ) =>
   (options.client ?? client).post<RetryOperationResponses, RetryOperationErrors, ThrowOnError>({
     url: "/v1/default/banks/{bank_id}/operations/{operation_id}/retry",
+    ...options,
+  });
+
+/**
+ * Delete a terminal async operation
+ *
+ * Permanently remove a failed, cancelled, or completed async operation record
+ */
+export const deleteOperation = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteOperationData, ThrowOnError>
+) =>
+  (options.client ?? client).delete<DeleteOperationResponses, DeleteOperationErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/operations/{operation_id}/delete",
     ...options,
   });
 

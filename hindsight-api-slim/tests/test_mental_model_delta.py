@@ -28,7 +28,9 @@ import pytest
 
 from hindsight_api import MemoryEngine, RequestContext
 from hindsight_api.engine.llm_wrapper import LLMConfig
+from hindsight_api.engine.maintenance import MaintenanceLoop
 from hindsight_api.engine.response_models import ReflectResult
+from hindsight_api.engine.retain import embedding_utils
 
 
 def _canned_reflect_result(text: str, facts: list[dict] | None = None) -> ReflectResult:
@@ -273,6 +275,259 @@ class TestDeltaRefreshPlumbing:
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
+    async def test_delta_no_new_facts_advances_watermark_to_newest_processed(
+        self,
+        memory: MemoryEngine,
+        request_context: RequestContext,
+        patch_reflect,
+        patch_llm_call,
+        monkeypatch,
+    ):
+        """A successful no-op refresh advances ``last_refreshed_at`` to the newest
+        in-scope memory it actually saw — not ``now()``.
+
+        The scheduled-refresh gate uses ``last_refreshed_at`` as its watermark. If a
+        no-op refresh left it unchanged, one unrelated memory would make every
+        maintenance tick submit another LLM refresh forever. Anchoring the watermark to
+        the newest processed memory stops that storm without jumping ahead of the real
+        data, so a row that commits later stays newer than the watermark (see
+        ``test_delta_refresh_watermark_survives_straddling_commit``).
+        """
+        bank_id = f"test-delta-watermark-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+
+        existing = "# Preferences\n\nThe user prefers concise answers.\n"
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="User Preferences",
+            source_query="What are the user's durable collaboration preferences?",
+            content=existing,
+            trigger={"mode": "delta", "refresh_cron": "* * * * *"},
+            request_context=request_context,
+        )
+
+        # Established model whose cron is overdue, plus a topic-irrelevant but in-scope
+        # fact committed a couple of minutes ago. The coarse staleness query sees the
+        # row while the reflect agent correctly returns no supporting facts.
+        assert memory._pool is not None
+        async with memory._pool.acquire() as conn:
+            before = await conn.fetchval(
+                """
+                UPDATE mental_models
+                SET last_refreshed_at = NOW() - INTERVAL '1 day',
+                    last_refreshed_source_query = source_query
+                WHERE bank_id = $1 AND id = $2
+                RETURNING last_refreshed_at
+                """,
+                bank_id,
+                mm["id"],
+            )
+            fact_updated_at = await conn.fetchval(
+                """
+                INSERT INTO memory_units (id, bank_id, text, fact_type, tags, created_at, updated_at)
+                VALUES ($1, $2, 'The build server uses Linux.', 'world', ARRAY[]::varchar[],
+                        NOW() - INTERVAL '2 minutes', NOW() - INTERVAL '2 minutes')
+                RETURNING updated_at
+                """,
+                uuid.uuid4(),
+                bank_id,
+            )
+            stale_row = await conn.fetchrow(
+                "SELECT id, tags, trigger, last_refreshed_at FROM mental_models WHERE bank_id = $1 AND id = $2",
+                bank_id,
+                mm["id"],
+            )
+            assert stale_row is not None
+            assert await memory.compute_mental_model_is_stale(conn, bank_id, stale_row) is True
+
+        patch_reflect(memory, text="No relevant preference changes.", facts=[])
+        delta_llm_calls = patch_llm_call(memory, returns="should-not-be-called")
+
+        async def fail_embedding_generation(*args, **kwargs):
+            raise AssertionError("A no-op delta refresh must not regenerate the embedding")
+
+        monkeypatch.setattr(embedding_utils, "generate_embeddings_batch", fail_embedding_generation)
+
+        refreshed = await memory.refresh_mental_model(
+            bank_id=bank_id,
+            mental_model_id=mm["id"],
+            request_context=request_context,
+        )
+
+        assert refreshed is not None
+        assert refreshed["content"] == existing
+        assert len(delta_llm_calls) == 0
+        assert (refreshed.get("reflect_response") or {}).get("delta_skipped_reason") == "no_new_facts"
+
+        async with memory._pool.acquire() as conn:
+            mm_row = await conn.fetchrow(
+                "SELECT id, tags, trigger, last_refreshed_at FROM mental_models WHERE bank_id = $1 AND id = $2",
+                bank_id,
+                mm["id"],
+            )
+            assert mm_row is not None
+            after = mm_row["last_refreshed_at"]
+            is_stale = await memory.compute_mental_model_is_stale(conn, bank_id, mm_row)
+            history_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM mental_model_history WHERE bank_id = $1 AND mental_model_id = $2",
+                bank_id,
+                mm["id"],
+            )
+        # Watermark advanced to the newest in-scope memory actually seen — exactly its
+        # updated_at, not now() — so the settled window no longer re-triggers.
+        assert after == fact_updated_at
+        assert after > before
+        assert is_stale is False
+        assert history_count == 0
+
+        submitted: list[str] = []
+
+        async def record_submit(
+            *,
+            bank_id: str,
+            mental_model_id: str,
+            request_context: RequestContext,
+            skip_if_in_flight: bool = False,
+        ) -> dict[str, str]:
+            submitted.append(mental_model_id)
+            return {"operation_id": str(uuid.uuid4())}
+
+        monkeypatch.setattr(memory, "submit_async_refresh_mental_model", record_submit)
+        await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
+        assert mm["id"] not in submitted
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_delta_refresh_watermark_survives_straddling_commit(
+        self,
+        memory: MemoryEngine,
+        request_context: RequestContext,
+        patch_reflect,
+        patch_llm_call,
+        monkeypatch,
+    ):
+        """A memory whose transaction starts before the refresh snapshot but commits
+        after it must remain visible to a later refresh.
+
+        ``memory_units.updated_at`` is the writing transaction's start time, but the row
+        only becomes visible at COMMIT. A refresh that persisted its exact snapshot
+        cutoff (or ``now()``) would leave such a straddling row below the watermark — its
+        start time predates the cutoff — even though reflect never saw it, dropping it
+        forever. Anchoring the watermark to ``max(updated_at)`` of the rows the refresh
+        *actually saw* excludes the still-uncommitted straddler, so it stays strictly
+        newer than the watermark and is picked up next time.
+        """
+        bank_id = f"test-delta-straddle-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="User Preferences",
+            source_query="What are the user's durable collaboration preferences?",
+            content="# Preferences\n\nThe user prefers concise answers.\n",
+            trigger={"mode": "delta", "refresh_cron": "* * * * *"},
+            request_context=request_context,
+        )
+
+        assert memory._pool is not None
+        async with memory._pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE mental_models
+                SET last_refreshed_at = NOW() - INTERVAL '1 day',
+                    last_refreshed_source_query = source_query
+                WHERE bank_id = $1 AND id = $2
+                """,
+                bank_id,
+                mm["id"],
+            )
+            # A committed baseline in-scope fact. This is the newest row the refresh can
+            # see, so it becomes the max(seen) watermark.
+            baseline_updated_at = await conn.fetchval(
+                """
+                INSERT INTO memory_units (id, bank_id, text, fact_type, tags, created_at, updated_at)
+                VALUES ($1, $2, 'The user is on the platform team.', 'world', ARRAY[]::varchar[],
+                        NOW() - INTERVAL '2 minutes', NOW() - INTERVAL '2 minutes')
+                RETURNING updated_at
+                """,
+                uuid.uuid4(),
+                bank_id,
+            )
+
+        reflect_calls = patch_reflect(memory, text="No relevant preference changes.", facts=[])
+        delta_llm_calls = patch_llm_call(memory, returns="should-not-be-called")
+        original_update = memory.update_mental_model
+
+        # Open a transaction and insert a NEWER relevant memory, but hold the commit so
+        # it is invisible at the refresh snapshot. Its updated_at (transaction-start) is
+        # still before the cutoff, so an exact-cutoff/now() watermark would drop it.
+        straddle_conn = await memory._pool.acquire()
+        straddle_tx = straddle_conn.transaction()
+        await straddle_tx.start()
+        straddle_fact_id = uuid.uuid4()
+        await straddle_conn.execute(
+            """
+            INSERT INTO memory_units
+                (id, bank_id, text, fact_type, tags, created_at, updated_at)
+            VALUES
+                ($1, $2, 'The user now prefers detailed answers.', 'world',
+                 ARRAY[]::varchar[], NOW(), NOW())
+            """,
+            straddle_fact_id,
+            bank_id,
+        )
+
+        straddle_committed = False
+
+        async def commit_straddle_then_update(*args, **kwargs):
+            nonlocal straddle_committed
+            # refresh has already captured its snapshot and finished reflect. Commit the
+            # previously-invisible row in this exact window, after the snapshot.
+            await straddle_tx.commit()
+            straddle_committed = True
+            return await original_update(*args, **kwargs)
+
+        monkeypatch.setattr(memory, "update_mental_model", commit_straddle_then_update)
+
+        try:
+            refreshed = await memory.refresh_mental_model(
+                bank_id=bank_id,
+                mental_model_id=mm["id"],
+                request_context=request_context,
+            )
+        finally:
+            if not straddle_committed:
+                await straddle_tx.rollback()
+            await memory._pool.release(straddle_conn)
+
+        assert refreshed is not None
+        assert len(reflect_calls) == 1
+        assert len(delta_llm_calls) == 0
+        cutoff = reflect_calls[0].get("created_before")
+        assert cutoff is not None
+
+        async with memory._pool.acquire() as conn:
+            mm_row = await conn.fetchrow(
+                "SELECT id, tags, trigger, last_refreshed_at FROM mental_models WHERE bank_id = $1 AND id = $2",
+                bank_id,
+                mm["id"],
+            )
+            straddle_updated_at = await conn.fetchval(
+                "SELECT updated_at FROM memory_units WHERE bank_id = $1 AND id = $2",
+                bank_id,
+                straddle_fact_id,
+            )
+            assert mm_row is not None
+            after = mm_row["last_refreshed_at"]
+            # Watermark advanced only to the committed baseline the refresh actually saw.
+            assert after == baseline_updated_at
+            # The straddler was stamped before the cutoff (an exact-cutoff/now() watermark
+            # would drop it), yet it is newer than max(seen), so the model reads stale.
+            assert straddle_updated_at < cutoff
+            assert after < straddle_updated_at
+            assert await memory.compute_mental_model_is_stale(conn, bank_id, mm_row) is True
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
     async def test_delta_mode_applies_ops_when_query_stable(
         self,
         memory: MemoryEngine,
@@ -500,29 +755,34 @@ class TestDeltaRefreshPlumbing:
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
-    async def test_delta_llm_failure_falls_back_to_candidate(
+    async def test_delta_llm_failure_preserves_document_and_raises(
         self,
         memory: MemoryEngine,
         request_context: RequestContext,
         patch_reflect,
         monkeypatch,
     ):
-        """When the structured-delta LLM call raises, refresh falls back to the
-        candidate markdown so the user still sees a fresh synthesis instead of
-        an opaque failure.
+        """#3112: a failed structured-delta call must never overwrite the document.
+
+        The reflect candidate was synthesised under ``created_after`` — only the
+        memories newer than the last refresh — so writing it as the whole document
+        deletes everything grounded in older ones. This used to be logged as
+        "falling back to full synthesis", which it never was. The refresh now
+        preserves the document and fails, the same way an empty candidate does.
         """
         bank_id = f"test-delta-llm-fail-{uuid.uuid4().hex[:8]}"
         await memory.get_bank_profile(bank_id, request_context=request_context)
 
+        existing = "# Team\n\nExisting.\n"
         mm = await memory.create_mental_model(
             bank_id=bank_id,
             name="Team Info",
             source_query="Tell me about the team",
-            content="# Team\n\nExisting.\n",
+            content=existing,
             trigger={"mode": "delta"},
             request_context=request_context,
         )
-        # Seed tracking column with a successful zero-op refresh.
+        # Seed tracking column + structured baseline with a successful zero-op refresh.
         patch_reflect(memory, text="ignored")
 
         async def ok_call(*, messages, **kwargs):
@@ -531,14 +791,18 @@ class TestDeltaRefreshPlumbing:
             return DeltaOperationList()
 
         monkeypatch.setattr(memory._reflect_llm_config, "call", ok_call)
-        await memory.refresh_mental_model(bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context)
+        seeded = await memory.refresh_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
+        seeded_content = seeded["content"]
+        seeded_refreshed_at = seeded["last_refreshed_at"]
 
-        # Now the second refresh: LLM raises. Refresh must not crash; it should
-        # store the candidate markdown.
-        candidate = "# Team\n\nFallback candidate from reflect_async.\n"
+        # Second refresh: the delta LLM call raises. The candidate is deliberately
+        # a plausible-looking document — the danger is that it *is* non-empty, so
+        # the empty-content guard would let it through.
         patch_reflect(
             memory,
-            text=candidate,
+            text="# Team\n\nNarrow candidate covering only the new fact.\n",
             facts=[{"id": "obs-new", "text": "some new fact", "type": "observation", "context": None}],
         )
 
@@ -546,13 +810,330 @@ class TestDeltaRefreshPlumbing:
             raise RuntimeError("simulated provider 500")
 
         monkeypatch.setattr(memory._reflect_llm_config, "call", boom)
+
+        from hindsight_api.engine.memory_engine import MentalModelRefreshError
+
+        with pytest.raises(MentalModelRefreshError):
+            await memory.refresh_mental_model(
+                bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+            )
+
+        preserved = await memory.get_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
+        assert preserved is not None
+        assert preserved["content"] == seeded_content, (
+            "Delta failure overwrote the document with the narrow-window candidate (#3112)"
+        )
+        # The watermark must not move: the new fact has to stay inside the window
+        # the retry reads, or it is lost for good.
+        assert preserved["last_refreshed_at"] == seeded_refreshed_at
+        rr = preserved.get("reflect_response") or {}
+        assert rr.get("refresh_skipped") == "delta_ops_failed"
+        assert rr.get("delta_applied") is False
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_delta_all_ops_skipped_preserves_document_and_raises(
+        self,
+        memory: MemoryEngine,
+        request_context: RequestContext,
+        patch_reflect,
+        patch_llm_call,
+    ):
+        """Ops that are all rejected leave the document unchanged — that is a failure.
+
+        Persisting it would look like a clean refresh while advancing the watermark
+        past facts that never reached the document, putting them outside every
+        future delta window. Distinct from the model emitting *zero* ops, which is a
+        legitimate "nothing to add" and is covered by the byte-identical test above.
+        """
+        bank_id = f"test-delta-all-skipped-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+
+        existing = "# Team\n\nAlice is the lead.\n"
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Team Info",
+            source_query="Tell me about the team",
+            content=existing,
+            trigger={"mode": "delta"},
+            request_context=request_context,
+        )
+
+        patch_reflect(
+            memory,
+            text="# Team\n\nNarrow candidate.\n",
+            facts=[{"id": "obs-new", "text": "Bob joined", "type": "observation", "context": None}],
+        )
+        # Every op targets a section that does not exist, so apply_operations
+        # rejects all of them.
+        patch_llm_call(
+            memory,
+            returns=[
+                {
+                    "op": "append_block",
+                    "section_id": "does-not-exist",
+                    "block": {"type": "paragraph", "text": "Bob joined the team."},
+                },
+                {
+                    "op": "append_block",
+                    "section_id": "also-missing",
+                    "block": {"type": "paragraph", "text": "Bob sits with Alice."},
+                },
+            ],
+        )
+
+        from hindsight_api.engine.memory_engine import MentalModelRefreshError
+
+        with pytest.raises(MentalModelRefreshError):
+            await memory.refresh_mental_model(
+                bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+            )
+
+        preserved = await memory.get_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
+        assert preserved is not None
+        assert preserved["content"] == existing
+        rr = preserved.get("reflect_response") or {}
+        assert rr.get("refresh_skipped") == "delta_ops_all_skipped"
+        # The rejected ops are persisted so the reason each was dropped is
+        # recoverable without re-running the refresh.
+        assert len(rr.get("delta_operations_skipped") or []) == 2
+        assert all("unknown section_id" in op.get("reason", "") for op in rr["delta_operations_skipped"])
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_delta_partial_skip_applies_the_rest_and_records_it(
+        self,
+        memory: MemoryEngine,
+        request_context: RequestContext,
+        patch_reflect,
+        patch_llm_call,
+    ):
+        """One bad op must not sink the whole refresh — but it must be visible.
+
+        Most of the new facts still reach the document, so the refresh proceeds;
+        the rejected op is recorded on the model so a human can see that part of
+        this run's evidence never landed.
+        """
+        bank_id = f"test-delta-partial-skip-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Team Info",
+            source_query="Tell me about the team",
+            content="# Team\n\nAlice is the lead.\n",
+            trigger={"mode": "delta"},
+            request_context=request_context,
+        )
+        # First refresh establishes the structured doc, so section ids are known.
+        # It needs a fact: with none, the no-new-facts short-circuit preserves the
+        # content without ever writing structured_content.
+        patch_reflect(
+            memory,
+            text="ignored",
+            facts=[{"id": "obs-seed", "text": "seed", "type": "observation", "context": None}],
+        )
+        patch_llm_call(memory, returns=[])
+        seeded = await memory.refresh_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
+        structured = await memory.get_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
+        assert structured is not None
+        section_id = structured["structured_content"]["sections"][0]["id"]
+
+        patch_reflect(
+            memory,
+            text="# Team\n\nNarrow candidate.\n",
+            facts=[{"id": "obs-new", "text": "Bob joined", "type": "observation", "context": None}],
+        )
+        patch_llm_call(
+            memory,
+            returns=[
+                {
+                    "op": "append_block",
+                    "section_id": section_id,
+                    "block": {"type": "paragraph", "text": "Bob joined the team."},
+                },
+                {
+                    "op": "append_block",
+                    "section_id": "does-not-exist",
+                    "block": {"type": "paragraph", "text": "Dropped on the floor."},
+                },
+            ],
+        )
         refreshed = await memory.refresh_mental_model(
             bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
         )
 
-        assert "Fallback candidate" in refreshed["content"]
+        assert "Bob joined the team." in refreshed["content"]
+        assert "Alice is the lead." in refreshed["content"], "surviving op must not disturb existing content"
+        assert refreshed["content"] != seeded["content"]
         rr = refreshed.get("reflect_response") or {}
-        assert rr.get("delta_applied") is False
+        assert rr.get("delta_applied") is True
+        assert len(rr.get("delta_operations_applied") or []) == 1
+        assert len(rr.get("delta_operations_skipped") or []) == 1
+        assert "refresh_skipped" not in rr
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_unusable_structured_content_rebuilds_baseline_from_markdown(
+        self,
+        memory: MemoryEngine,
+        request_context: RequestContext,
+        patch_reflect,
+        patch_llm_call,
+    ):
+        """A corrupt structured_content column must not disable delta forever.
+
+        The markdown in ``content`` is the same document and parses leniently, so
+        the baseline is re-derived from it and the refresh proceeds — repairing
+        structured_content on the way. Failing instead would wedge the model:
+        nothing else rewrites that column.
+        """
+        bank_id = f"test-delta-bad-struct-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Team Info",
+            source_query="Tell me about the team",
+            content="# Team\n\nAlice is the lead.\n",
+            trigger={"mode": "delta"},
+            request_context=request_context,
+        )
+        # Valid JSON, wrong shape — what a schema change or a hand edit leaves behind.
+        await memory.update_mental_model(
+            bank_id=bank_id,
+            mental_model_id=mm["id"],
+            structured_content={"not_a_document": True},
+            request_context=request_context,
+        )
+
+        patch_reflect(
+            memory,
+            text="# Team\n\nNarrow candidate.\n",
+            facts=[{"id": "obs-new", "text": "Bob joined", "type": "observation", "context": None}],
+        )
+        patch_llm_call(memory, returns=[])
+        refreshed = await memory.refresh_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
+
+        # Delta ran against the markdown-derived baseline: the existing content
+        # survives (it was not replaced by the narrow candidate) and the
+        # structured column is valid again.
+        assert "Alice is the lead." in refreshed["content"]
+        assert "Narrow candidate" not in refreshed["content"]
+        rr = refreshed.get("reflect_response") or {}
+        assert rr.get("delta_applied") is True
+        stored = await memory.get_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
+        assert stored is not None
+        assert stored["structured_content"]["sections"]
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_unparseable_baseline_preserves_document_and_raises(
+        self,
+        memory: MemoryEngine,
+        request_context: RequestContext,
+        patch_reflect,
+        patch_llm_call,
+        monkeypatch,
+    ):
+        """With no readable baseline at all, delta has nothing to edit — so it fails.
+
+        This is the second half of the #3112 guard: the candidate is just as narrow
+        here as it is after an LLM failure, so it is refused for the same reason.
+        """
+        bank_id = f"test-delta-no-baseline-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+
+        existing = "# Team\n\nAlice is the lead.\n"
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Team Info",
+            source_query="Tell me about the team",
+            content=existing,
+            trigger={"mode": "delta"},
+            request_context=request_context,
+        )
+
+        from hindsight_api.engine.reflect import structured_doc
+
+        def unparseable(_markdown: str):
+            raise ValueError("simulated unparseable markdown")
+
+        monkeypatch.setattr(structured_doc, "parse_markdown", unparseable)
+
+        patch_reflect(
+            memory,
+            text="# Team\n\nNarrow candidate.\n",
+            facts=[{"id": "obs-new", "text": "Bob joined", "type": "observation", "context": None}],
+        )
+        patch_llm_call(memory, returns=[])
+
+        from hindsight_api.engine.memory_engine import MentalModelRefreshError
+
+        with pytest.raises(MentalModelRefreshError):
+            await memory.refresh_mental_model(
+                bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+            )
+
+        preserved = await memory.get_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
+        assert preserved is not None
+        assert preserved["content"] == existing
+        rr = preserved.get("reflect_response") or {}
+        assert rr.get("refresh_skipped") == "structured_doc_unreadable"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_full_mode_candidate_is_still_written(
+        self,
+        memory: MemoryEngine,
+        request_context: RequestContext,
+        patch_reflect,
+        patch_llm_call,
+    ):
+        """The #3112 guard must not touch full mode.
+
+        A full-mode candidate is synthesised over the whole history, so it IS the
+        document — there is no narrowing to protect against, and refusing it would
+        break the ordinary refresh path.
+        """
+        bank_id = f"test-full-mode-writes-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Team Info",
+            source_query="Tell me about the team",
+            content="# Team\n\nAlice is the lead.\n",
+            trigger={"mode": "full"},
+            request_context=request_context,
+        )
+
+        calls = patch_reflect(
+            memory,
+            text="# Team\n\nFull rewrite over the whole history.\n",
+            facts=[{"id": "obs-new", "text": "Bob joined", "type": "observation", "context": None}],
+        )
+        patch_llm_call(memory, returns=[])
+        refreshed = await memory.refresh_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
+
+        assert "created_after" not in calls[0], "full mode must not narrow the reflect window"
+        assert "Full rewrite over the whole history." in refreshed["content"]
 
         await memory.delete_bank(bank_id, request_context=request_context)
 

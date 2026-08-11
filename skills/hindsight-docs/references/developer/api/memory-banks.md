@@ -20,7 +20,7 @@ Banks are completely isolated from each other — memories stored in one bank ar
 You don't need to pre-create a bank. Hindsight will automatically create it with default settings when you first use it.
 
 > **💡 Prerequisites**
-> 
+>
 Make sure you've completed the [Quick Start](./quickstart) to install the client and start the server.
 ## Creating a Memory Bank
 
@@ -163,6 +163,8 @@ Each entry in `entity_labels` is a **label group** — one classification dimens
 }
 ```
 
+**How label entities resolve.** Regular entities resolve fuzzily so close name variants merge ("Alice" / "Alice Chen"). Label entities are different: their canonical names are user-defined, so two similar-looking values (`use:use-001` / `use:use-002`) must stay distinct. They therefore resolve by **exact match only** and are stored with `entity_kind = "label"`, which keeps them out of fuzzy name matching entirely — a free-text label group accumulating thousands of similar values doesn't slow down resolution of the bank's regular entities. The classification is fixed when the entity is first stored; removing a label group later doesn't reclassify its existing entities.
+
 ### entities_allow_free_form
 
 By default, entity labels are extracted **alongside** regular named entities (people, places, concepts). Set to `false` to disable free-form extraction so only label entities are stored:
@@ -291,7 +293,7 @@ How much to weight emotional context when reasoning during `reflect`. Scale 1–
 | `5` | Empathetic — considers emotional context |
 
 > **ℹ️ Info**
-> 
+>
 Disposition traits and `reflect_mission` only affect the `reflect` operation. `retain_mission` and `observations_mission` are separate per-operation settings.
 ### mcp_enabled_tools
 
@@ -507,10 +509,10 @@ You can also update configuration directly from the Control Plane UI — navigat
 
 ## Directives
 
-Directives are hard rules that the agent must follow during [reflect](./reflect) operations. Unlike disposition traits which influence *how* the agent reasons, directives are explicit instructions that are *always* enforced.
+Directives are hard rules that the agent must follow during [reflect](./reflect) operations. Unlike disposition traits which influence *how* the agent reasons, directives are explicit instructions that are enforced whenever they are in scope (see [Directive Scope and Tags](#directive-scope-and-tags)).
 
 > **ℹ️ Info**
-> 
+>
 Directives only affect the `reflect` operation. They are injected into prompts and the agent is required to comply with them in all responses.
 ### When to Use Directives
 
@@ -520,6 +522,15 @@ Use directives for rules that must never be violated:
 - **Privacy rules**: "Never share personal data with third parties"
 - **Domain constraints**: "Prefer conservative investment recommendations"
 - **Behavioral guardrails**: "Always cite sources when making claims"
+
+### Directive Scope and Tags
+
+Directives can carry `tags`, and those tags scope **when** a directive is applied during `reflect` — mirroring how tags scope memories:
+
+- **Untagged directives always apply**, on every `reflect`.
+- **Tagged directives apply only when the `reflect` request includes matching tags** (using the request's `tags_match` mode). A `reflect` call with no tags applies only the untagged directives.
+
+To apply **every** active directive regardless of tags, set `apply_all_directives: true` on the `reflect` request. This ignores tag scope for directives (untagged and tagged alike are enforced) and is useful when an operator keeps tagged directives for organization but wants all of them enforced on an untagged reflection.
 
 ### Creating Directives
 
@@ -732,7 +743,7 @@ Consolidated observations are excluded by default — the target bank regenerate
 Because an observation can be derived from facts spanning several documents, `include_observations` is only supported on a **whole-bank export** (omit `document_id`); combining it with a document subset returns `400`.
 
 > **⚠️ Imported observations are inserted as-is — no merge**
-> 
+>
 They are not merged or deduplicated against observations already in the target bank (consolidation merges related observations; import does not). Prefer importing observations into a fresh/empty bank, or omit `include_observations` and let the target consolidate the imported facts itself.
 ### Enabling / disabling
 

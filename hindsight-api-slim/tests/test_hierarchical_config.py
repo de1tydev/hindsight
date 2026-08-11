@@ -6,11 +6,12 @@ key normalization, API endpoints, validation, and caching.
 """
 
 import json
+import uuid
 
 import pytest
 
 from hindsight_api.config import HindsightConfig, normalize_config_dict, normalize_config_key
-from hindsight_api.config_resolver import ConfigResolver
+from hindsight_api.config_resolver import BankConfigPersistenceConflictError, ConfigResolver
 from hindsight_api.extensions.tenant import TenantExtension
 from hindsight_api.models import RequestContext
 
@@ -72,6 +73,9 @@ class FakeBankConfigConnection:
 
     async def execute(self, query, updates_json, bank_id):
         self.backend.config.update(json.loads(updates_json))
+        # Mirror the driver's "<CMD> <rowcount>" status: this fake stands in for
+        # a bank that already exists, so the UPDATE matches its single row.
+        return "UPDATE 1"
 
 
 @pytest.mark.asyncio
@@ -137,9 +141,14 @@ async def test_hierarchical_fields_categorization():
     assert "retain_chunk_batch_size" in configurable
     assert "enable_auto_consolidation" in configurable
     assert "consolidation_llm_parallelism" in configurable
+    assert "audit_log_enabled" in configurable
+    assert "store_document_text" in configurable
+    assert "enable_temporal_retrieval" in configurable
+    assert "enable_graph_retrieval" in configurable
+    assert "enable_reranking" in configurable
 
     # Verify count is correct
-    assert len(configurable) == 40
+    assert len(configurable) == 45
 
     # Verify credential fields (NEVER exposed)
     assert "llm_api_key" in credentials
@@ -594,6 +603,24 @@ async def test_config_freshness_across_updates(memory, request_context):
 
     finally:
         await memory.delete_bank(bank1, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_update_bank_config_rejects_missing_bank(memory, request_context):
+    """The resolver must not report success while discarding the overrides.
+
+    Bank creation moved out of the resolver and into MemoryEngine, so a caller
+    that skips provisioning would otherwise UPDATE zero rows and silently no-op
+    while returning normally (the failure mode #1940 originally fixed).
+    """
+    bank_id = f"test-resolver-missing-bank-{uuid.uuid4().hex[:8]}"
+    resolver = ConfigResolver(backend=memory._backend)
+
+    with pytest.raises(BankConfigPersistenceConflictError, match="does not exist"):
+        await resolver.update_bank_config(bank_id, {"enable_observations": False}, request_context)
+
+    profile = await memory.get_bank_profile(bank_id, request_context=request_context, create_if_missing=False)
+    assert profile is None
 
 
 @pytest.mark.asyncio

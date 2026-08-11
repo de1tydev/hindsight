@@ -11,7 +11,6 @@ from typing import Any, Literal
 
 from .trace import (
     EntryPoint,
-    LinkInfo,
     NodeVisit,
     PruningDecision,
     QueryInfo,
@@ -211,56 +210,6 @@ class SearchTracer:
         elif link_type == "entity":
             self.entity_links_followed += 1
 
-    def add_neighbor_link(
-        self,
-        from_node_id: str,
-        to_node_id: str,
-        link_type: Literal["temporal", "semantic", "entity"],
-        link_weight: float,
-        entity_id: str | None,
-        new_activation: float | None,
-        followed: bool,
-        prune_reason: str | None = None,
-        is_supplementary: bool = False,
-    ):
-        """
-        Record a link to a neighbor (whether followed or not).
-
-        Args:
-            from_node_id: Source node
-            to_node_id: Target node
-            link_type: Type of link
-            link_weight: Weight of link
-            entity_id: Entity ID if link is entity-based
-            new_activation: Activation passed to neighbor (None for supplementary links)
-            followed: Whether link was followed
-            prune_reason: Why link was not followed (if not followed)
-            is_supplementary: Whether this is a supplementary link (multiple connections)
-        """
-        # Find the visit for the source node
-        visit = None
-        for v in self.visits:
-            if v.node_id == from_node_id:
-                visit = v
-                break
-
-        if visit is None:
-            # Node not found, skip
-            return
-
-        link_info = LinkInfo(
-            to_node_id=to_node_id,
-            link_type=link_type,
-            link_weight=link_weight,
-            entity_id=entity_id,
-            new_activation=new_activation,
-            followed=followed,
-            prune_reason=prune_reason,
-            is_supplementary=is_supplementary,
-        )
-
-        visit.neighbors_explored.append(link_info)
-
     def prune_node(
         self,
         node_id: str,
@@ -392,7 +341,7 @@ class SearchTracer:
 
             # Extract score components (only include non-None values)
             # Keys from ScoredResult.to_dict(): cross_encoder_score, cross_encoder_score_normalized,
-            # rrf_normalized, temporal, recency, combined_score, weight
+            # rrf_normalized, temporal, recency, proof_norm, combined_score, weight
             score_components = {}
             for key in [
                 "cross_encoder_score",
@@ -401,6 +350,7 @@ class SearchTracer:
                 "rrf_normalized",
                 "temporal",
                 "recency",
+                "proof_norm",
                 "combined_score",
             ]:
                 if key in result and result[key] is not None:

@@ -29,7 +29,7 @@ curl -fsSL https://hindsight.vectorize.io/get-codex | bash
 The installer:
 1. Downloads scripts to `~/.hindsight/codex/scripts/`
 2. Writes `~/.codex/hooks.json` with absolute paths to the scripts
-3. Adds `hooks = true` to `~/.codex/config.toml`
+3. Adds `codex_hooks = true` to `~/.codex/config.toml`
 
 ### Uninstall
 
@@ -86,6 +86,7 @@ export ANTHROPIC_API_KEY=your-key
 | `retainEveryNTurns` | `10` | Retain every N turns (1 = every turn) |
 | `recallBudget` | `"mid"` | Recall depth: `"low"`, `"mid"`, `"high"` |
 | `recallMaxTokens` | `1024` | Max tokens for injected memories |
+| `recallMinScores` | `{}` | Optional score floors applied after recall, keyed by score field (for example `{"semantic": 0.65, "reranker": 0.2}`). Missing or `null` scores pass so BM25-only and passthrough-reranker hits are not accidentally suppressed. When a cross-encoder reranker is active, the `reranker` floor is the main precision gate; treat reranker scores as query-local and not calibrated across queries. |
 | `recallTimeout` | `10` | Timeout in seconds for recall API calls |
 | `dynamicBankId` | `false` | Separate bank per project/session |
 | `dynamicBankGranularity` | `["agent", "project"]` | Fields for dynamic bank ID |
@@ -128,4 +129,4 @@ This creates banks like `codex::my-project` automatically, using the working dir
 
 **Server not starting**: Set `hindsightApiUrl` to use an external server, or ensure `uvx` is on PATH for local daemon mode.
 
-**Hooks not firing**: Check that `~/.codex/config.toml` contains `hooks = true` under `[features]`, and that your Codex CLI version supports hooks (v0.116.0+).
+**Hooks not firing**: Check that `~/.codex/config.toml` contains `codex_hooks = true` under `[features]`, and that your Codex CLI version supports hooks (v0.116.0+).

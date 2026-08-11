@@ -32,6 +32,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class BankConfigPersistenceConflictError(ValueError):
+    """Raised when a validated bank config update can no longer be persisted."""
+
+    def __init__(self, bank_id: str):
+        self.bank_id = bank_id
+        super().__init__(f"Cannot update config for bank '{bank_id}': the bank does not exist")
+
+
 def _validate_retain_strategy_chunking(base_config: HindsightConfig, strategies: Any) -> None:
     """Validate retain strategy chunking with the same semantics as apply_strategy()."""
     if not isinstance(strategies, dict):
@@ -128,6 +136,22 @@ class ConfigResolver:
         # Return full config object (dataclass doesn't have __init__ that accepts kwargs, so we update the object)
         # Create a new config instance by copying the global config and updating fields
         resolved_config = HindsightConfig(**config_dict)
+        # Multi-LLM chains and the reranker failover chain are static credential fields
+        # (never tenant/bank-overridable), but asdict() above flattened their member
+        # dataclasses into plain dicts. Restore the original typed objects from the global
+        # config so the resolved object stays well-typed for any consumer that reads them.
+        resolved_config = replace(
+            resolved_config,
+            reranker_members=self._global_config.reranker_members,
+            llm_members=self._global_config.llm_members,
+            llm_strategy=self._global_config.llm_strategy,
+            retain_llm_members=self._global_config.retain_llm_members,
+            retain_llm_strategy=self._global_config.retain_llm_strategy,
+            reflect_llm_members=self._global_config.reflect_llm_members,
+            reflect_llm_strategy=self._global_config.reflect_llm_strategy,
+            consolidation_llm_members=self._global_config.consolidation_llm_members,
+            consolidation_llm_strategy=self._global_config.consolidation_llm_strategy,
+        )
         validate_retain_chunking_config(
             resolved_config.retain_chunk_size,
             resolved_config.retain_structured_chunk_size,
@@ -316,11 +340,17 @@ class ConfigResolver:
             logger.error(f"Failed to bulk-load bank configs: {e}")
         return result
 
-    async def update_bank_config(
-        self, bank_id: str, updates: dict[str, Any], context: RequestContext | None = None
-    ) -> None:
+    async def validate_bank_config_updates(
+        self,
+        bank_id: str,
+        updates: dict[str, Any],
+        context: RequestContext | None = None,
+        *,
+        projected_bank_overrides: dict[str, Any] | None = None,
+        check_permissions: bool = True,
+    ) -> dict[str, Any]:
         """
-        Update bank configuration overrides (with permission checking).
+        Normalize and validate bank configuration overrides.
 
         Args:
             bank_id: Bank identifier
@@ -329,9 +359,16 @@ class ConfigResolver:
                     or Python field format (llm_provider).
                     Only configurable fields are allowed.
             context: Request context for permission checking
+            projected_bank_overrides: Bank overrides to use as the validation
+                base instead of loading the current bank row.
+            check_permissions: Whether client field permissions apply to these
+                updates. Server-owned projected values set this to false.
+
+        Returns:
+            Normalized updates ready to persist.
 
         Raises:
-            ValueError: If attempting to override invalid/disallowed fields
+            ValueError: If attempting to override invalid/disallowed fields.
         """
         # Normalize keys
         normalized_updates = normalize_config_dict(updates)
@@ -363,7 +400,7 @@ class ConfigResolver:
                 )
 
         # PERMISSIONS: Check tenant/bank permissions
-        if self.tenant_extension and context:
+        if check_permissions and self.tenant_extension and context:
             try:
                 allowed_fields = await self.tenant_extension.get_allowed_config_fields(context, bank_id)
                 if allowed_fields is not None:  # None means "allow all"
@@ -373,7 +410,7 @@ class ConfigResolver:
                             f"Not allowed to modify fields: {sorted(disallowed)}. "
                             f"Your permissions allow: {sorted(list(allowed_fields)[:10])}..."
                             if allowed_fields
-                            else "Not allowed to modify fields: {sorted(disallowed)}. "
+                            else f"Not allowed to modify fields: {sorted(disallowed)}. "
                             "Your permissions do not allow any config modifications."
                         )
             except ValueError:
@@ -402,6 +439,9 @@ class ConfigResolver:
         # Validate recall budget fields
         _validate_recall_budget_updates(normalized_updates)
 
+        # Validate disposition trait fields (1-5 integer scale)
+        _validate_disposition_updates(normalized_updates)
+
         chunking_fields_updated = (
             "retain_chunk_size" in normalized_updates
             or "retain_structured_chunk_size" in normalized_updates
@@ -409,7 +449,11 @@ class ConfigResolver:
         )
         if chunking_fields_updated:
             config_dict = await self._resolve_parent_config_dict(bank_id, context)
-            active_bank_overrides = await self._load_bank_config(bank_id)
+            active_bank_overrides = (
+                await self._load_bank_config(bank_id)
+                if projected_bank_overrides is None
+                else dict(projected_bank_overrides)
+            )
             for key, value in normalized_updates.items():
                 if key not in self._configurable_fields:
                     continue
@@ -425,17 +469,26 @@ class ConfigResolver:
             )
             _validate_retain_strategy_chunking(base_config, base_config.retain_strategies)
 
-        # Persist the override. Banks are created lazily (on first retain), so a
-        # PATCH that precedes any ingestion would otherwise UPDATE zero rows and
-        # silently no-op while returning 200. Ensure the bank row exists first
-        # (this also creates its per-bank vector indexes), then merge defensively:
-        # COALESCE guards against a NULL config column (NULL || jsonb is NULL),
-        # which would drop the override even when a row is updated.
-        from .engine.retain.fact_storage import ensure_bank_exists
+        return normalized_updates
 
+    async def update_bank_config(
+        self, bank_id: str, updates: dict[str, Any], context: RequestContext | None = None
+    ) -> None:
+        """Validate and persist bank configuration overrides for an existing bank.
+
+        Bank creation belongs to ``MemoryEngine``; this raises ``ValueError`` if
+        the bank does not exist rather than silently discarding the overrides.
+        """
+        normalized_updates = await self.validate_bank_config_updates(bank_id, updates, context)
+        await self._persist_bank_config(bank_id, normalized_updates)
+
+    async def _persist_bank_config(self, bank_id: str, normalized_updates: dict[str, Any]) -> None:
+        """Persist already-validated overrides without changing bank lifecycle state."""
+        # Bank lifecycle belongs to MemoryEngine. Callers must create the row
+        # before reaching this persistence step. COALESCE guards against a NULL
+        # config column (NULL || jsonb is NULL), which would drop the override.
         async with self._backend.acquire() as conn:
-            await ensure_bank_exists(conn, bank_id, ops=self._backend.ops)
-            await conn.execute(
+            result = await conn.execute(
                 f"""
                 UPDATE {fq_table("banks")}
                 SET config = COALESCE(config, '{{}}'::jsonb) || $1::jsonb,
@@ -445,6 +498,14 @@ class ConfigResolver:
                 json.dumps(normalized_updates),
                 bank_id,
             )
+
+        # A missing bank row matches zero rows, which would otherwise persist
+        # nothing while reporting success. Fail loudly instead: reaching here
+        # without the row means a caller skipped the engine's provisioning step.
+        # (The Oracle wrapper reshapes rowcount into the same "UPDATE <n>" form.)
+        updated = int(result.split()[-1]) if isinstance(result, str) and result.startswith("UPDATE") else 0
+        if updated == 0:
+            raise BankConfigPersistenceConflictError(bank_id)
 
         logger.info(f"Updated bank config for {bank_id}: {list(normalized_updates.keys())}")
 
@@ -514,6 +575,31 @@ def _validate_recall_budget_updates(updates: dict[str, Any]) -> None:
                 f"recall_budget_min ({updates['recall_budget_min']}) must be <= "
                 f"recall_budget_max ({updates['recall_budget_max']})"
             )
+
+
+_DISPOSITION_KEYS = (
+    "disposition_skepticism",
+    "disposition_literalism",
+    "disposition_empathy",
+)
+
+
+def _validate_disposition_updates(updates: dict[str, Any]) -> None:
+    """Validate disposition trait config updates. Raises ValueError on invalid input.
+
+    Each trait is an integer on a 1-5 scale (or None to clear the per-bank
+    override). The read overlay injects the stored value verbatim into a strict
+    ``DispositionTraits(int, ge=1, le=5)``; an out-of-contract value (a float, a
+    0-1 scale, or an int outside 1-5) accepted here would later 500 the whole
+    bank list when any bank profile is serialized (issue #2348).
+    """
+    for key in _DISPOSITION_KEYS:
+        if key in updates:
+            value = updates[key]
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or not (1 <= value <= 5):
+                raise ValueError(f"{key} must be an integer between 1 and 5, got {value!r}")
 
 
 def apply_strategy(config: HindsightConfig, strategy_name: str) -> HindsightConfig:

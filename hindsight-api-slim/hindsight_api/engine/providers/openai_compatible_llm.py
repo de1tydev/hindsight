@@ -26,9 +26,10 @@ import logging
 import os
 import re
 import time
+from contextlib import AbstractAsyncContextManager, nullcontext
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 import httpx
@@ -36,8 +37,18 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI, LengthFinish
 
 from hindsight_api.config import DEFAULT_LLM_TIMEOUT, ENV_LLM_TIMEOUT
 from hindsight_api.engine.bank_attribution import apply_bank_attribution
-from hindsight_api.engine.llm_interface import LLMInterface, OutputTooLongError, ProviderRateLimitResetError
+from hindsight_api.engine.llm_interface import (
+    LLM_TOOL_CHOICE_AUTO,
+    LLMInterface,
+    LLMToolChoice,
+    LLMToolChoiceMode,
+    OutputTooLongError,
+    ProviderRateLimitResetError,
+)
+from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
+from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from hindsight_api.engine.structured_output import strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
 
@@ -46,16 +57,56 @@ logger = logging.getLogger(__name__)
 # Seed applied to every Groq request for deterministic behavior
 DEFAULT_LLM_SEED = 4242
 JSON_MODE_USER_HINT = "Return valid json only."
+DEFAULT_VERIFICATION_MAX_COMPLETION_TOKENS = 512
 
-# Self-hosted OpenAI-compatible servers that advertise tool_choice="required"
+
+def _validate_ollama_num_ctx(value: Any) -> int | None:
+    """Validate a native Ollama context-window override."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"ollama_num_ctx must be a positive integer, got {value!r}")
+    if value < 1:
+        raise ValueError(f"ollama_num_ctx must be >= 1, got {value}")
+    return value
+
+
+# Provider implementations that advertise tool_choice="required"
 # but silently ignore it: instead of forcing a tool call they return
 # finish_reason "stop"/"tool_calls" with an EMPTY tool_calls array and no error.
 # Reflect's agent loop then sees no tool call, runs synthesis with no retrieval,
 # and answers "I don't have information" even when the bank holds the answer.
 # See issues #1563 (LM Studio), #1179 (LM Studio + Qwen), #1877 (vLLM with
-# --enable-auto-tool-choice). llama-server (the "llamacpp" provider) honors
-# "required" correctly and is intentionally excluded (#1179).
+# --enable-auto-tool-choice). The generic OpenAI provider is intentionally not
+# inferred from its URL: custom OpenAI-compatible endpoints can implement the
+# required-tool contract, and silently downgrading them changes request semantics.
+# llama-server (the "llamacpp" provider) honors "required" correctly and is
+# intentionally excluded (#1179).
 _TOOL_CHOICE_REQUIRED_UNSUPPORTED_PROVIDERS = frozenset({"lmstudio", "ollama"})
+
+# Local providers whose OpenAI-compatible surface always lives under a `/v1`
+# path (LM Studio: http://localhost:1234/v1, Ollama: http://localhost:11434/v1).
+# For these we know the exact endpoint shape, so a bare host base URL can be
+# normalized safely. Cloud/proxy endpoints are left untouched — their path is
+# provider-specific and must be supplied verbatim.
+_V1_PATH_LOCAL_PROVIDERS = frozenset({"lmstudio", "ollama"})
+
+
+def _ensure_v1_base_url(base_url: str) -> str:
+    """Append the OpenAI-compatible ``/v1`` prefix to a bare local base URL.
+
+    LM Studio's server UI advertises its address as ``http://localhost:1234``,
+    so users commonly set ``HINDSIGHT_API_LLM_BASE_URL`` to that bare host. The
+    OpenAI SDK then POSTs to ``<host>/chat/completions`` and LM Studio rejects it
+    with ``Unexpected endpoint or method`` — its OpenAI-compatible routes live
+    under ``/v1``. Only a base URL with no meaningful path (bare host or a lone
+    trailing slash) is rewritten; anything with an explicit path (e.g. a reverse
+    proxy mount or an already-correct ``/v1``) is returned unchanged. See #2922.
+    """
+    parsed = urlparse(base_url)
+    if parsed.path.strip("/"):
+        return base_url
+    return urlunparse(parsed._replace(path="/v1"))
 
 
 class ProviderResponseError(RuntimeError):
@@ -66,23 +117,68 @@ class ProviderResponseError(RuntimeError):
         self.retryable = retryable
 
 
+def _is_json(text: str) -> bool:
+    """True if ``text`` parses as a JSON value."""
+    try:
+        json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return True
+
+
+def _outer_json_span(content: str) -> str | None:
+    """Return the outermost ``{...}`` / ``[...]`` span if it parses as JSON, else None.
+
+    Fallback for responses where fences are partial/absent or the model wrapped
+    the JSON in surrounding prose. Only returned when it is valid JSON so callers
+    never receive a worse candidate than the raw content.
+    """
+    starts = [i for i in (content.find("{"), content.find("[")) if i >= 0]
+    ends = [i for i in (content.rfind("}"), content.rfind("]")) if i >= 0]
+    if not starts or not ends:
+        return None
+    start, end = min(starts), max(ends)
+    if end <= start:
+        return None
+    candidate = content[start : end + 1].strip()
+    return candidate if _is_json(candidate) else None
+
+
 def _strip_code_fences(content: str) -> str:
     """Strip markdown code fences from LLM response if present.
 
     Many LLM providers (MiniMax, some Ollama models, Claude via proxies)
     wrap JSON responses in ```json ... ``` fences even when json_object
-    response format is requested. This strips the fences while preserving
-    the JSON content inside. Returns the original content unchanged if
-    no fences are detected.
+    response format is requested. Fences are detected by line (a closing
+    ``` must sit alone on its line) so triple-backticks *inside* JSON string
+    values do not truncate the payload. When the stripped candidate is not
+    valid JSON (partial fence, prose-wrapped output, truncated response), fall
+    back to the outermost parseable JSON span. Returns the original content
+    unchanged if no better candidate is found.
     """
-    if "```" not in content:
-        return content
-    try:
-        if "```json" in content:
-            return content.split("```json")[1].split("```")[0].strip()
-        return content.split("```")[1].split("```")[0].strip()
-    except (IndexError, ValueError):
-        return content
+    candidate = content
+    if "```" in content:
+        lines = content.split("\n")
+        # Find first line that starts a code fence (``` optionally followed by language)
+        fence_start = next((i for i, line in enumerate(lines) if line.startswith("```")), None)
+        if fence_start is not None:
+            # Find matching closing fence (``` alone or with trailing whitespace)
+            fence_end = next(
+                (j for j in range(fence_start + 1, len(lines)) if lines[j].strip() == "```"),
+                None,
+            )
+            if fence_end is not None:
+                candidate = "\n".join(lines[fence_start + 1 : fence_end]).strip()
+
+    if _is_json(candidate):
+        return candidate
+
+    # Fence stripping did not yield valid JSON — try to recover the outer JSON span.
+    span = _outer_json_span(content)
+    if span is not None:
+        return span
+
+    return candidate
 
 
 # Reasoning/thinking tags emitted by extended-thinking models. Some providers
@@ -230,6 +326,21 @@ def _content_or_error(response: Any, *, provider: str, model: str, scope: str) -
             retryable=retryable,
         )
     return content, choice
+
+
+def _usage_from_openai_response(response: Any) -> LLMResponseUsage:
+    """Extract prompt/completion/cached token counts from an OpenAI-shaped usage block."""
+    usage = getattr(response, "usage", None)
+    input_tokens = (usage.prompt_tokens or 0) if usage else 0
+    output_tokens = (usage.completion_tokens or 0) if usage else 0
+    cached_tokens = 0
+    if usage and getattr(usage, "prompt_tokens_details", None):
+        cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+    return LLMResponseUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_tokens=cached_tokens,
+    )
 
 
 def _ensure_json_word_in_user_message(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -419,6 +530,8 @@ class OpenAICompatibleLLM(LLMInterface):
         timeout: float | None = None,
         groq_service_tier: str | None = None,
         extra_body: dict[str, Any] | None = None,
+        *,
+        ollama_num_ctx: int | None = None,
         **kwargs: Any,
     ):
         """
@@ -429,10 +542,15 @@ class OpenAICompatibleLLM(LLMInterface):
             api_key: API key (optional for ollama/lmstudio).
             base_url: Base URL for the API (uses defaults for groq/ollama/lmstudio if empty).
             model: Model name.
-            reasoning_effort: Reasoning effort level for supported models ("low", "medium", "high").
+            reasoning_effort: Reasoning effort level for supported models
+                ("none", "low", "medium", "high"). "none" is required when calling
+                function tools on some reasoning models, which reject every other
+                value — including omitting the parameter entirely.
             timeout: Request timeout in seconds (uses env var or 120s default).
             groq_service_tier: Groq service tier ("on_demand", "flex", "auto").
             extra_body: Extra body params merged into every API call.
+            ollama_num_ctx: Native Ollama context window override. None lets Ollama use
+                the model/server default.
             **kwargs: Additional provider-specific parameters.
         """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
@@ -449,8 +567,10 @@ class OpenAICompatibleLLM(LLMInterface):
             "deepseek",
             "volcano",
             "openrouter",
+            "requesty",
             "zai",
             "opencode-go",
+            "atlas",
             "fireworks",
         ]
         if self.provider not in valid_providers:
@@ -472,14 +592,23 @@ class OpenAICompatibleLLM(LLMInterface):
                 self.base_url = "https://api.deepseek.com"
             elif self.provider == "openrouter":
                 self.base_url = "https://openrouter.ai/api/v1"
+            elif self.provider == "requesty":
+                self.base_url = "https://router.requesty.ai/v1"
             elif self.provider == "zai":
                 self.base_url = "https://api.z.ai/api/coding/paas/v4"
             elif self.provider == "opencode-go":
                 self.base_url = "https://opencode.ai/zen/go/v1"
+            elif self.provider == "atlas":
+                self.base_url = "https://api.atlascloud.ai/v1"
             elif self.provider == "fireworks":
                 # OpenAI-compatible inference host (online path). The batch API
                 # lives on a separate control-plane host — see FireworksLLM.
                 self.base_url = "https://api.fireworks.ai/inference/v1"
+
+        # Normalize bare local base URLs (e.g. a user pasting the address shown
+        # in the LM Studio UI) so the OpenAI SDK targets the `/v1` routes. See #2922.
+        if self.provider in _V1_PATH_LOCAL_PROVIDERS and self.base_url:
+            self.base_url = _ensure_v1_base_url(self.base_url)
 
         # For ollama/lmstudio, use dummy key if not provided
         if self.provider in ("ollama", "lmstudio") and not self.api_key:
@@ -494,8 +623,10 @@ class OpenAICompatibleLLM(LLMInterface):
                 "minimax",
                 "deepseek",
                 "openrouter",
+                "requesty",
                 "zai",
                 "opencode-go",
+                "atlas",
                 "ollama-cloud",
             )
             and not self.api_key
@@ -505,6 +636,7 @@ class OpenAICompatibleLLM(LLMInterface):
         # Service tier configuration (from config, not env vars)
         self.groq_service_tier = groq_service_tier
         self.openai_service_tier = kwargs.get("openai_service_tier")
+        self.ollama_num_ctx = _validate_ollama_num_ctx(ollama_num_ctx)
         # User-configured extra body params (merged into every API call)
         self._config_extra_body = extra_body or {}
 
@@ -535,17 +667,17 @@ class OpenAICompatibleLLM(LLMInterface):
     def _drops_tool_choice_required(self) -> bool:
         """Whether this endpoint silently ignores ``tool_choice="required"``.
 
-        True for self-hosted OpenAI-compatible servers known to return an empty
-        tool_calls array for "required" instead of forcing a call (#1563/#1179/
-        #1877). Covers LM Studio / Ollama directly, plus any server reached via
-        the generic "openai" provider with a custom ``base_url`` (e.g. a local
-        vLLM endpoint). The real OpenAI API (no base_url override) honors
-        "required", and cloud providers keep their own default base_urls, so both
-        are left untouched.
+        Only explicitly identified provider implementations are classified as
+        unsupported. A custom base URL does not identify endpoint capabilities:
+        an OpenAI-compatible endpoint may correctly enforce required tool calls,
+        and replacing ``required`` with ``auto`` would violate the caller's named
+        tool choice after the tools list has been narrowed.
         """
-        if self.provider in _TOOL_CHOICE_REQUIRED_UNSUPPORTED_PROVIDERS:
-            return True
-        return self.provider == "openai" and bool(self.base_url)
+        return self.provider in _TOOL_CHOICE_REQUIRED_UNSUPPORTED_PROVIDERS
+
+    def _verification_max_completion_tokens(self) -> int:
+        """Return the startup verification budget for OpenAI-compatible gateways."""
+        return DEFAULT_VERIFICATION_MAX_COMPLETION_TOKENS
 
     async def verify_connection(self) -> None:
         """
@@ -558,7 +690,7 @@ class OpenAICompatibleLLM(LLMInterface):
             logger.info(f"Verifying connection: {self.provider}/{self.model}")
             await self.call(
                 messages=[{"role": "user", "content": "Say 'ok'"}],
-                max_completion_tokens=100,
+                max_completion_tokens=self._verification_max_completion_tokens(),
                 max_retries=2,
                 initial_backoff=0.5,
                 max_backoff=2.0,
@@ -620,6 +752,11 @@ class OpenAICompatibleLLM(LLMInterface):
         # use the widely-supported max_tokens
         return "max_tokens"
 
+    def _apply_provider_extra_body_defaults(self, extra_body: dict[str, Any]) -> None:
+        """Apply provider-specific extra_body defaults while preserving user overrides."""
+        if self.provider == "minimax":
+            extra_body.setdefault("thinking", {"type": "disabled"})
+
     async def call(
         self,
         messages: list[dict[str, str]],
@@ -633,6 +770,7 @@ class OpenAICompatibleLLM(LLMInterface):
         skip_validation: bool = False,
         strict_schema: bool = False,
         return_usage: bool = False,
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> Any:
         """
         Make an LLM API call with retry logic.
@@ -673,6 +811,7 @@ class OpenAICompatibleLLM(LLMInterface):
                 skip_validation=skip_validation,
                 scope=scope,
                 return_usage=return_usage,
+                attempt_context=attempt_context,
             )
 
         start_time = time.time()
@@ -707,6 +846,7 @@ class OpenAICompatibleLLM(LLMInterface):
 
         # Provider-specific parameters
         extra_body: dict[str, Any] = {**self._config_extra_body}
+        self._apply_provider_extra_body_defaults(extra_body)
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
             # Add service_tier if configured
@@ -722,7 +862,7 @@ class OpenAICompatibleLLM(LLMInterface):
         if response_format is not None:
             schema = None
             if hasattr(response_format, "model_json_schema"):
-                schema = response_format.model_json_schema()
+                schema = strict_json_schema(response_format) if strict_schema else response_format.model_json_schema()
 
             if strict_schema and schema is not None:
                 # Use OpenAI's strict JSON schema enforcement
@@ -765,11 +905,14 @@ class OpenAICompatibleLLM(LLMInterface):
             # Surface attempt count in worker stage so JSON-schema retry loops
             # are visible from logs (small models on strict structured output
             # often loop here). Cheap no-op outside worker context.
-            if attempt > 0:
-                set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
             try:
                 if response_format is not None:
-                    response = await self._client.chat.completions.create(**call_params)
+                    async with attempt_context() if attempt_context is not None else nullcontext():
+                        set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
+                        response = await self._client.chat.completions.create(**call_params)
+                    # Stash usage before parse/validate, which may raise locally
+                    # even though the provider charged for these tokens (#2387).
+                    stash_response_usage(_usage_from_openai_response(response))
 
                     content, first_choice = _content_or_error(
                         response,
@@ -822,7 +965,10 @@ class OpenAICompatibleLLM(LLMInterface):
                     else:
                         result = response_format.model_validate(json_data)
                 else:
-                    response = await self._client.chat.completions.create(**call_params)
+                    async with attempt_context() if attempt_context is not None else nullcontext():
+                        set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
+                        response = await self._client.chat.completions.create(**call_params)
+                    stash_response_usage(_usage_from_openai_response(response))
                     result, first_choice = _content_or_error(
                         response,
                         provider=self.provider,
@@ -840,14 +986,27 @@ class OpenAICompatibleLLM(LLMInterface):
                 # Record token usage metrics
                 duration = time.time() - start_time
                 usage = response.usage
-                input_tokens = usage.prompt_tokens or 0 if usage else 0
-                output_tokens = usage.completion_tokens or 0 if usage else 0
+                response_usage = _usage_from_openai_response(response)
+                input_tokens = response_usage.input_tokens
+                output_tokens = response_usage.output_tokens
                 total_tokens = usage.total_tokens or 0 if usage else 0
-                cached_tokens = 0
-                if usage and getattr(usage, "prompt_tokens_details", None):
-                    cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+                cached_tokens = response_usage.cached_tokens
+                thoughts_tokens = 0
+                if usage and getattr(usage, "completion_tokens_details", None):
+                    thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+                # OpenAI-compatible providers fold reasoning tokens into
+                # ``completion_tokens`` (and thus ``total_tokens``), but the
+                # TokenUsage contract — and the Gemini provider — treat
+                # ``output_tokens``/``total_tokens`` as visible-only, surfacing
+                # reasoning separately in ``thoughts_tokens``. Subtract so the
+                # two fields don't double-count reasoning (cost over-attribution).
+                if thoughts_tokens:
+                    output_tokens = max(0, output_tokens - thoughts_tokens)
+                    total_tokens = max(0, total_tokens - thoughts_tokens)
 
-                # Record LLM metrics
+                # Record LLM metrics. ``output_tokens`` is visible-only by now, so
+                # ``thoughts_tokens`` has to be recorded alongside it or the reasoning
+                # half of the billed output reaches no counter at all.
                 metrics = get_metrics_collector()
                 metrics.record_llm_call(
                     provider=self.provider,
@@ -857,6 +1016,8 @@ class OpenAICompatibleLLM(LLMInterface):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     success=True,
+                    cached_input_tokens=cached_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
 
                 # Record trace span
@@ -894,6 +1055,7 @@ class OpenAICompatibleLLM(LLMInterface):
                         output_tokens=output_tokens,
                         total_tokens=total_tokens,
                         cached_tokens=cached_tokens,
+                        thoughts_tokens=thoughts_tokens,
                     )
                     return result, token_usage
                 return result
@@ -923,6 +1085,9 @@ class OpenAICompatibleLLM(LLMInterface):
                 if e.status_code in (401, 403):
                     logger.error(f"Auth error (HTTP {e.status_code}), not retrying: {str(e)}")
                     raise
+
+                # Diagnostic dump (opt-in) of the exact request behind any 4xx.
+                dump_request_on_4xx(scope=scope, provider=self.provider, model=self.model, err=e, request=call_params)
 
                 _raise_provider_quota_defer(
                     e, provider=self.provider, model=self.model, scope=scope, max_backoff=max_backoff
@@ -1014,7 +1179,8 @@ class OpenAICompatibleLLM(LLMInterface):
         max_retries: int = 5,
         initial_backoff: float = 1.0,
         max_backoff: float = 30.0,
-        tool_choice: str | dict[str, Any] = "auto",
+        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMToolCallResult:
         """
         Make an LLM API call with tool/function calling support.
@@ -1028,51 +1194,43 @@ class OpenAICompatibleLLM(LLMInterface):
             max_retries: Maximum retry attempts.
             initial_backoff: Initial backoff time in seconds.
             max_backoff: Maximum backoff time in seconds.
-            tool_choice: How to choose tools - "auto", "none", "required", or specific function.
+            tool_choice: Canonical tool-selection policy.
 
         Returns:
             LLMToolCallResult with content and/or tool_calls.
         """
         start_time = time.time()
 
-        request_tool_choice: str | dict[str, Any] | None = tool_choice
-
-        # Normalize named tool_choice dicts to "required" + filter tools.
-        # Some providers (e.g. LM Studio, Ollama) reject the OpenAI named format
-        # {"type": "function", "function": {"name": "..."}}.  The semantics are
-        # identical to tool_choice="required" with the tools list restricted to
-        # just the requested tool, so we apply that transformation where supported.
-        if isinstance(request_tool_choice, dict) and request_tool_choice.get("type") == "function":
-            forced_name = request_tool_choice.get("function", {}).get("name")
-            if forced_name:
-                filtered = [t for t in tools if t.get("function", {}).get("name") == forced_name]
-                if filtered:
-                    tools = filtered
-                request_tool_choice = "required"
+        request_tool_choice: str | None
+        if tool_choice.mode is LLMToolChoiceMode.NAMED:
+            forced_name = tool_choice.selected_function_name
+            filtered = [tool for tool in tools if tool.get("function", {}).get("name") == forced_name]
+            if len(filtered) != 1:
+                raise ValueError(
+                    f"Named tool_choice must reference exactly one declared tool; "
+                    f"found {len(filtered)} definitions for {forced_name!r}"
+                )
+            tools = filtered
+            request_tool_choice = LLMToolChoiceMode.REQUIRED.value
+        elif tool_choice.mode is LLMToolChoiceMode.AUTO:
+            request_tool_choice = None
+        else:
+            request_tool_choice = tool_choice.mode.value
 
         # DeepSeek accepts tool calls but rejects explicit required/named
         # tool_choice values. The tools list has already been narrowed for
         # forced calls, so omitting tool_choice preserves the practical behavior.
-        if "deepseek" in self.model.lower() and request_tool_choice != "auto":
+        if "deepseek" in self.model.lower() and tool_choice.mode is not LLMToolChoiceMode.AUTO:
             request_tool_choice = None
 
-        # "auto" is the OpenAI API default — omitting tool_choice is semantically
-        # identical. Some providers (e.g. DeepSeek's reasoner pathway, which
-        # deepseek-v4-flash falls into when thinking mode is enabled) reject the
-        # parameter outright, returning HTTP 400 even for value "auto". Sending it
-        # only when the caller asks for a non-default behaviour avoids those 400s
-        # without changing semantics for compliant providers.
-        if request_tool_choice == "auto":
-            request_tool_choice = None
-
-        # vLLM (--enable-auto-tool-choice), LM Studio, Ollama and similar
-        # self-hosted servers silently drop tool_choice="required", returning an
-        # empty tool_calls array instead of forcing a call (#1563/#1179/#1877).
+        # LM Studio and Ollama silently drop tool_choice="required", returning an
+        # empty tool_calls array instead of forcing a call (#1563/#1179).
         # Downgrade to auto (None) so the model still gets to call a tool. Named
         # tool_choice dicts were already normalized to "required" + a single
         # filtered tool above, so the call stays practically forced even under
-        # auto. The real OpenAI API honors "required" and is left untouched.
-        if request_tool_choice == "required" and self._drops_tool_choice_required():
+        # auto. Generic OpenAI-compatible endpoints retain the canonical
+        # ``required`` contract regardless of whether they use a custom base URL.
+        if request_tool_choice == LLMToolChoiceMode.REQUIRED.value and self._drops_tool_choice_required():
             request_tool_choice = None
 
         # DeepSeek tool-call replies can carry provider-specific reasoning_content.
@@ -1107,8 +1265,16 @@ class OpenAICompatibleLLM(LLMInterface):
                 temperature = max(0.01, min(temperature, 1.0))
             call_params["temperature"] = temperature
 
+        # Set reasoning_effort for reasoning models, matching call(). Omitting it
+        # here is not a neutral default: OpenAI rejects function tools on a
+        # reasoning model unless reasoning_effort is present and set to "none",
+        # so leaving it out fails exactly like sending an unsupported value.
+        if self._supports_reasoning_model():
+            call_params["reasoning_effort"] = self.reasoning_effort
+
         # Provider-specific parameters
         extra_body: dict[str, Any] = {**self._config_extra_body}
+        self._apply_provider_extra_body_defaults(extra_body)
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
         if extra_body:
@@ -1119,10 +1285,10 @@ class OpenAICompatibleLLM(LLMInterface):
         last_exception = None
 
         for attempt in range(max_retries + 1):
-            if attempt > 0:
-                set_stage(f"llm.{self.provider}.tools.attempt={attempt + 1}/{max_retries + 1}")
             try:
-                response = await self._client.chat.completions.create(**call_params)
+                async with attempt_context() if attempt_context is not None else nullcontext():
+                    set_stage(f"llm.{self.provider}.tools.attempt={attempt + 1}/{max_retries + 1}")
+                    response = await self._client.chat.completions.create(**call_params)
 
                 message = response.choices[0].message
                 finish_reason = response.choices[0].finish_reason
@@ -1144,7 +1310,20 @@ class OpenAICompatibleLLM(LLMInterface):
                 usage = response.usage
                 input_tokens = usage.prompt_tokens or 0 if usage else 0
                 output_tokens = usage.completion_tokens or 0 if usage else 0
+                cached_tokens = 0
+                if usage and getattr(usage, "prompt_tokens_details", None):
+                    cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+                thoughts_tokens = 0
+                if usage and getattr(usage, "completion_tokens_details", None):
+                    thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+                # See ``call()``: OpenAI-compatible ``completion_tokens`` includes
+                # reasoning, so make ``output_tokens`` visible-only to avoid
+                # double-counting it against ``thoughts_tokens``.
+                if thoughts_tokens:
+                    output_tokens = max(0, output_tokens - thoughts_tokens)
 
+                # See ``call()``: record the reasoning and cached counts too, so no
+                # billed token is dropped from the metrics counters.
                 metrics = get_metrics_collector()
                 metrics.record_llm_call(
                     provider=self.provider,
@@ -1154,6 +1333,8 @@ class OpenAICompatibleLLM(LLMInterface):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     success=True,
+                    cached_input_tokens=cached_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
 
                 # Record OpenTelemetry span
@@ -1186,6 +1367,8 @@ class OpenAICompatibleLLM(LLMInterface):
                     finish_reason=finish_reason,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
 
             except APIConnectionError as e:
@@ -1213,6 +1396,10 @@ class OpenAICompatibleLLM(LLMInterface):
                         f"not retrying: {_summarize_status_error(e)}"
                     )
                     raise
+
+                # Diagnostic dump (opt-in) of the exact request behind any 4xx.
+                dump_request_on_4xx(scope=scope, provider=self.provider, model=self.model, err=e, request=call_params)
+
                 _raise_provider_quota_defer(
                     e, provider=self.provider, model=self.model, scope=scope, max_backoff=max_backoff
                 )
@@ -1249,6 +1436,7 @@ class OpenAICompatibleLLM(LLMInterface):
         skip_validation: bool,
         scope: str = "memory",
         return_usage: bool = False,
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> Any:
         """
         Call Ollama using native API with JSON schema enforcement.
@@ -1284,9 +1472,10 @@ class OpenAICompatibleLLM(LLMInterface):
 
         # Add optional parameters with optimized defaults for Ollama
         options: dict[str, Any] = {
-            "num_ctx": 16384,  # 16k context window for larger prompts
             "num_batch": 512,  # Optimal batch size for prompt processing
         }
+        if self.ollama_num_ctx is not None:
+            options["num_ctx"] = self.ollama_num_ctx
         if max_completion_tokens:
             options["num_predict"] = max_completion_tokens
         if temperature is not None:
@@ -1302,10 +1491,10 @@ class OpenAICompatibleLLM(LLMInterface):
 
         async with httpx.AsyncClient(timeout=300.0) as client:
             for attempt in range(max_retries + 1):
-                if attempt > 0:
-                    set_stage(f"llm.ollama_native.{scope}.attempt={attempt + 1}/{max_retries + 1}")
                 try:
-                    response = await client.post(native_url, json=payload, headers=headers)
+                    async with attempt_context() if attempt_context is not None else nullcontext():
+                        set_stage(f"llm.ollama_native.{scope}.attempt={attempt + 1}/{max_retries + 1}")
+                        response = await client.post(native_url, json=payload, headers=headers)
                     response.raise_for_status()
 
                     result = response.json()
@@ -1542,3 +1731,6 @@ class OpenAICompatibleLLM(LLMInterface):
         """Clean up resources (close OpenAI client connections)."""
         if hasattr(self, "_client") and self._client:
             await self._client.close()
+
+    def supports_attempt_scoped_concurrency(self) -> bool:
+        return True

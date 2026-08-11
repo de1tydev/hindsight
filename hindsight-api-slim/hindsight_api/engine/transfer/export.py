@@ -19,10 +19,14 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+from ..causal_links import CAUSAL_LINK_TYPES
 from ..db_utils import acquire_with_retry
 from ..schema import fq_table
 from .schema import (
+    CARRIED_HISTORY_TABLES,
+    HISTORY_TABLES,
     SCHEMA_VERSION,
+    BankRowsJSONEncoding,
     TransferCausalRelation,
     TransferChunk,
     TransferDocument,
@@ -71,9 +75,7 @@ _BANK_ROW_TABLES = ("banks", "mental_models", "directives", "webhooks")
 # keep their (id, bank_id) across export/import, so their refresh history can be
 # re-attached. The surrogate ``id`` is dropped on dump so the target reassigns it
 # (see _dump_history_rows); restored after its parent table (mental_models).
-_CARRIED_HISTORY_TABLES = ("mental_model_history",)
 # Operational history — only carried with include_history=True.
-_HISTORY_TABLES = ("audit_log", "llm_requests")
 # Intentionally never exported.
 _SKIP_TABLES = frozenset(
     {
@@ -86,6 +88,12 @@ _SKIP_TABLES = frozenset(
         # to fresh ids, so carrying them would only produce dangling associations.
         # Revert anything worth keeping on the source before migrating.
         "invalidated_memory_units",
+        # Knowledge-base folder/page tree (client-managed metadata over the carried
+        # mental models). Not carried yet: its self-referential parent_id FK needs a
+        # parents-first (topological) restore order, which the generic per-row
+        # _restore_rows doesn't provide — a follow-up. The mental models themselves
+        # ARE carried, so the target can recreate the tree.
+        "knowledge_pages",
     }
 )
 # Derived columns dropped from carried rows so the target regenerates them with
@@ -125,10 +133,9 @@ class _LoadedExport:
     unit_index: dict[Any, _UnitLocation] = field(default_factory=dict)
 
 
-# Causal link types that retain persists between facts. Only these travel in the
-# archive; temporal/semantic/entity links are regenerated against the target bank.
-_CAUSAL_LINK_TYPES = ("caused_by", "causes", "enables", "prevents")
-
+# Retain currently writes only ``caused_by``. The legacy types stay in archives
+# so importing a historical bank preserves its graph; temporal/semantic/entity
+# links are regenerated against the target bank.
 # Facts of these types are exported; observations are derived and excluded.
 _EXPORTED_FACT_TYPES = ("world", "experience")
 
@@ -138,7 +145,12 @@ def _as_jsonb(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, str):
-        return json.loads(value)
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            # Admin connections register a JSONB decoder, so a valid scalar such
+            # as `"combined"` arrives here as the already-decoded `combined`.
+            return value
     return value
 
 
@@ -187,7 +199,12 @@ async def export_documents(
         raise ValueError("include_observations is only supported when exporting the whole bank (omit document_id)")
 
     async with acquire_with_retry(backend) as conn:
-        loaded = await _load_documents(conn, bank_id, document_ids)
+        # Carry per-fact consolidation lifecycle exactly when observations are
+        # carried: with observations in the archive the target must NOT re-derive
+        # them, so imported facts keep their consolidated/failed state. Without
+        # observations (the default document export) the target re-consolidates
+        # from scratch, so lifecycle is deliberately dropped.
+        loaded = await _load_documents(conn, bank_id, document_ids, include_lifecycle=include_observations)
         documents = loaded.documents
         observations = await _load_observations(conn, bank_id, loaded.unit_index) if include_observations else []
 
@@ -266,7 +283,13 @@ async def _dump_history_rows(conn: Any, table: str, bank_id: str) -> list[dict]:
     return [{k: v for k, v in dict(row).items() if k not in _DERIVED_COLUMNS and k != "id"} for row in rows]
 
 
-async def export_bank(conn: Any, bank_id: str, *, include_history: bool = False) -> bytes:
+async def export_bank(
+    conn: Any,
+    bank_id: str,
+    *,
+    include_history: bool = False,
+    bank_rows_json_encoding: BankRowsJSONEncoding = "serialized",
+) -> bytes:
     """Export an entire bank into a portable ZIP archive (no embeddings).
 
     Produces a superset of the documents archive: the logical
@@ -281,17 +304,19 @@ async def export_bank(conn: Any, bank_id: str, *, include_history: bool = False)
     ``_current_schema`` and passes its raw connection; the engine acquires one
     after tenant auth).
     """
-    loaded = await _load_documents(conn, bank_id, None)
+    # Whole-bank export always carries observations (they're bank-level state)
+    # and, with them, the per-fact consolidation lifecycle so the target restores
+    # exact eligibility instead of re-consolidating historical facts (#2965).
+    loaded = await _load_documents(conn, bank_id, None, include_lifecycle=True)
     documents = loaded.documents
-    # Whole-bank export always carries observations (they're bank-level state).
     observations = await _load_observations(conn, bank_id, loaded.unit_index)
 
     bank_rows = {table: await _dump_bank_rows(conn, table, bank_id) for table in _BANK_ROW_TABLES}
-    for table in _CARRIED_HISTORY_TABLES:
+    for table in CARRIED_HISTORY_TABLES:
         bank_rows[table] = await _dump_history_rows(conn, table, bank_id)
     history_rows: dict[str, list[dict]] = {}
     if include_history:
-        history_rows = {table: await _dump_bank_rows(conn, table, bank_id) for table in _HISTORY_TABLES}
+        history_rows = {table: await _dump_bank_rows(conn, table, bank_id) for table in HISTORY_TABLES}
 
     archive = io.BytesIO()
     fact_total = 0
@@ -321,6 +346,7 @@ async def export_bank(conn: Any, bank_id: str, *, include_history: bool = False)
             directive_count=len(bank_rows.get("directives", [])),
             webhook_count=len(bank_rows.get("webhooks", [])),
             includes_history=include_history,
+            bank_rows_json_encoding=bank_rows_json_encoding,
         )
         zf.writestr("manifest.json", manifest.model_dump_json(indent=2))
 
@@ -343,6 +369,7 @@ async def _load_documents(
     conn: Any,
     bank_id: str,
     document_ids: list[str] | None,
+    include_lifecycle: bool = False,
 ) -> _LoadedExport:
     """Load and assemble TransferDocument payloads for the requested documents."""
     doc_filter = "AND id = ANY($2)" if document_ids else ""
@@ -364,7 +391,7 @@ async def _load_documents(
     selected_ids = [row["id"] for row in doc_rows]
 
     chunks_by_doc = await _load_chunks(conn, bank_id, selected_ids)
-    loaded = await _load_facts(conn, bank_id, selected_ids)
+    loaded = await _load_facts(conn, bank_id, selected_ids, include_lifecycle=include_lifecycle)
     await _attach_entities(conn, loaded)
     await _attach_causal_relations(conn, loaded)
 
@@ -459,17 +486,22 @@ async def _load_chunks(conn: Any, bank_id: str, doc_ids: list[str]) -> dict[str,
     return chunks_by_doc
 
 
-async def _load_facts(conn: Any, bank_id: str, doc_ids: list[str]) -> _LoadedFacts:
+async def _load_facts(conn: Any, bank_id: str, doc_ids: list[str], include_lifecycle: bool = False) -> _LoadedFacts:
     """Load non-observation facts grouped by document, with a unit-id location index.
 
     The ordering is fixed (created_at, id) so that
     ``causal_relations.target_fact_index`` ordinals stay consistent.
+
+    ``include_lifecycle`` carries each fact's ``created_at`` / ``consolidated_at`` /
+    ``consolidation_failed_at`` (whole-bank / with-observations export). It is left
+    off for the plain document export so the target re-consolidates from scratch.
     """
     rows = await conn.fetch(
         f"""
         SELECT id, document_id, text, fact_type, context, event_date,
                occurred_start, occurred_end, mentioned_at, metadata,
-               chunk_id, tags, observation_scopes
+               chunk_id, tags, observation_scopes,
+               created_at, consolidated_at, consolidation_failed_at
         FROM {fq_table("memory_units")}
         WHERE bank_id = $1
           AND document_id = ANY($2)
@@ -498,6 +530,9 @@ async def _load_facts(conn: Any, bank_id: str, doc_ids: list[str]) -> _LoadedFac
             tags=list(row["tags"] or []),
             observation_scopes=_as_jsonb(row["observation_scopes"]),
             chunk_index=_chunk_index_from_chunk_id(row["chunk_id"]),
+            created_at=row["created_at"] if include_lifecycle else None,
+            consolidated_at=row["consolidated_at"] if include_lifecycle else None,
+            consolidation_failed_at=row["consolidation_failed_at"] if include_lifecycle else None,
         )
         bucket.append(fact)
         loaded.unit_index[row["id"]] = _UnitLocation(document_id=doc_id, ordinal=ordinal)
@@ -543,7 +578,7 @@ async def _attach_causal_relations(conn: Any, loaded: _LoadedFacts) -> None:
           AND from_unit_id = ANY($2)
           AND to_unit_id = ANY($2)
         """,
-        list(_CAUSAL_LINK_TYPES),
+        list(CAUSAL_LINK_TYPES),
         list(loaded.unit_index.keys()),
     )
     for row in rows:

@@ -15,6 +15,7 @@ from typing import Any
 import asyncpg  # noqa: F401
 
 from .base import DatabaseBackend, DatabaseConnection
+from .pool_instrumentation import PoolStats, instrument_acquire
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,8 @@ class PostgreSQLBackend(DatabaseBackend):
 
     def __init__(self) -> None:
         self._pool: asyncpg.Pool | None = None
+        self._acquire_warn_threshold_s: float = 1.0
+        self._acquire_timeout_s: float | None = None
 
     async def initialize(
         self,
@@ -88,6 +91,16 @@ class PostgreSQLBackend(DatabaseBackend):
         statement_cache_size: int = 0,
         init_callback: Any | None = None,
     ) -> None:
+        from ...config import get_config
+
+        self._acquire_warn_threshold_s = get_config().db_acquire_warn_threshold_ms / 1000.0
+        # Kept for acquire() below: asyncpg's ``timeout`` create_pool kwarg is a
+        # *connect* kwarg (how long establishing a new connection may take), and
+        # ``Pool.acquire()`` defaults to waiting for a free connection forever.
+        # Passing it here alone made HINDSIGHT_API_DB_ACQUIRE_TIMEOUT a no-op for
+        # the wait it names: a pool-exhaustion stall never surfaced as an error,
+        # it just hung (#3002). 0 restores the unbounded behaviour.
+        self._acquire_timeout_s = acquire_timeout if acquire_timeout > 0 else None
         self._pool = await asyncpg.create_pool(
             dsn,
             min_size=min_size,
@@ -95,7 +108,12 @@ class PostgreSQLBackend(DatabaseBackend):
             command_timeout=command_timeout,
             statement_cache_size=statement_cache_size,
             timeout=acquire_timeout,
+            # init runs once per new connection; setup runs on every acquire,
+            # after asyncpg's release-time RESET ALL. Passing init_callback as
+            # both keeps the per-connection session GUCs (hnsw.ef_search, etc.)
+            # applied after a connection is reused, not just on first creation.
             init=init_callback,
+            setup=init_callback,
         )
         logger.info(
             f"PostgreSQL pool created (min={min_size}, max={max_size}, "
@@ -103,21 +121,45 @@ class PostgreSQLBackend(DatabaseBackend):
         )
 
     async def shutdown(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
+        # Drop the reference *before* awaiting close(): closing is not
+        # instantaneous, and anything acquiring during that window would
+        # otherwise get an asyncpg "pool is closing" error rather than seeing
+        # is_ready False.
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            await pool.close()
             logger.info("PostgreSQL pool closed")
+
+    @property
+    def is_ready(self) -> bool:
+        return self._pool is not None
+
+    def _pool_stats(self) -> PoolStats | None:
+        """Snapshot for slow-acquire logs. in_use = live connections minus idle ones."""
+        pool = self._pool
+        if pool is None:
+            return None
+        idle = pool.get_idle_size()
+        return PoolStats(in_use=pool.get_size() - idle, max=pool.get_max_size(), idle=idle)
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[PostgresConnection]:
         pool = self._ensure_pool()
-        async with pool.acquire() as conn:
+        async with instrument_acquire(
+            pool.acquire(timeout=self._acquire_timeout_s),
+            pool_stats=self._pool_stats,
+            warn_threshold_s=self._acquire_warn_threshold_s,
+        ) as conn:
             yield PostgresConnection(conn)
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[PostgresConnection]:
         pool = self._ensure_pool()
-        async with pool.acquire() as conn:
+        async with instrument_acquire(
+            pool.acquire(timeout=self._acquire_timeout_s),
+            pool_stats=self._pool_stats,
+            warn_threshold_s=self._acquire_warn_threshold_s,
+        ) as conn:
             async with conn.transaction():
                 yield PostgresConnection(conn)
 

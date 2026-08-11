@@ -38,6 +38,20 @@ export interface WebhookHttpConfig {
   params: Record<string, string>;
 }
 
+export interface KnowledgeNode {
+  id: string;
+  kind: "folder" | "page";
+  name: string;
+  parent_id: string | null;
+  mental_model_id: string | null;
+  managed: boolean;
+  description: string | null;
+  tags: string[];
+  timestamp: string | null;
+  is_stale: boolean | null;
+  children: KnowledgeNode[];
+}
+
 export interface Webhook {
   id: string;
   bank_id: string | null;
@@ -187,6 +201,7 @@ export interface MentalModel {
   trigger: {
     mode?: "full" | "delta";
     refresh_after_consolidation: boolean;
+    refresh_cron?: string | null;
     fact_types?: Array<"world" | "experience" | "observation">;
     exclude_mental_models?: boolean;
     exclude_mental_model_ids?: string[];
@@ -195,11 +210,106 @@ export interface MentalModel {
     include_chunks?: boolean;
     recall_max_tokens?: number;
     recall_chunks_max_tokens?: number;
+    response_schema?: Record<string, unknown>;
+    keep_trace?: boolean;
   };
   last_refreshed_at: string;
   created_at: string;
   reflect_response?: any;
   is_stale?: boolean | null;
+}
+
+/** How a refresh resolved full-vs-delta, and why it did not stay in delta. */
+export type RefreshMode = "full" | "delta";
+
+export type ModeFallbackReason =
+  | "no_baseline_content"
+  | "source_query_changed"
+  | "structured_doc_unreadable"
+  | "delta_ops_failed"
+  | "delta_ops_all_skipped";
+
+export type RefreshOutcome =
+  | "content_written"
+  | "content_preserved_no_new_facts"
+  | "refresh_failed_empty_candidate"
+  | "refresh_failed_delta_not_applied";
+
+export interface MentalModelRefreshScope {
+  tags?: string[] | null;
+  tags_match: TagsMatch;
+  tag_groups?: TagGroup[] | null;
+  fact_types?: string[] | null;
+  exclude_mental_models: boolean;
+  exclude_mental_model_ids: string[];
+}
+
+export interface MentalModelRefreshWindow {
+  created_after?: string | null;
+  created_before: string;
+  watermark?: string | null;
+}
+
+export interface MentalModelFactCounts {
+  retrieved: Record<string, number>;
+  used: Record<string, number>;
+}
+
+export interface MentalModelDeltaOperations {
+  applied: Array<Record<string, any>>;
+  skipped: Array<Record<string, any>>;
+}
+
+/**
+ * Shaped like reflect's trace: the calls the agent made plus the refresh
+ * decision. The evidence lives in reflect_response.based_on, and the resolved
+ * scope and window are returned by the dry run rather than persisted.
+ */
+export interface MentalModelRefreshTrace {
+  recorded_at?: string | null;
+  effective_mode: RefreshMode;
+  mode_fallback_reason?: ModeFallbackReason | null;
+  outcome: RefreshOutcome;
+  tool_calls: Array<{
+    tool: string;
+    reason?: string | null;
+    input: Record<string, any>;
+    /** Only present on a dry run; the persisted trace keeps result_count instead. */
+    output?: Record<string, any> | null;
+    /** The delta watermark given to this call; null when the tool applies no time bound. */
+    updated_at?: string | null;
+    result_count?: number | null;
+    duration_ms: number;
+    iteration: number;
+  }>;
+  llm_calls: Array<{ scope: string; duration_ms: number }>;
+  delta_operations?: MentalModelDeltaOperations | null;
+  usage?: { input_tokens: number; output_tokens: number; total_tokens: number } | null;
+  duration_ms: number;
+  warnings: string[];
+}
+
+export interface MentalModelDryRunRefreshResult {
+  mental_model_id: string;
+  name: string;
+  requested_mode: RefreshMode;
+  effective_mode: RefreshMode;
+  mode_fallback_reason?: ModeFallbackReason | null;
+  outcome: RefreshOutcome;
+  would_persist: boolean;
+  scope: MentalModelRefreshScope;
+  window: MentalModelRefreshWindow;
+  facts: MentalModelFactCounts;
+  based_on: Record<string, Array<Record<string, unknown>>>;
+  current_content: string;
+  candidate_content: string;
+  preview_content: string;
+  diff: string;
+  delta_operations?: MentalModelDeltaOperations | null;
+  trace: MentalModelRefreshTrace;
+  usage: { input_tokens: number; output_tokens: number; total_tokens: number };
+  duration_ms: number;
+  warnings: string[];
 }
 
 export interface BankTemplateImportResponse {
@@ -343,6 +453,7 @@ export class ControlPlaneClient {
   async recall(params: {
     query: string;
     types?: string[];
+    prefer_observations?: boolean;
     bank_id: string;
     budget?: string;
     max_tokens?: number;
@@ -355,6 +466,12 @@ export class ControlPlaneClient {
     query_timestamp?: string;
     tags?: string[];
     tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    min_scores?: {
+      semantic?: number | null;
+      keyword?: number | null;
+      reranker?: number | null;
+      final?: number | null;
+    };
   }) {
     return this.fetchApi("/api/recall", {
       method: "POST",
@@ -374,9 +491,11 @@ export class ControlPlaneClient {
     include_tool_calls?: boolean;
     tags?: string[];
     tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    apply_all_directives?: boolean;
     fact_types?: Array<"world" | "experience" | "observation">;
     exclude_mental_models?: boolean;
     exclude_mental_model_ids?: string[];
+    response_schema?: Record<string, unknown>;
   }) {
     return this.fetchApi("/api/reflect", {
       method: "POST",
@@ -501,6 +620,7 @@ export class ControlPlaneClient {
         task_type: string;
         items_count: number;
         document_id: string | null;
+        filename?: string | null;
         created_at: string;
         updated_at?: string | null;
         status: string;
@@ -536,6 +656,19 @@ export class ControlPlaneClient {
       operation_id: string;
     }>(bankApi(bankId, `/operations/${encodeURIComponent(operationId)}`), {
       method: "POST",
+    });
+  }
+
+  /**
+   * Delete a terminal (failed/cancelled/completed) operation record
+   */
+  async deleteOperation(bankId: string, operationId: string) {
+    return this.fetchApi<{
+      success: boolean;
+      message: string;
+      operation_id: string;
+    }>(bankApi(bankId, `/operations/${encodeURIComponent(operationId)}`), {
+      method: "DELETE",
     });
   }
 
@@ -585,6 +718,115 @@ export class ControlPlaneClient {
   }
 
   /**
+   * Get the knowledge base as a nested folder/page tree.
+   */
+  async getKnowledgeTree(bankId: string) {
+    return this.fetchApi<{ roots: KnowledgeNode[] }>(
+      `/api/knowledge-base/tree?bank_id=${encodeURIComponent(bankId)}`
+    );
+  }
+
+  /**
+   * Hybrid search (BM25 + vector) across a bank's knowledge pages.
+   */
+  async searchKnowledgePages(bankId: string, q: string, limit = 10) {
+    return this.fetchApi<{
+      results: Array<{
+        id: string;
+        name: string;
+        mental_model_id: string | null;
+        snippet: string;
+        score: number;
+        updated_at: string | null;
+      }>;
+      total: number;
+    }>(
+      `/api/knowledge-base/search?bank_id=${encodeURIComponent(bankId)}&q=${encodeURIComponent(q)}&limit=${limit}`
+    );
+  }
+
+  /**
+   * Get a single knowledge page rendered as a markdown document.
+   */
+  async getKnowledgePage(bankId: string, pageId: string) {
+    return this.fetchApi<{
+      id: string;
+      name: string;
+      type: string;
+      description: string | null;
+      tags: string[];
+      timestamp: string | null;
+      body: string | null;
+      markdown: string;
+    }>(
+      `/api/knowledge-base/pages/${encodeURIComponent(pageId)}?bank_id=${encodeURIComponent(bankId)}`
+    );
+  }
+
+  /**
+   * Create a folder, optionally under a parent folder.
+   */
+  async createKnowledgeFolder(bankId: string, body: { name: string; parent_id?: string | null }) {
+    return this.fetchApi<KnowledgeNode>(
+      `/api/knowledge-base/folders?bank_id=${encodeURIComponent(bankId)}`,
+      { method: "POST", body: JSON.stringify(body) }
+    );
+  }
+
+  /**
+   * Create a page (mental model + tree node). Content is generated asynchronously.
+   */
+  async createKnowledgePage(
+    bankId: string,
+    body: { name: string; source_query: string; parent_id?: string | null; tags?: string[] }
+  ) {
+    return this.fetchApi<{ page_id: string; mental_model_id: string; operation_id: string | null }>(
+      `/api/knowledge-base/pages?bank_id=${encodeURIComponent(bankId)}`,
+      { method: "POST", body: JSON.stringify(body) }
+    );
+  }
+
+  /**
+   * Rename/move a node and/or update a page's options. Pass `parent_id: null`
+   * to move to the root. Changing `source_query` rebuilds the page's content.
+   */
+  async updateKnowledgeNode(
+    bankId: string,
+    nodeId: string,
+    body: {
+      name?: string;
+      parent_id?: string | null;
+      source_query?: string;
+      tags?: string[];
+      max_tokens?: number;
+    }
+  ) {
+    return this.fetchApi<KnowledgeNode>(
+      `/api/knowledge-base/nodes/${encodeURIComponent(nodeId)}?bank_id=${encodeURIComponent(bankId)}`,
+      { method: "PATCH", body: JSON.stringify(body) }
+    );
+  }
+
+  /**
+   * Delete a node and its whole subtree.
+   */
+  async deleteKnowledgeNode(bankId: string, nodeId: string) {
+    return this.fetchApi<{ status: string }>(
+      `/api/knowledge-base/nodes/${encodeURIComponent(nodeId)}?bank_id=${encodeURIComponent(bankId)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  /**
+   * Export the knowledge base as a portable markdown bundle (markdown files).
+   */
+  async exportKnowledgeBase(bankId: string) {
+    return this.fetchApi<{ files: Array<{ path: string; content: string }> }>(
+      `/api/knowledge-base/export?bank_id=${encodeURIComponent(bankId)}`
+    );
+  }
+
+  /**
    * Get entity details
    */
   async getEntity(entityId: string, bankId: string) {
@@ -594,24 +836,23 @@ export class ControlPlaneClient {
   }
 
   /**
-   * Regenerate entity observations
-   */
-  async regenerateEntityObservations(entityId: string, bankId: string) {
-    return this.fetchApi(
-      `/api/entities/${encodeURIComponent(entityId)}/regenerate?bank_id=${encodeURIComponent(bankId)}`,
-      {
-        method: "POST",
-      }
-    );
-  }
-
-  /**
    * List documents
    */
-  async listDocuments(params: { bank_id: string; q?: string; limit?: number; offset?: number }) {
+  async listDocuments(params: {
+    bank_id: string;
+    q?: string;
+    tags?: string[];
+    tags_match?: TagsMatch;
+    limit?: number;
+    offset?: number;
+  }) {
     const queryParams = new URLSearchParams();
     queryParams.append("bank_id", params.bank_id);
     if (params.q) queryParams.append("q", params.q);
+    for (const tag of params.tags ?? []) queryParams.append("tags", tag);
+    if (params.tags?.length && params.tags_match) {
+      queryParams.append("tags_match", params.tags_match);
+    }
     if (params.limit) queryParams.append("limit", params.limit.toString());
     if (params.offset) queryParams.append("offset", params.offset.toString());
     return this.fetchApi(`/api/documents?${queryParams}`);
@@ -750,6 +991,7 @@ export class ControlPlaneClient {
       consolidationState?: "failed" | "pending" | "done";
       state?: "valid" | "invalidated";
       documentId?: string;
+      entityId?: string;
       limit?: number;
       offset?: number;
     }
@@ -760,6 +1002,7 @@ export class ControlPlaneClient {
     if (options?.consolidationState) params.set("consolidation_state", options.consolidationState);
     if (options?.state) params.set("state", options.state);
     if (options?.documentId) params.set("document_id", options.documentId);
+    if (options?.entityId) params.set("entity_id", options.entityId);
     if (options?.limit !== undefined) params.set("limit", String(options.limit));
     if (options?.offset !== undefined) params.set("offset", String(options.offset));
     return this.fetchApi<{
@@ -846,6 +1089,9 @@ export class ControlPlaneClient {
       document_id: string | null;
       chunk_id: string | null;
       tags: string[];
+      // Inherited from the source document at retain time (so a memory knows
+      // which coding agent wrote it without fetching the document).
+      metadata: Record<string, unknown> | null;
       observation_scopes: string | string[][] | null;
       state: "valid" | "invalidated";
       invalidation_reason: string | null;
@@ -902,16 +1148,6 @@ export class ControlPlaneClient {
       mission: string;
       background?: string; // Deprecated, kept for backwards compatibility
     }>(`/api/profile/${encodeURIComponent(bankId)}`);
-  }
-
-  /**
-   * Set bank mission
-   */
-  async setBankMission(bankId: string, mission: string) {
-    return this.fetchApi(bankApi(bankId), {
-      method: "PATCH",
-      body: JSON.stringify({ mission }),
-    });
   }
 
   /**
@@ -1062,27 +1298,6 @@ export class ControlPlaneClient {
     }>(bankApi(bankId, `/operations/${encodeURIComponent(operationId)}${qs}`));
   }
 
-  /**
-   * Update bank profile
-   */
-  async updateBankProfile(
-    bankId: string,
-    profile: {
-      name?: string;
-      disposition?: {
-        skepticism: number;
-        literalism: number;
-        empathy: number;
-      };
-      mission?: string;
-    }
-  ) {
-    return this.fetchApi(`/api/profile/${encodeURIComponent(bankId)}`, {
-      method: "PUT",
-      body: JSON.stringify(profile),
-    });
-  }
-
   // ============= OBSERVATIONS (auto-consolidated, read-only) =============
 
   /**
@@ -1122,35 +1337,6 @@ export class ControlPlaneClient {
         updated_at: string;
       }>;
     }>(bankApi(bankId, `/observations${query ? `?${query}` : ""}`));
-  }
-
-  /**
-   * Get an observation with source memories
-   */
-  async getObservation(bankId: string, observationId: string) {
-    return this.fetchApi<{
-      id: string;
-      bank_id: string;
-      text: string;
-      proof_count: number;
-      history: Array<{
-        previous_text: string;
-        changed_at: string;
-        reason: string;
-      }>;
-      tags: string[];
-      source_memory_ids: string[];
-      source_memories: Array<{
-        id: string;
-        text: string;
-        type: string;
-        context?: string;
-        occurred_start?: string;
-        mentioned_at?: string;
-      }>;
-      created_at: string;
-      updated_at: string;
-    }>(bankApi(bankId, `/observations/${encodeURIComponent(observationId)}`));
   }
 
   /**
@@ -1196,15 +1382,36 @@ export class ControlPlaneClient {
   /**
    * List mental models for a bank
    */
-  async listMentalModels(bankId: string, tags?: string[], tagsMatch?: string) {
+  async listMentalModels(
+    bankId: string,
+    options: {
+      tags?: string[];
+      tagsMatch?: string;
+      /** Trim the payload: "metadata" drops content and the stored reflect response. */
+      detail?: "metadata" | "content" | "full";
+      limit?: number;
+      offset?: number;
+    } = {}
+  ) {
     const params = new URLSearchParams();
-    if (tags && tags.length > 0) {
-      tags.forEach((t) => params.append("tags", t));
+    if (options.tags && options.tags.length > 0) {
+      options.tags.forEach((t) => params.append("tags", t));
     }
-    if (tagsMatch) {
-      params.append("tags_match", tagsMatch);
+    if (options.tagsMatch) {
+      params.append("tags_match", options.tagsMatch);
+    }
+    if (options.detail) {
+      params.append("detail", options.detail);
+    }
+    if (options.limit !== undefined) {
+      params.append("limit", String(options.limit));
+    }
+    if (options.offset !== undefined) {
+      params.append("offset", String(options.offset));
     }
     const query = params.toString();
+    // Shape of the default detail="full"; lighter levels omit the fields below
+    // last_refreshed_at, so narrow the result when you ask for one.
     return this.fetchApi<{
       items: Array<{
         id: string;
@@ -1217,6 +1424,7 @@ export class ControlPlaneClient {
         trigger: {
           mode?: "full" | "delta";
           refresh_after_consolidation: boolean;
+          refresh_cron?: string | null;
           fact_types?: Array<"world" | "experience" | "observation">;
           exclude_mental_models?: boolean;
           exclude_mental_model_ids?: string[];
@@ -1225,6 +1433,8 @@ export class ControlPlaneClient {
           include_chunks?: boolean;
           recall_max_tokens?: number;
           recall_chunks_max_tokens?: number;
+          response_schema?: Record<string, unknown>;
+          keep_trace?: boolean;
         };
         last_refreshed_at: string;
         created_at: string;
@@ -1251,6 +1461,7 @@ export class ControlPlaneClient {
       trigger?: {
         mode?: "full" | "delta";
         refresh_after_consolidation: boolean;
+        refresh_cron?: string | null;
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
         exclude_mental_model_ids?: string[];
@@ -1259,6 +1470,8 @@ export class ControlPlaneClient {
         include_chunks?: boolean;
         recall_max_tokens?: number;
         recall_chunks_max_tokens?: number;
+        response_schema?: Record<string, unknown>;
+        keep_trace?: boolean;
       };
     }
   ) {
@@ -1293,6 +1506,7 @@ export class ControlPlaneClient {
       trigger?: {
         mode?: "full" | "delta";
         refresh_after_consolidation: boolean;
+        refresh_cron?: string | null;
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
         exclude_mental_model_ids?: string[];
@@ -1301,6 +1515,8 @@ export class ControlPlaneClient {
         include_chunks?: boolean;
         recall_max_tokens?: number;
         recall_chunks_max_tokens?: number;
+        response_schema?: Record<string, unknown>;
+        keep_trace?: boolean;
       };
     }
   ) {
@@ -1314,6 +1530,7 @@ export class ControlPlaneClient {
       max_tokens: number;
       trigger: {
         refresh_after_consolidation: boolean;
+        refresh_cron?: string | null;
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
         exclude_mental_model_ids?: string[];
@@ -1322,6 +1539,8 @@ export class ControlPlaneClient {
         include_chunks?: boolean;
         recall_max_tokens?: number;
         recall_chunks_max_tokens?: number;
+        response_schema?: Record<string, unknown>;
+        keep_trace?: boolean;
       };
       last_refreshed_at: string;
       created_at: string;
@@ -1353,6 +1572,21 @@ export class ControlPlaneClient {
     }>(bankApi(bankId, `/mental-models/${encodeURIComponent(mentalModelId)}/refresh`), {
       method: "POST",
     });
+  }
+
+  /**
+   * Preview a refresh without changing the model - the production refresh
+   * pipeline with the content and watermark writes skipped. Synchronous, and
+   * costs the same LLM tokens as a real refresh.
+   */
+  async dryRunRefreshMentalModel(
+    bankId: string,
+    mentalModelId: string
+  ): Promise<MentalModelDryRunRefreshResult> {
+    return this.fetchApi<MentalModelDryRunRefreshResult>(
+      bankApi(bankId, `/mental-models/${encodeURIComponent(mentalModelId)}/dry-run-refresh`),
+      { method: "POST" }
+    );
   }
 
   /**

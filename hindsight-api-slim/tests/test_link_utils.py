@@ -2,14 +2,13 @@
 
 import numpy as np
 import pytest
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
+from hindsight_api.config import DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY, clear_config_cache
 from hindsight_api.engine.retain.link_utils import (
     _normalize_datetime,
     _cap_links_per_unit,
-    compute_temporal_links,
-    compute_temporal_query_bounds,
     compute_semantic_links_ann,
     compute_semantic_links_within_batch,
     MAX_TEMPORAL_LINKS_PER_UNIT,
@@ -54,213 +53,6 @@ class TestNormalizeDatetime:
 
         # Should be able to compare without TypeError
         assert normalized_naive == normalized_aware
-
-
-class TestComputeTemporalQueryBounds:
-    """Tests for compute_temporal_query_bounds function."""
-
-    def test_empty_units_returns_none(self):
-        """Test that empty input returns (None, None)."""
-        min_date, max_date = compute_temporal_query_bounds({})
-        assert min_date is None
-        assert max_date is None
-
-    def test_single_unit_normal_date(self):
-        """Test bounds for a single unit with normal date."""
-        units = {"unit-1": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)}
-        min_date, max_date = compute_temporal_query_bounds(units, time_window_hours=24)
-
-        assert min_date == datetime(2024, 6, 14, 12, 0, 0, tzinfo=timezone.utc)
-        assert max_date == datetime(2024, 6, 16, 12, 0, 0, tzinfo=timezone.utc)
-
-    def test_multiple_units(self):
-        """Test bounds span across multiple units."""
-        units = {
-            "unit-1": datetime(2024, 6, 10, 12, 0, 0, tzinfo=timezone.utc),
-            "unit-2": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
-            "unit-3": datetime(2024, 6, 20, 12, 0, 0, tzinfo=timezone.utc),
-        }
-        min_date, max_date = compute_temporal_query_bounds(units, time_window_hours=24)
-
-        # min should be Jun 10 - 24h = Jun 9
-        assert min_date == datetime(2024, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
-        # max should be Jun 20 + 24h = Jun 21
-        assert max_date == datetime(2024, 6, 21, 12, 0, 0, tzinfo=timezone.utc)
-
-    def test_mixed_naive_and_aware_datetimes(self):
-        """Test that mixed naive/aware datetimes work correctly."""
-        units = {
-            "unit-1": datetime(2024, 6, 10, 12, 0, 0),  # naive
-            "unit-2": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc),  # aware
-        }
-        # Should not raise TypeError
-        min_date, max_date = compute_temporal_query_bounds(units, time_window_hours=24)
-
-        assert min_date is not None
-        assert max_date is not None
-        assert min_date.tzinfo is not None
-        assert max_date.tzinfo is not None
-
-    def test_overflow_near_datetime_min(self):
-        """Test overflow protection near datetime.min."""
-        units = {"unit-1": datetime(1, 1, 2, 0, 0, tzinfo=timezone.utc)}
-        min_date, max_date = compute_temporal_query_bounds(units, time_window_hours=48)
-
-        # Should handle overflow gracefully
-        assert min_date == datetime.min.replace(tzinfo=timezone.utc)
-        assert max_date is not None
-
-    def test_overflow_near_datetime_max(self):
-        """Test overflow protection near datetime.max."""
-        units = {"unit-1": datetime(9999, 12, 30, 0, 0, tzinfo=timezone.utc)}
-        min_date, max_date = compute_temporal_query_bounds(units, time_window_hours=48)
-
-        # Should handle overflow gracefully
-        assert min_date is not None
-        assert max_date == datetime.max.replace(tzinfo=timezone.utc)
-
-
-class TestComputeTemporalLinks:
-    """Tests for compute_temporal_links function."""
-
-    def test_empty_units_returns_empty(self):
-        """Test that empty input returns empty list."""
-        links = compute_temporal_links({}, [])
-        assert links == []
-
-    def test_no_candidates_returns_empty(self):
-        """Test that no candidates means no links."""
-        units = {"unit-1": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)}
-        links = compute_temporal_links(units, [])
-        assert links == []
-
-    def test_candidate_within_window_creates_link(self):
-        """Test that candidates within time window create links."""
-        units = {"unit-1": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)}
-        candidates = [
-            {"id": "candidate-1", "event_date": datetime(2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc)},
-        ]
-
-        links = compute_temporal_links(units, candidates, time_window_hours=24)
-
-        assert len(links) == 1
-        assert links[0][0] == "unit-1"
-        assert links[0][1] == "candidate-1"
-        assert links[0][2] == "temporal"
-        assert links[0][4] is None
-        # Weight should be high since they're close (2 hours apart)
-        assert links[0][3] > 0.9
-
-    def test_candidate_outside_window_no_link(self):
-        """Test that candidates outside time window don't create links."""
-        units = {"unit-1": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)}
-        candidates = [
-            {"id": "candidate-1", "event_date": datetime(2024, 6, 10, 12, 0, 0, tzinfo=timezone.utc)},
-        ]
-
-        links = compute_temporal_links(units, candidates, time_window_hours=24)
-
-        assert len(links) == 0
-
-    def test_weight_decreases_with_distance(self):
-        """Test that weight decreases as time difference increases."""
-        units = {"unit-1": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)}
-        candidates = [
-            {"id": "close", "event_date": datetime(2024, 6, 15, 11, 0, 0, tzinfo=timezone.utc)},  # 1 hour
-            {"id": "far", "event_date": datetime(2024, 6, 14, 18, 0, 0, tzinfo=timezone.utc)},  # 18 hours
-        ]
-
-        links = compute_temporal_links(units, candidates, time_window_hours=24)
-
-        assert len(links) == 2
-        close_link = next(l for l in links if l[1] == "close")
-        far_link = next(l for l in links if l[1] == "far")
-
-        assert close_link[3] > far_link[3]
-
-    def test_max_10_links_per_unit(self):
-        """Test that at most 10 links are created per unit."""
-        units = {"unit-1": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)}
-        # Create 15 candidates all within window
-        candidates = [
-            {"id": f"candidate-{i}", "event_date": datetime(2024, 6, 15, 11, 0, 0, tzinfo=timezone.utc)}
-            for i in range(15)
-        ]
-
-        links = compute_temporal_links(units, candidates, time_window_hours=24)
-
-        assert len(links) == 10
-
-    def test_multiple_units_multiple_candidates(self):
-        """Test with multiple units and candidates."""
-        units = {
-            "unit-1": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
-            "unit-2": datetime(2024, 6, 20, 12, 0, 0, tzinfo=timezone.utc),
-        }
-        candidates = [
-            {"id": "c1", "event_date": datetime(2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc)},  # near unit-1
-            {"id": "c2", "event_date": datetime(2024, 6, 20, 10, 0, 0, tzinfo=timezone.utc)},  # near unit-2
-            {"id": "c3", "event_date": datetime(2024, 6, 17, 12, 0, 0, tzinfo=timezone.utc)},  # between, near neither
-        ]
-
-        links = compute_temporal_links(units, candidates, time_window_hours=24)
-
-        # unit-1 should link to c1 only
-        # unit-2 should link to c2 only
-        unit1_links = [l for l in links if l[0] == "unit-1"]
-        unit2_links = [l for l in links if l[0] == "unit-2"]
-
-        assert len(unit1_links) == 1
-        assert unit1_links[0][1] == "c1"
-
-        assert len(unit2_links) == 1
-        assert unit2_links[0][1] == "c2"
-
-    def test_mixed_naive_and_aware_datetimes(self):
-        """Test that mixed naive/aware datetimes work correctly."""
-        units = {"unit-1": datetime(2024, 6, 15, 12, 0, 0)}  # naive
-        candidates = [
-            {"id": "c1", "event_date": datetime(2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc)},  # aware
-        ]
-
-        # Should not raise TypeError
-        links = compute_temporal_links(units, candidates, time_window_hours=24)
-        assert len(links) == 1
-
-    def test_overflow_near_datetime_min(self):
-        """Test overflow protection when unit date is near datetime.min."""
-        units = {"unit-1": datetime(1, 1, 2, 0, 0, tzinfo=timezone.utc)}
-        candidates = [
-            {"id": "c1", "event_date": datetime(1, 1, 1, 12, 0, 0, tzinfo=timezone.utc)},
-        ]
-
-        # Should not raise OverflowError
-        links = compute_temporal_links(units, candidates, time_window_hours=48)
-        assert len(links) == 1
-
-    def test_overflow_near_datetime_max(self):
-        """Test overflow protection when unit date is near datetime.max."""
-        units = {"unit-1": datetime(9999, 12, 30, 0, 0, tzinfo=timezone.utc)}
-        candidates = [
-            {"id": "c1", "event_date": datetime(9999, 12, 31, 12, 0, 0, tzinfo=timezone.utc)},
-        ]
-
-        # Should not raise OverflowError
-        links = compute_temporal_links(units, candidates, time_window_hours=48)
-        assert len(links) == 1
-
-    def test_weight_minimum_is_0_3(self):
-        """Test that weight doesn't go below 0.3."""
-        units = {"unit-1": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)}
-        candidates = [
-            # 23 hours apart - should be just within 24h window but low weight
-            {"id": "c1", "event_date": datetime(2024, 6, 14, 13, 0, 0, tzinfo=timezone.utc)},
-        ]
-
-        links = compute_temporal_links(units, candidates, time_window_hours=24)
-
-        assert len(links) == 1
-        assert links[0][3] >= 0.3
 
 
 class TestCapLinksPerUnit:
@@ -320,16 +112,34 @@ class TestComputeSemanticLinksWithinBatch:
     """
 
     def test_empty_returns_empty(self):
-        assert compute_semantic_links_within_batch([], []) == []
+        assert (
+            compute_semantic_links_within_batch(
+                [],
+                [],
+                threshold=DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY,
+            )
+            == []
+        )
 
     def test_single_unit_returns_empty(self):
         emb = [np.random.randn(384).tolist()]
-        assert compute_semantic_links_within_batch(["u1"], emb) == []
+        assert (
+            compute_semantic_links_within_batch(
+                ["u1"],
+                emb,
+                threshold=DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY,
+            )
+            == []
+        )
 
     def test_identical_embeddings_produce_links(self):
         """Two identical embeddings should have similarity=1.0 (above 0.7 threshold)."""
         emb = [0.1] * 384
-        links = compute_semantic_links_within_batch(["u1", "u2"], [emb, emb])
+        links = compute_semantic_links_within_batch(
+            ["u1", "u2"],
+            [emb, emb],
+            threshold=DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY,
+        )
         assert len(links) == 2  # bidirectional: u1→u2, u2→u1
         from_ids = {lnk[0] for lnk in links}
         to_ids = {lnk[1] for lnk in links}
@@ -344,8 +154,28 @@ class TestComputeSemanticLinksWithinBatch:
         """Orthogonal embeddings should have similarity=0 (below 0.7 threshold)."""
         emb1 = [1.0] + [0.0] * 383
         emb2 = [0.0] + [1.0] + [0.0] * 382
-        links = compute_semantic_links_within_batch(["u1", "u2"], [emb1, emb2])
+        links = compute_semantic_links_within_batch(
+            ["u1", "u2"],
+            [emb1, emb2],
+            threshold=DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY,
+        )
         assert len(links) == 0
+
+    def test_non_unit_embeddings_use_cosine_similarity(self):
+        """Vector magnitude must not turn a below-threshold cosine pair into a link."""
+        emb1 = [10.0, 0.0]
+        emb2 = [1.0, 1.0]
+
+        links = compute_semantic_links_within_batch(["u1", "u2"], [emb1, emb2], threshold=0.9)
+
+        assert links == []
+
+    @pytest.mark.parametrize("invalid", [[0.0, 0.0], [float("nan"), 1.0], [float("inf"), 1.0]])
+    def test_invalid_cosine_embeddings_do_not_link(self, invalid):
+        """Zero-norm and non-finite vectors have no defined cosine similarity."""
+        links = compute_semantic_links_within_batch(["invalid", "valid"], [invalid, [1.0, 0.0]], threshold=0.0)
+
+        assert links == []
 
     def test_respects_threshold(self):
         """Links below threshold should be excluded."""
@@ -383,7 +213,11 @@ class TestComputeSemanticLinksWithinBatch:
     def test_link_tuple_structure(self):
         """Verify the tuple format matches what _bulk_insert_links expects."""
         emb = [0.1] * 384
-        links = compute_semantic_links_within_batch(["u1", "u2"], [emb, emb])
+        links = compute_semantic_links_within_batch(
+            ["u1", "u2"],
+            [emb, emb],
+            threshold=DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY,
+        )
         for lnk in links:
             assert len(lnk) == 5
             from_id, to_id, link_type, weight, entity_id = lnk
@@ -407,6 +241,19 @@ class TestComputeSemanticLinksAnnPgBouncerSafety:
     `relation "_ann_seeds" does not exist` on the statement immediately
     following the CREATE TEMP TABLE.
     """
+
+    @pytest.fixture(autouse=True)
+    def _reset_config_cache(self):
+        # Tests below monkeypatch HINDSIGHT_API_VECTOR_EXTENSION. The ANN code
+        # path reads it through the process-global config cache, and monkeypatch
+        # reverts only the env var — not the cache. Left uncleared, a leaked
+        # "vchord" makes every later bank-creating test on the same xdist worker
+        # emit `USING vchordrq` against the pgvector-only test DB and fail with
+        # `access method "vchordrq" does not exist`. Clear before and after so
+        # the cache is rebuilt from the current env for each test.
+        clear_config_cache()
+        yield
+        clear_config_cache()
 
     @pytest.fixture
     def mock_conn(self):
@@ -432,6 +279,7 @@ class TestComputeSemanticLinksAnnPgBouncerSafety:
             bank_id="bank-1",
             unit_ids=[],
             embeddings=[],
+            threshold=DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY,
         )
         assert result == []
         mock_conn.transaction.assert_not_called()
@@ -448,6 +296,7 @@ class TestComputeSemanticLinksAnnPgBouncerSafety:
             unit_ids=["u1", "u2"],
             embeddings=[emb, emb],
             fact_types=["world", "world"],
+            threshold=DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY,
         )
 
         # Transaction context manager was entered.
@@ -469,6 +318,7 @@ class TestComputeSemanticLinksAnnPgBouncerSafety:
             unit_ids=["u1"],
             embeddings=[emb],
             fact_types=["world"],
+            threshold=DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY,
         )
 
         executed_sql = [call.args[0] for call in mock_conn.execute.call_args_list]
@@ -498,6 +348,7 @@ class TestComputeSemanticLinksAnnPgBouncerSafety:
             unit_ids=["u1"],
             embeddings=[emb],
             fact_types=["world"],
+            threshold=DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY,
         )
 
         executed_sql = [call.args[0] for call in mock_conn.execute.call_args_list]
@@ -525,6 +376,7 @@ class TestComputeSemanticLinksAnnPgBouncerSafety:
             unit_ids=["u1"],
             embeddings=[emb],
             fact_types=["world"],
+            threshold=DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY,
         )
 
         executed_sql = [call.args[0] for call in mock_conn.execute.call_args_list]
@@ -551,6 +403,7 @@ class TestComputeSemanticLinksAnnPgBouncerSafety:
             unit_ids=["u1"],
             embeddings=[emb],
             fact_types=["world"],
+            threshold=DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY,
         )
 
         executed_sql = [call.args[0] for call in mock_conn.execute.call_args_list]

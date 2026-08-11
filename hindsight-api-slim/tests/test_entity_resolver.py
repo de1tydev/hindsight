@@ -2,16 +2,18 @@
 Tests for EntityResolver edge cases.
 """
 
+import itertools
 import json
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from hindsight_api.engine.db import create_database_backend
 from hindsight_api.engine.db.result import DictResultRow as ResultRow
-from hindsight_api.engine.entity_resolver import EntityResolver
+from hindsight_api.engine.entity_resolver import EntityResolver, _canonical_cooccurrence_pairs
+from hindsight_api.engine.retain.types import ResolvedEntity
 from hindsight_api.pg0 import resolve_database_url
 
 # ---------------------------------------------------------------------------
@@ -59,6 +61,46 @@ async def test_discard_pending_stats_does_not_affect_other_task_keys():
     assert other_key in resolver._pending_cooccurrences, "other task's cooccurrences must be preserved"
 
 
+# ---------------------------------------------------------------------------
+# Unit tests for _canonical_cooccurrence_pairs() — no database required
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_cooccurrence_pairs_keeps_every_pair_when_input_is_unsorted():
+    """Every distinct pair must survive, whatever order the entities arrive in.
+
+    ["C", "A", "B"] is the minimal witness: ordering the second pair used to
+    swap the outer loop variable, so ("A", "C") was silently dropped.
+    """
+    pairs = list(_canonical_cooccurrence_pairs(["C", "A", "B"]))
+
+    assert set(pairs) == {("A", "B"), ("A", "C"), ("B", "C")}
+    assert len(pairs) == 3
+
+
+def test_canonical_cooccurrence_pairs_is_input_order_invariant():
+    """entity_list is built from a set, so its order is arbitrary per run: the
+    emitted pairs must not depend on it."""
+    expected = {("e1", "e2"), ("e1", "e3"), ("e1", "e4"), ("e2", "e3"), ("e2", "e4"), ("e3", "e4")}
+
+    for order in itertools.permutations(["e1", "e2", "e3", "e4"]):
+        assert set(_canonical_cooccurrence_pairs(list(order))) == expected, f"lost a pair for input order {order}"
+
+
+def test_canonical_cooccurrence_pairs_emits_canonical_order():
+    """Each pair must come out as (a, b) with a < b, the ordering the
+    entity_cooccurrences PK and check constraint require."""
+    for order in itertools.permutations(["e1", "e2", "e3"]):
+        for a, b in _canonical_cooccurrence_pairs(list(order)):
+            assert a < b, f"non-canonical pair {(a, b)} for input order {order}"
+
+
+def test_canonical_cooccurrence_pairs_skips_duplicates_and_short_input():
+    assert list(_canonical_cooccurrence_pairs(["e1", "e1"])) == []
+    assert list(_canonical_cooccurrence_pairs(["e1"])) == []
+    assert list(_canonical_cooccurrence_pairs([])) == []
+
+
 @pytest.mark.asyncio
 async def test_resolve_entities_batch_handles_unicode_lower_conflicts(pg0_db_url):
     """
@@ -85,7 +127,7 @@ async def test_resolve_entities_batch_handles_unicode_lower_conflicts(pg0_db_url
                 event_date,
             )
 
-            resolved_ids = await resolver.resolve_entities_batch(
+            resolved_entities = await resolver.resolve_entities_batch(
                 bank_id=bank_id,
                 entities_data=[
                     {
@@ -109,7 +151,7 @@ async def test_resolve_entities_batch_handles_unicode_lower_conflicts(pg0_db_url
                 bank_id,
             )
 
-        assert resolved_ids == [existing_entity_id]
+        assert resolved_entities == [ResolvedEntity(entity_id=existing_entity_id, canonical_name="İstanbul")]
         assert len(entity_rows) == 1
         assert entity_rows[0]["id"] == existing_entity_id
         assert entity_rows[0]["canonical_name"] == "İstanbul"
@@ -117,6 +159,95 @@ async def test_resolve_entities_batch_handles_unicode_lower_conflicts(pg0_db_url
         async with backend.acquire() as conn:
             await conn.execute("DELETE FROM entities WHERE bank_id = $1", bank_id)
         await backend.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_label_entities_stored_and_reasserted_with_label_kind(pg0_db_url):
+    """Label entities are created with entity_kind='label' and keep it through
+    the Phase-2 reassert.
+
+    The kind decides membership in the partial trigram index (#3208): a label
+    row resurrected as 'regular' would silently re-enter the index, so the
+    resurrect path is the interesting one to pin, not just the insert.
+    """
+    resolved_url = await resolve_database_url(pg0_db_url)
+    backend = create_database_backend("postgresql")
+    await backend.initialize(resolved_url, min_size=1, max_size=2, command_timeout=30)
+    bank_id = f"test-entity-kind-{uuid.uuid4().hex[:8]}"
+    # Free-text label group: any "topic:..." text classifies as a label.
+    entity_labels = [{"key": "topic", "type": "text", "description": "session topic"}]
+    resolver = EntityResolver(pool=backend, entity_lookup="trigram")
+
+    try:
+        async with backend.acquire() as conn:
+            resolved = await resolver.resolve_entities_batch(
+                bank_id=bank_id,
+                entities_data=[
+                    {"text": "topic:algebra", "nearby_entities": []},
+                    {"text": "Alice", "nearby_entities": []},
+                ],
+                context="entity kind storage",
+                unit_event_date=None,
+                conn=conn,
+                entity_labels=entity_labels,
+            )
+
+            async def _kinds_by_name():
+                rows = await conn.fetch("SELECT canonical_name, entity_kind FROM entities WHERE bank_id = $1", bank_id)
+                return {row["canonical_name"]: row["entity_kind"] for row in rows}
+
+            assert await _kinds_by_name() == {"topic:algebra": "label", "Alice": "regular"}
+            kinds_resolved = {e.canonical_name: e.entity_kind for e in resolved}
+            assert kinds_resolved == {"topic:algebra": "label", "Alice": "regular"}
+
+            # Simulate the prune-between-phases race: rows vanish after Phase-1
+            # resolution, then the Phase-2 reassert re-creates them.
+            await conn.execute("DELETE FROM entities WHERE bank_id = $1", bank_id)
+            await resolver.reassert_entities_batch(bank_id, resolved, conn)
+            assert await _kinds_by_name() == {"topic:algebra": "label", "Alice": "regular"}
+    finally:
+        async with backend.acquire() as conn:
+            await conn.execute("DELETE FROM entities WHERE bank_id = $1", bank_id)
+        await backend.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fuzzy_scoring_never_merges_regular_text_into_label_row():
+    """A regular text must not fuzzy-merge into a label row (#1558).
+
+    The trigram/UTL_MATCH probes exclude label rows in SQL (entity_kind
+    filter), but the "full" fallback strategy loads every bank entity, so the
+    Python scoring loop must skip label-classified candidates itself. The
+    candidate here would clear the 0.6 merge threshold on name similarity plus
+    temporal proximity if it weren't skipped.
+    """
+    from types import SimpleNamespace
+
+    from hindsight_api.engine.retain.entity_labels import build_labels_lookup, parse_entity_labels
+
+    now = datetime.now(timezone.utc)
+    labels_cfg = parse_entity_labels([{"key": "topic", "type": "text"}])
+    ops = SimpleNamespace(
+        bulk_insert_entities=AsyncMock(return_value={"topic empathy": "new-entity-id"}),
+        fetch_missing_entity_ids=AsyncMock(return_value=[]),
+    )
+    resolver = EntityResolver(pool=SimpleNamespace(ops=ops), entity_lookup="full")
+
+    resolved = await resolver._resolve_from_candidates(
+        conn=AsyncMock(),
+        bank_id="bank-1",
+        # "topic empathy" (no colon) is NOT a label text, so it goes through
+        # fuzzy scoring rather than the exact-match label branch.
+        entities_data=[{"text": "topic empathy", "nearby_entities": [], "event_date": now}],
+        unit_event_date=now,
+        all_candidates={"topic empathy": [("label-row-id", "topic:empathy", {}, now, 5)]},
+        cooccurrence_map={},
+        taxonomy_lookup=build_labels_lookup(labels_cfg),
+        labels_cfg=labels_cfg,
+    )
+
+    assert resolved == [ResolvedEntity(entity_id="new-entity-id", canonical_name="topic empathy")]
+    ops.bulk_insert_entities.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

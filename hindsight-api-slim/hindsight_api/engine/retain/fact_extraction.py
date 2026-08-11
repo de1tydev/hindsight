@@ -15,9 +15,10 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from ..llm_interface import ProviderRateLimitResetError
-from ..llm_wrapper import LLMConfig, OutputTooLongError, sanitize_llm_output
+from ..llm_wrapper import LLMConfig, OutputTooLongError, parse_llm_json, sanitize_llm_output
 from ..operation_metadata import RetainExtractionErrors
 from ..response_models import TokenUsage
+from ..structured_output import strict_json_schema
 from .entity_labels import (
     EntityLabelsConfig,
     MapField,
@@ -32,7 +33,7 @@ def _extract_map_entities(
     entity_obj: dict,
     fields: dict[str, MapField],
     prefix: str,
-    validated_entities: "list[Entity]",
+    validated_entities: list[str],
     existing_texts_lower: set[str],
 ) -> None:
     """Recursively extract key:field:value entity strings from a map entity dict."""
@@ -59,7 +60,7 @@ def _extract_map_entities(
                     continue
                 label_str = f"{prefix}{field_name}:{v.strip()}"
                 if label_str.lower() not in existing_texts_lower:
-                    validated_entities.append(Entity(text=label_str))
+                    validated_entities.append(label_str)
                     existing_texts_lower.add(label_str.lower())
         else:
             # text or value — single string
@@ -67,7 +68,7 @@ def _extract_map_entities(
                 continue
             label_str = f"{prefix}{field_name}:{field_val.strip()}"
             if label_str.lower() not in existing_texts_lower:
-                validated_entities.append(Entity(text=label_str))
+                validated_entities.append(label_str)
                 existing_texts_lower.add(label_str.lower())
 
 
@@ -114,12 +115,33 @@ def _sanitize_text(text: str | None) -> str | None:
     return sanitize_llm_output(text)
 
 
-class Entity(BaseModel):
-    """An entity extracted from text."""
+def _coerce_entity_strings(v: Any) -> Any:
+    """
+    Normalize the LLM's `entities` field to a plain list of strings.
 
-    text: str = Field(
-        description="The specific, named entity as it appears in the fact. Must be a proper noun or specific identifier."
-    )
+    The schema previously asked for `Entity` objects ({"text": "..."}) while the
+    prompt's few-shot examples taught a flat string array. Models that followed
+    the examples literally returned strings, and the entities were silently
+    dropped — none were ever persisted (#2749). The `Entity` wrapper carried no
+    information beyond the string, so it was removed rather than taught to the
+    prompt; the object form is still unwrapped here for models that learned it
+    and for in-flight batch jobs.
+
+    Returns non-list input untouched so pydantic reports the type error itself.
+    """
+    if v is None:
+        return []
+    if not isinstance(v, list):
+        return v
+    coerced = []
+    for item in v:
+        if isinstance(item, dict):
+            text = item.get("text")
+            if isinstance(text, str):
+                coerced.append(text)
+        else:
+            coerced.append(item)
+    return coerced
 
 
 class Fact(BaseModel):
@@ -144,7 +166,7 @@ class Fact(BaseModel):
     )
 
     # Optional structured data
-    entities: list[Entity] | None = None
+    entities: list[str] | None = None
     causal_relations: list["CausalRelation"] | None = None
 
 
@@ -193,9 +215,11 @@ class ExtractedFact(BaseModel):
     occurred_start: str | None = Field(default=None, description="ISO timestamp for events")
     occurred_end: str | None = Field(default=None, description="ISO timestamp for event end")
     fact_type: Literal["world", "assistant"] = Field(
-        description="'world' = objective/external facts. 'assistant' = first-person actions, experiences, or observations by the speaker."
+        description="'world' = objective/external facts, including user preferences, rules, corrections, and constraints even when stated during a conversation. 'assistant' = actions, experiences, or observations the assistant/agent actually performed."
     )
-    entities: list[Entity] | None = Field(default=None, description="People, places, concepts")
+    entities: list[str] = Field(
+        default_factory=list, description='People, places, concepts - plain strings, e.g. ["Alice", "Kubernetes"]'
+    )
     causal_relations: list[FactCausalRelation] | None = Field(
         default=None, description="Links to previous facts (target_index < this fact's index)"
     )
@@ -203,33 +227,72 @@ class ExtractedFact(BaseModel):
     @field_validator("entities", mode="before")
     @classmethod
     def ensure_entities_list(cls, v):
-        """Ensure entities is always a list (convert None to empty list)."""
-        if v is None:
-            return []
-        return v
-
-    def build_fact_text(self) -> str:
-        """Combine all dimensions into a single comprehensive fact string."""
-        parts = [self.what]
-
-        # Add 'who' if not N/A
-        if self.who and self.who.upper() != "N/A":
-            parts.append(f"Involving: {self.who}")
-
-        # Add 'why' if not N/A
-        if self.why and self.why.upper() != "N/A":
-            parts.append(self.why)
-
-        if len(parts) == 1:
-            return parts[0]
-
-        return " | ".join(parts)
+        return _coerce_entity_strings(v)
 
 
 class FactExtractionResponse(BaseModel):
     """Response containing all extracted facts (causal relations are embedded in each fact)."""
 
     facts: list[ExtractedFact] = Field(description="List of extracted factual statements")
+
+
+# Below this size, splitting an over-long chunk further cannot help: if a chunk
+# this small still overflows the model's output cap, the cause is degenerate or
+# looping model output rather than genuinely dense input, and halving it just
+# recurses toward a single character. A few-hundred-character floor bounds that
+# runaway (an all-sizes-overflow 3000-char chunk drops in ~17 extraction calls
+# instead of ~5000) while staying well under any chunk that legitimately holds
+# enough facts to exceed the cap.
+_MIN_SPLIT_CHUNK_CHARS = 500
+
+
+def _split_chunk_for_output_retry(chunk: str) -> tuple[str, str] | None:
+    """Split an oversized extraction chunk without corrupting structured input."""
+    stripped = chunk.strip()
+    if len(stripped) <= _MIN_SPLIT_CHUNK_CHARS:
+        return None
+
+    try:
+        parsed = json.loads(stripped)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = None
+
+    if isinstance(parsed, list):
+        if len(parsed) >= 2:
+            mid = len(parsed) // 2
+            return json.dumps(parsed[:mid]), json.dumps(parsed[mid:])
+
+        if len(parsed) == 1 and isinstance(parsed[0], dict):
+            turn = parsed[0]
+            content = turn.get("content")
+            if isinstance(content, str) and len(content) > 1:
+                cut = len(content) // 2
+                first_turn = dict(turn)
+                second_turn = dict(turn)
+                first_turn["content"] = content[:cut]
+                second_turn["content"] = content[cut:]
+                return json.dumps([first_turn]), json.dumps([second_turn])
+
+        return None
+
+    # Split plain text at the midpoint, preferring sentence boundaries nearby.
+    mid_point = len(stripped) // 2
+    search_range = int(len(stripped) * 0.2)
+    search_start = max(0, mid_point - search_range)
+    search_end = min(len(stripped), mid_point + search_range)
+
+    best_split = mid_point
+    for ending in [". ", "! ", "? ", "\n\n"]:
+        pos = stripped.rfind(ending, search_start, search_end)
+        if pos != -1:
+            best_split = pos + len(ending)
+            break
+
+    first_half = stripped[:best_split].strip()
+    second_half = stripped[best_split:].strip()
+    if not first_half or not second_half or first_half == stripped or second_half == stripped:
+        return None
+    return first_half, second_half
 
 
 class ExtractedFactVerbose(BaseModel):
@@ -296,12 +359,12 @@ class ExtractedFactVerbose(BaseModel):
     )
 
     fact_type: Literal["world", "assistant"] = Field(
-        description="'world' = objective/external facts about other people, events, general knowledge. 'assistant' = first-person actions, experiences, or observations by the speaker (e.g., 'I changed X', 'I discovered Y')."
+        description="'world' = objective/external facts about the user, other people, events, general knowledge, preferences, rules, corrections, or constraints. 'assistant' = actions, experiences, or observations the assistant/agent actually performed (e.g., 'I changed X', 'I discovered Y')."
     )
 
-    entities: list[Entity] | None = Field(
-        default=None,
-        description="Named entities, objects, AND abstract concepts from the fact. Include: people names, organizations, places, significant objects (e.g., 'coffee maker', 'car'), AND abstract concepts/themes (e.g., 'friendship', 'career growth', 'loss', 'celebration'). Extract anything that could help link related facts together.",
+    entities: list[str] = Field(
+        default_factory=list,
+        description="Named entities, objects, AND abstract concepts from the fact, as plain strings (e.g. [\"Alice\", \"friendship\"]). Include: people names, organizations, places, significant objects (e.g., 'coffee maker', 'car'), AND abstract concepts/themes (e.g., 'friendship', 'career growth', 'loss', 'celebration'). Extract anything that could help link related facts together.",
     )
 
     causal_relations: list[FactCausalRelation] | None = Field(
@@ -313,9 +376,7 @@ class ExtractedFactVerbose(BaseModel):
     @field_validator("entities", mode="before")
     @classmethod
     def ensure_entities_list(cls, v):
-        if v is None:
-            return []
-        return v
+        return _coerce_entity_strings(v)
 
 
 class FactExtractionResponseVerbose(BaseModel):
@@ -346,19 +407,17 @@ class ExtractedFactNoCausal(BaseModel):
     occurred_start: str | None = Field(default=None, description="WHEN the event happened (ISO timestamp).")
     occurred_end: str | None = Field(default=None, description="WHEN the event ended (ISO timestamp).")
     fact_type: Literal["world", "assistant"] = Field(
-        description="'world' = about the user/others. 'assistant' = experience with assistant."
+        description="'world' = about the user/others, including user preferences, rules, corrections, and constraints. 'assistant' = actions or experiences the assistant/agent actually performed."
     )
-    entities: list[Entity] | None = Field(
-        default=None,
-        description="Named entities, objects, and concepts from the fact.",
+    entities: list[str] = Field(
+        default_factory=list,
+        description='Named entities, objects, and concepts from the fact, as plain strings (e.g. ["Alice", "Kubernetes"]).',
     )
 
     @field_validator("entities", mode="before")
     @classmethod
     def ensure_entities_list(cls, v):
-        if v is None:
-            return []
-        return v
+        return _coerce_entity_strings(v)
 
 
 class FactExtractionResponseNoCausal(BaseModel):
@@ -390,14 +449,14 @@ class VerbatimExtractedFact(BaseModel):
     fact_type: Literal["world", "assistant"] = Field(
         description="'world' = objective/external facts. 'assistant' = first-person actions, experiences, or observations by the speaker."
     )
-    entities: list[Entity] | None = Field(default=None, description="People, places, concepts")
+    entities: list[str] = Field(
+        default_factory=list, description='People, places, concepts - plain strings, e.g. ["Alice", "Kubernetes"]'
+    )
 
     @field_validator("entities", mode="before")
     @classmethod
     def ensure_entities_list(cls, v):
-        if v is None:
-            return []
-        return v
+        return _coerce_entity_strings(v)
 
 
 class VerbatimFactExtractionResponse(BaseModel):
@@ -452,6 +511,11 @@ def chunk_text(text: str, max_chars: int, structured_chunk_size: int | None = No
     ``structured_chunk_size``. When unset, that limit defaults to ``max_chars``.
     For plain text, uses sentence-aware splitting.
 
+    The result is idempotent: re-chunking any chunk this returns yields that chunk
+    unchanged. The streaming retain pipeline pre-chunks each document once and then
+    re-chunks every piece during extraction; if a piece re-split, its sub-chunks
+    would inherit one chunk_index and collide on ``chunk_id`` (issue #2301).
+
     Args:
         text: Input text to chunk (plain text, JSON conversation, or JSONL)
         max_chars: Target maximum characters per chunk
@@ -470,11 +534,23 @@ def chunk_text(text: str, max_chars: int, structured_chunk_size: int | None = No
     # Try to parse as JSON conversation array
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, list) and all(isinstance(turn, dict) for turn in parsed):
-            # This looks like a conversation - chunk at turn boundaries
-            return _chunk_conversation(parsed, max_chars, structured_limit)
     except (json.JSONDecodeError, ValueError):
-        pass
+        parsed = None
+
+    if isinstance(parsed, list) and all(isinstance(turn, dict) for turn in parsed):
+        # This looks like a conversation - chunk at turn boundaries
+        return _chunk_conversation(parsed, max_chars, structured_limit)
+
+    if isinstance(parsed, dict):
+        # A single JSON object — e.g. one JSONL line handed back to the extractor
+        # after the producer already pre-chunked it. It is one structured unit:
+        # keep it whole up to the structured limit, else split it as text within
+        # the chunk budget. Without this, a lone object (one line, so _chunk_jsonl
+        # declines) would fall through to plain-text splitting and re-split a chunk
+        # the producer deliberately kept whole — breaking idempotency (issue #2301).
+        if len(text) <= structured_limit:
+            return [text]
+        return _split_oversized_unit(text, max_chars)
 
     # Try to parse as JSONL (newline-delimited JSON objects, e.g. session logs)
     jsonl_chunks = _chunk_jsonl(text, max_chars, structured_limit)
@@ -516,10 +592,12 @@ def _chunk_conversation(turns: list[dict], max_chars: int, structured_limit: int
         turn_size = turn_unit_size + 1  # +1 for comma
 
         # A turn too large to keep whole even alone: flush, then split it as
-        # text so no chunk runs far over budget (the extractor won't re-chunk).
+        # text. Fragment within min(structured_limit, max_chars) so no fragment
+        # exceeds the chunk budget — otherwise a downstream re-chunk would split
+        # it again and collide on chunk_id (issue #2301).
         if turn_unit_size > structured_limit:
             _flush()
-            chunks.extend(_split_oversized_unit(turn_json, structured_limit))
+            chunks.extend(_split_oversized_unit(turn_json, min(structured_limit, max_chars)))
             continue
 
         # If adding this turn would exceed limit and we have turns, save current chunk
@@ -582,10 +660,12 @@ def _chunk_jsonl(text: str, max_chars: int, structured_limit: int) -> list[str] 
         line_size = len(line) + 1  # +1 for the joining newline
 
         # A line too large to keep whole even alone: flush, then split it as
-        # text so no chunk runs far over budget (the extractor won't re-chunk).
+        # text. Fragment within min(structured_limit, max_chars) so no fragment
+        # exceeds the chunk budget — otherwise a downstream re-chunk would split
+        # it again and collide on chunk_id (issue #2301).
         if line_unit_size > structured_limit:
             _flush()
-            chunks.extend(_split_oversized_unit(line, structured_limit))
+            chunks.extend(_split_oversized_unit(line, min(structured_limit, max_chars)))
             continue
 
         # If adding this line would exceed the limit and we have lines, flush.
@@ -642,8 +722,8 @@ fact_kind:
 - "conversation": Ongoing state, preference, trait (no dates)
 
 fact_type:
-- "world": About other people, external events, general knowledge, objective facts
-- "assistant": First-person actions, experiences, or observations by the speaker/author (e.g., "I changed X", "I discovered Y", "I debugged Z"). Also includes interactions with the user (requests, recommendations). If the narrator describes something they did, tried, learned, or decided — use "assistant".
+- "world": Objective/external facts, including the user's preferences, rules, corrections, constraints, plans, traits, or context. These stay "world" even when the user states them during an assistant interaction (e.g., "User prefers browser_navigate over web_search", "User corrected the project deadline").
+- "assistant": Actions, experiences, or observations the assistant/agent actually performed (e.g., "I changed X", "I discovered Y", "I debugged Z"). Use this for the assistant/agent doing, trying, learning, deciding, recommending, or responding — not merely for user facts mentioned in conversation.
 
 ══════════════════════════════════════════════════════════════════════════
 TEMPORAL HANDLING
@@ -659,6 +739,11 @@ Use "Event Date" from input as reference for relative dates.
 ══════════════════════════════════════════════════════════════════════════
 ENTITIES
 ══════════════════════════════════════════════════════════════════════════
+
+ALWAYS return "entities" as an array of plain strings — never objects, never null.
+Correct: entities=["Alice", "Kubernetes", "CKA"]
+Wrong:   entities as an array of objects with a "text" key ← never use this form
+Use an empty array [] only when the fact truly names nothing.
 
 Include: people names, organizations, places, key objects, abstract concepts (career, friendship, etc.)
 Always include "user" when fact is about the user.{examples}"""
@@ -745,7 +830,7 @@ RULES:
 - Extract all entities (people, places, organizations, objects, concepts).
 - Extract temporal information (occurred_start, occurred_end, fact_kind, when).
 - Extract location (where) and people (who).
-- fact_type: use "world" unless the content is clearly an interaction with the assistant."""
+- fact_type: use "world" for user preferences, rules, corrections, constraints, traits, and other objective facts, even when stated during an assistant interaction. Use "assistant" only for actions or experiences the assistant/agent actually performed."""
 
 VERBATIM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
     retain_mission_section="{retain_mission_section}",
@@ -846,8 +931,8 @@ For CONVERSATIONS (fact_kind="conversation"):
 FACT TYPE
 ══════════════════════════════════════════════════════════════════════════
 
-- **world**: User's life, other people, events (would exist without this conversation)
-- **assistant**: Interactions with assistant (requests, recommendations, help)
+- **world**: User's life, preferences, rules, corrections, constraints, other people, and events (facts that would exist without this conversation)
+- **assistant**: Actions or experiences the assistant/agent actually performed while helping the user (requests, recommendations, help)
   ⚠️ CRITICAL for assistant facts: ALWAYS capture the user's request/question in the fact!
   Include: what the user asked, what problem they wanted solved, what context they provided
 
@@ -1077,8 +1162,8 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
             }
             if not free_form_entities:
                 dynamic_fields["entities"] = (
-                    list[Entity] | None,
-                    Field(default=None, description="Leave empty — labels-only mode"),
+                    list[str],
+                    Field(default_factory=list, description="Leave empty — labels-only mode"),
                 )
             # Inherit parent's required fields and add 'labels' so it appears in the JSON schema
             # required array (the base class json_schema_extra overrides required entirely)
@@ -1182,8 +1267,16 @@ def _build_request_body(llm_config, config, prompt: str, user_message: str, resp
     request_body = {
         "model": llm_config.model,
         "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": user_message}],
-        "temperature": 0.1,
     }
+
+    # Honour the configured retain temperature. ``None`` omits the parameter
+    # entirely (for models like Azure GPT-5.5 that reject explicit temperatures),
+    # mirroring LLMProvider.call, which drops temperature when it is None. The
+    # batch path builds the request body directly instead of going through
+    # LLMProvider.call (#2469 only de-hardcoded the streaming path), so it must
+    # apply the same rule here.
+    if config.llm_temperature_retain is not None:
+        request_body["temperature"] = config.llm_temperature_retain
 
     # Add max_completion_tokens if configured
     if config.retain_max_completion_tokens:
@@ -1194,17 +1287,30 @@ def _build_request_body(llm_config, config, prompt: str, user_message: str, resp
         request_body["service_tier"] = llm_config._provider_impl.openai_service_tier
 
     # Add response_format (JSON schema). The batch path builds the request body
-    # directly instead of going through LLMProvider.call(), so honour
-    # HINDSIGHT_API_LLM_STRICT_SCHEMA here too: strict=True grammar-enforces the
-    # output on capable backends rather than relying on the model to emit clean JSON.
+    # directly instead of going through LLMProvider.call(), so resolve the
+    # strict-schema flag here too: strict=True grammar-enforces the output on capable
+    # backends rather than relying on the model to emit clean JSON. Reads the
+    # retain-scoped field, which already folds in the global HINDSIGHT_API_LLM_STRICT_SCHEMA
+    # fallback, so the batch and streaming paths can't disagree.
     if hasattr(response_schema, "model_json_schema"):
-        schema = response_schema.model_json_schema()
+        schema = (
+            strict_json_schema(response_schema) if config.llm_strict_schema else response_schema.model_json_schema()
+        )
         request_body["response_format"] = {
             "type": "json_schema",
-            "json_schema": {"name": "facts", "schema": schema, "strict": config.llm_strict_schema},
+            "json_schema": {"name": "facts", "schema": schema, "strict": config.llm_strict_schema_retain},
         }
 
     return request_body
+
+
+def _coerce_fact_response(response: Any) -> dict[str, Any] | None:
+    """Accept the schema wrapper, or a recoverable top-level facts array."""
+    if isinstance(response, dict):
+        return response
+    if isinstance(response, list) and all(isinstance(item, dict) for item in response):
+        return {"facts": response}
+    return None
 
 
 async def _extract_facts_from_chunk(
@@ -1275,10 +1381,15 @@ async def _extract_facts_from_chunk(
     llm_max_retries = (
         config.retain_llm_max_retries if config.retain_llm_max_retries is not None else config.llm_max_retries
     )
+    # OUTER content-validation attempts (re-prompts on malformed JSON). Follows the
+    # same `N + 1` convention as the providers' transport-retry loops — N retries after
+    # the initial request — so a zero budget still performs one request (#2731). The raw
+    # budget is forwarded unchanged to llm_config.call(), which owns transport retries.
+    outer_attempts = llm_max_retries + 1
     last_error: Exception | None = None
 
     usage = TokenUsage()  # Track cumulative usage across retries
-    for attempt in range(llm_max_retries):
+    for attempt in range(outer_attempts):
         try:
             initial_backoff = (
                 config.retain_llm_initial_backoff
@@ -1293,7 +1404,8 @@ async def _extract_facts_from_chunk(
                 messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_message}],
                 response_format=response_schema,
                 scope="retain_extract_facts",
-                temperature=0.1,
+                temperature=config.llm_temperature_retain,
+                strict_schema=config.llm_strict_schema_retain,
                 max_completion_tokens=config.retain_max_completion_tokens,
                 max_retries=llm_max_retries,
                 initial_backoff=initial_backoff,
@@ -1312,10 +1424,11 @@ async def _extract_facts_from_chunk(
             has_malformed_facts = False
 
             # Handle malformed LLM responses
-            if not isinstance(extraction_response_json, dict):
-                if attempt < llm_max_retries - 1:
+            coerced_response_json = _coerce_fact_response(extraction_response_json)
+            if coerced_response_json is None:
+                if attempt < outer_attempts - 1:
                     logger.warning(
-                        f"LLM returned non-dict JSON on attempt {attempt + 1}/{llm_max_retries}: {type(extraction_response_json).__name__}. Retrying..."
+                        f"LLM returned non-dict JSON on attempt {attempt + 1}/{outer_attempts}: {type(extraction_response_json).__name__}. Retrying..."
                     )
                     continue
                 else:
@@ -1324,9 +1437,10 @@ async def _extract_facts_from_chunk(
                     # worker's retry machinery and ultimately fails loudly — never
                     # silently commit the document with 0 facts. See issue #1833.
                     raise RuntimeError(
-                        f"Fact extraction failed: LLM returned non-dict JSON after {llm_max_retries} attempts "
+                        f"Fact extraction failed: LLM returned non-dict JSON after {outer_attempts} attempts "
                         f"({type(extraction_response_json).__name__}). Raw: {str(extraction_response_json)[:500]}"
                     )
+            extraction_response_json = coerced_response_json
 
             raw_facts = extraction_response_json.get("facts", [])
 
@@ -1363,6 +1477,8 @@ async def _extract_facts_from_chunk(
                 # Fallback to old format if new fields not present
                 if not what:
                     what = get_value("factual_core")
+                if not what:
+                    what = get_value("text")
                 if not what:
                     # In verbatim mode, 'what' is intentionally absent — text is backfilled from chunk
                     if extraction_mode != "verbatim":
@@ -1422,21 +1538,9 @@ async def _extract_facts_from_chunk(
                     elif fact_data.get("occurred_start"):
                         fact_data["occurred_end"] = fact_data["occurred_start"]
 
-                # Add entities if present (validate as Entity objects)
-                # LLM sometimes returns strings instead of {"text": "..."} format
-                entities = get_value("entities")
-                validated_entities = []
-                if entities:
-                    # Validate and normalize each entity
-                    for ent in entities:
-                        if isinstance(ent, str):
-                            # Normalize string to Entity object
-                            validated_entities.append(Entity(text=ent))
-                        elif isinstance(ent, dict) and "text" in ent:
-                            try:
-                                validated_entities.append(Entity.model_validate(ent))
-                            except Exception as e:
-                                logger.warning(f"Invalid entity {ent}: {e}")
+                # Entities are plain strings. Older prompts taught a {"text": ...}
+                # object form, so keep unwrapping it for models that still emit it.
+                validated_entities = _coerce_entity_strings(get_value("entities"))
 
                 # Post-process label entities from structured labels object
                 entity_labels_raw = getattr(config, "entity_labels", None)
@@ -1446,7 +1550,7 @@ async def _extract_facts_from_chunk(
                     labels_lookup = build_labels_lookup(labels_cfg)
                     labels_data = llm_fact.get("labels") or {}
                     if isinstance(labels_data, dict):
-                        existing_texts_lower = {e.text.lower() for e in validated_entities}
+                        existing_texts_lower = {e.lower() for e in validated_entities}
                         for group in labels_cfg.attributes:
                             value = labels_data.get(group.key)
                             if not value:
@@ -1471,12 +1575,12 @@ async def _extract_facts_from_chunk(
                                 label_str = f"{group.key}:{v.strip()}"
                                 if group.type == "text":
                                     if label_str.lower() not in existing_texts_lower:
-                                        validated_entities.append(Entity(text=label_str))
+                                        validated_entities.append(label_str)
                                         existing_texts_lower.add(label_str.lower())
                                 elif (
                                     label_str.lower() in labels_lookup and label_str.lower() not in existing_texts_lower
                                 ):
-                                    validated_entities.append(Entity(text=label_str))
+                                    validated_entities.append(label_str)
                                     existing_texts_lower.add(label_str.lower())
                                 else:
                                     logger.warning(f"Label '{label_str}' not in valid label values, skipping")
@@ -1484,7 +1588,7 @@ async def _extract_facts_from_chunk(
                     # In labels-only mode, keep only label entities
                     if not free_form_entities:
                         validated_entities = [
-                            e for e in validated_entities if is_label_entity(e.text, labels_cfg, labels_lookup)
+                            e for e in validated_entities if is_label_entity(e, labels_cfg, labels_lookup)
                         ]
                 elif not free_form_entities:
                     # No labels but free_form disabled: clear all entities
@@ -1542,9 +1646,9 @@ async def _extract_facts_from_chunk(
                     continue
 
             # If we got malformed facts and haven't exhausted retries, try again
-            if has_malformed_facts and len(chunk_facts) < len(raw_facts) * 0.8 and attempt < llm_max_retries - 1:
+            if has_malformed_facts and len(chunk_facts) < len(raw_facts) * 0.8 and attempt < outer_attempts - 1:
                 logger.warning(
-                    f"Got {len(raw_facts) - len(chunk_facts)} malformed facts out of {len(raw_facts)} on attempt {attempt + 1}/{llm_max_retries}. Retrying..."
+                    f"Got {len(raw_facts) - len(chunk_facts)} malformed facts out of {len(raw_facts)} on attempt {attempt + 1}/{outer_attempts}. Retrying..."
                 )
                 continue
 
@@ -1583,7 +1687,7 @@ async def _extract_facts_from_chunk(
     # If we exhausted all retries, raise the last error or a descriptive fallback
     if last_error is not None:
         raise last_error
-    raise RuntimeError(f"Fact extraction failed after {llm_max_retries} attempts: LLM did not return valid JSON")
+    raise RuntimeError(f"Fact extraction failed after {outer_attempts} attempts: LLM did not return valid JSON")
 
 
 async def _extract_facts_with_auto_split(
@@ -1635,33 +1739,22 @@ async def _extract_facts_with_auto_split(
             metadata=metadata,
         )
     except OutputTooLongError:
-        # Output exceeded token limits - split the chunk in half and retry
+        # Output exceeded token limits - split the chunk and retry. Conversation
+        # chunks are JSON arrays, so preserve array/turn boundaries when possible.
         logger.warning(
             f"Output too long for chunk {chunk_index + 1}/{total_chunks} "
-            f"({len(chunk)} chars). Splitting in half and retrying..."
+            f"({len(chunk)} chars). Splitting and retrying..."
         )
 
-        # Split at the midpoint, preferring sentence boundaries
-        mid_point = len(chunk) // 2
+        split_chunks = _split_chunk_for_output_retry(chunk)
+        if split_chunks is None:
+            logger.warning(
+                f"Cannot make progress splitting chunk {chunk_index + 1}/{total_chunks} "
+                f"({len(chunk)} chars); dropping this sub-chunk."
+            )
+            return [], TokenUsage()
 
-        # Try to find a sentence boundary near the midpoint
-        # Look for ". ", "! ", "? " within 20% of midpoint
-        search_range = int(len(chunk) * 0.2)
-        search_start = max(0, mid_point - search_range)
-        search_end = min(len(chunk), mid_point + search_range)
-
-        sentence_endings = [". ", "! ", "? ", "\n\n"]
-        best_split = mid_point
-
-        for ending in sentence_endings:
-            pos = chunk.rfind(ending, search_start, search_end)
-            if pos != -1:
-                best_split = pos + len(ending)
-                break
-
-        # Split the chunk
-        first_half = chunk[:best_split].strip()
-        second_half = chunk[best_split:].strip()
+        first_half, second_half = split_chunks
 
         logger.info(
             f"Split chunk {chunk_index + 1} into two sub-chunks: {len(first_half)} chars and {len(second_half)} chars"
@@ -1793,7 +1886,14 @@ async def extract_facts_from_text(
         total_usage = total_usage + chunk_usage
 
     if failed_chunks:
-        failed_summary = ", ".join(f"chunk {idx}: {type(err).__name__}" for idx, err in failed_chunks[:5])
+        # Include the exception message — not just the type — so operators
+        # can tell a structured-JSON parse failure apart from a rate limit
+        # apart from a network 5xx, all of which can surface as the same
+        # exception types. The error_message we propagate to the
+        # async_operations row is the only inspection surface a worker-side
+        # failure leaves behind, and a bare "chunk 0: RuntimeError" is not
+        # actionable.
+        failed_summary = ", ".join(f"chunk {idx}: {type(err).__name__}: {err}" for idx, err in failed_chunks[:5])
         quota_errors = [err for _, err in failed_chunks if isinstance(err, ProviderRateLimitResetError)]
         if quota_errors and len(quota_errors) == len(failed_chunks):
             retry_at = max(err.retry_at for err in quota_errors)
@@ -2096,9 +2196,25 @@ async def extract_facts_from_contents_batch_api(
         content_str = message.get("content", "{}")
 
         try:
-            extraction_response_json = json.loads(content_str)
+            # #2701: use the lenient parser (strips markdown fences, scrubs
+            # embedded control chars) so recoverable batch responses — e.g.
+            # transient Gemini quirks — aren't dropped along with all their facts.
+            extraction_response_json = parse_llm_json(content_str)
         except json.JSONDecodeError as e:
             message = f"{custom_id}: failed to parse JSON: {e}"
+            logger.error(message)
+            extraction_errors.add(message)
+            chunks_metadata.append(
+                ChunkMetadata(
+                    chunk_text=chunk_content, fact_count=0, content_index=content_index, chunk_index=chunk_idx
+                )
+            )
+            continue
+
+        response_type_name = type(extraction_response_json).__name__
+        extraction_response_json = _coerce_fact_response(extraction_response_json)
+        if extraction_response_json is None:
+            message = f"{custom_id}: LLM returned non-dict JSON ({response_type_name})"
             logger.error(message)
             extraction_errors.add(message)
             chunks_metadata.append(
@@ -2125,6 +2241,8 @@ async def extract_facts_from_contents_batch_api(
             what = get_value("what")
             if not what:
                 what = get_value("factual_core")
+            if not what:
+                what = get_value("text")
             if not what:
                 continue
 
@@ -2174,18 +2292,9 @@ async def extract_facts_from_contents_batch_api(
                 elif fact_data.get("occurred_start"):
                     fact_data["occurred_end"] = fact_data["occurred_start"]
 
-            # Entities
-            entities = get_value("entities")
-            validated_entities = []
-            if entities:
-                for ent in entities:
-                    if isinstance(ent, str):
-                        validated_entities.append(Entity(text=ent))
-                    elif isinstance(ent, dict) and "text" in ent:
-                        try:
-                            validated_entities.append(Entity.model_validate(ent))
-                        except Exception:
-                            pass
+            # Entities are plain strings. Older prompts taught a {"text": ...}
+            # object form, so keep unwrapping it for models that still emit it.
+            validated_entities = _coerce_entity_strings(get_value("entities"))
 
             # Post-process label entities from structured labels object
             entity_labels_raw = getattr(config, "entity_labels", None)
@@ -2195,7 +2304,7 @@ async def extract_facts_from_contents_batch_api(
                 labels_lookup_batch = build_labels_lookup(labels_cfg_batch)
                 labels_data = llm_fact.get("labels") or {}
                 if isinstance(labels_data, dict):
-                    existing_texts_lower = {e.text.lower() for e in validated_entities}
+                    existing_texts_lower = {e.lower() for e in validated_entities}
                     for group in labels_cfg_batch.attributes:
                         value = labels_data.get(group.key)
                         if not value:
@@ -2220,18 +2329,18 @@ async def extract_facts_from_contents_batch_api(
                             label_str = f"{group.key}:{v.strip()}"
                             if group.type == "text":
                                 if label_str.lower() not in existing_texts_lower:
-                                    validated_entities.append(Entity(text=label_str))
+                                    validated_entities.append(label_str)
                                     existing_texts_lower.add(label_str.lower())
                             elif (
                                 label_str.lower() in labels_lookup_batch
                                 and label_str.lower() not in existing_texts_lower
                             ):
-                                validated_entities.append(Entity(text=label_str))
+                                validated_entities.append(label_str)
                                 existing_texts_lower.add(label_str.lower())
 
                 if not free_form_entities_batch:
                     validated_entities = [
-                        e for e in validated_entities if is_label_entity(e.text, labels_cfg_batch, labels_lookup_batch)
+                        e for e in validated_entities if is_label_entity(e, labels_cfg_batch, labels_lookup_batch)
                     ]
             elif not free_form_entities_batch:
                 validated_entities = []
@@ -2313,15 +2422,18 @@ async def extract_facts_from_contents_batch_api(
 
     for chunk_meta, chunk_facts in facts_by_chunk:
         content = contents[chunk_meta.content_index]
+        extraction_group_start_idx = global_fact_idx
 
         for fact_from_llm in chunk_facts:
             extracted_fact = ExtractedFactType(
                 fact_text=fact_from_llm.fact,
                 fact_type=fact_from_llm.fact_type,
-                entities=[e.text for e in (fact_from_llm.entities or [])],
+                entities=list(fact_from_llm.entities or []),
                 occurred_start=_parse_datetime(fact_from_llm.occurred_start) if fact_from_llm.occurred_start else None,
                 occurred_end=_parse_datetime(fact_from_llm.occurred_end) if fact_from_llm.occurred_end else None,
-                causal_relations=_convert_causal_relations(fact_from_llm.causal_relations or [], global_fact_idx),
+                causal_relations=_convert_causal_relations(
+                    fact_from_llm.causal_relations or [], extraction_group_start_idx, len(chunk_facts)
+                ),
                 content_index=chunk_meta.content_index,
                 chunk_index=chunk_meta.chunk_index,
                 context=content.context,
@@ -2446,8 +2558,7 @@ async def extract_facts_from_contents(
     # Step 1: Create parallel fact extraction tasks
     fact_extraction_tasks = []
     for item in contents:
-        # Call extract_facts_from_text directly (defined earlier in this file)
-        # to avoid circular import with utils.extract_facts
+        # Call extract_facts_from_text directly (defined earlier in this file).
         task = extract_facts_from_text(
             text=item.content,
             event_date=item.event_date,
@@ -2505,40 +2616,37 @@ async def extract_facts_from_contents(
         fact_idx_in_content = 0
         for chunk_idx_in_content, (chunk_text, chunk_fact_count) in enumerate(chunks_from_llm):
             chunk_global_idx = chunk_start_idx + chunk_idx_in_content
+            extraction_group_start_idx = global_fact_idx
+            chunk_facts = facts_from_llm[fact_idx_in_content : fact_idx_in_content + chunk_fact_count]
 
-            for _ in range(chunk_fact_count):
-                if fact_idx_in_content < len(facts_from_llm):
-                    fact_from_llm = facts_from_llm[fact_idx_in_content]
+            for fact_from_llm in chunk_facts:
+                # Convert Fact model from LLM to ExtractedFactType dataclass
+                # mentioned_at is always the event_date (when the conversation/document occurred)
+                extracted_fact = ExtractedFactType(
+                    fact_text=fact_from_llm.fact,
+                    fact_type=fact_from_llm.fact_type,
+                    entities=list(fact_from_llm.entities or []),
+                    # occurred_start/end: from LLM only, leave None if not provided
+                    occurred_start=_parse_datetime(fact_from_llm.occurred_start)
+                    if fact_from_llm.occurred_start
+                    else None,
+                    occurred_end=_parse_datetime(fact_from_llm.occurred_end) if fact_from_llm.occurred_end else None,
+                    causal_relations=_convert_causal_relations(
+                        fact_from_llm.causal_relations or [], extraction_group_start_idx, len(chunk_facts)
+                    ),
+                    content_index=content_index,
+                    chunk_index=chunk_global_idx,
+                    context=content.context,
+                    # mentioned_at: always the event_date (when the conversation/document occurred)
+                    mentioned_at=content.event_date,
+                    metadata=content.metadata,
+                    tags=content.tags,
+                    observation_scopes=content.observation_scopes,
+                )
 
-                    # Convert Fact model from LLM to ExtractedFactType dataclass
-                    # mentioned_at is always the event_date (when the conversation/document occurred)
-                    extracted_fact = ExtractedFactType(
-                        fact_text=fact_from_llm.fact,
-                        fact_type=fact_from_llm.fact_type,
-                        entities=[e.text for e in (fact_from_llm.entities or [])],
-                        # occurred_start/end: from LLM only, leave None if not provided
-                        occurred_start=_parse_datetime(fact_from_llm.occurred_start)
-                        if fact_from_llm.occurred_start
-                        else None,
-                        occurred_end=_parse_datetime(fact_from_llm.occurred_end)
-                        if fact_from_llm.occurred_end
-                        else None,
-                        causal_relations=_convert_causal_relations(
-                            fact_from_llm.causal_relations or [], global_fact_idx
-                        ),
-                        content_index=content_index,
-                        chunk_index=chunk_global_idx,
-                        context=content.context,
-                        # mentioned_at: always the event_date (when the conversation/document occurred)
-                        mentioned_at=content.event_date,
-                        metadata=content.metadata,
-                        tags=content.tags,
-                        observation_scopes=content.observation_scopes,
-                    )
-
-                    extracted_facts.append(extracted_fact)
-                    global_fact_idx += 1
-                    fact_idx_in_content += 1
+                extracted_facts.append(extracted_fact)
+                global_fact_idx += 1
+                fact_idx_in_content += 1
 
     # Step 4: For verbatim mode, collapse to one fact per chunk with original text
     if config.retain_extraction_mode == "verbatim":
@@ -2590,7 +2698,9 @@ def _parse_datetime(date_str: str):
         return None
 
 
-def _convert_causal_relations(relations_from_llm, fact_start_idx: int) -> list[CausalRelationType]:
+def _convert_causal_relations(
+    relations_from_llm, extraction_group_start_idx: int, extraction_group_size: int
+) -> list[CausalRelationType]:
     """
     Convert causal relations from LLM format to ExtractedFact format.
 
@@ -2598,9 +2708,16 @@ def _convert_causal_relations(relations_from_llm, fact_start_idx: int) -> list[C
     """
     causal_relations = []
     for rel in relations_from_llm:
+        target_fact_index = rel.target_fact_index
+        if (
+            not isinstance(target_fact_index, int)
+            or isinstance(target_fact_index, bool)
+            or not 0 <= target_fact_index < extraction_group_size
+        ):
+            continue
         causal_relation = CausalRelationType(
             relation_type=rel.relation_type,
-            target_fact_index=fact_start_idx + rel.target_fact_index,
+            target_fact_index=extraction_group_start_idx + target_fact_index,
         )
         causal_relations.append(causal_relation)
     return causal_relations

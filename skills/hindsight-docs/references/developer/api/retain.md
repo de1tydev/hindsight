@@ -8,10 +8,10 @@ When you **retain** content, Hindsight doesn't just store the raw text—it inte
 {/* Import raw source files */}
 
 > **ℹ️ How Retain Works**
-> 
+>
 Learn about fact extraction, entity resolution, and graph construction in the [Retain Architecture](../retain.md) guide.
 > **💡 Prerequisites**
-> 
+>
 Make sure you've completed the [Quick Start](./quickstart) to install the client and start the server.
 ## Store a Document
 
@@ -230,7 +230,7 @@ See [Recall API](./recall#tags) for filtering by tags during retrieval.
 Controls which [observations](../observations) this memory contributes to during consolidation. Each scope runs an independent pass, creating or updating observations tagged with only that scope's tags.
 
 > **ℹ️ Scope isolation**
-> 
+>
 During consolidation, Hindsight uses `all_strict` matching to find existing observations to update — only observations whose tags exactly match the current scope are considered. This keeps scopes isolated: a memory consolidated under `["student:alice"]` will never bleed into an observation tagged `["student:alice", "teacher:bob"]`.
 The examples below use a lesson transcript retained with `tags: ["student:alice", "teacher:bob", "session-id:s1"]`.
 
@@ -256,7 +256,7 @@ One consolidation pass over a single global, **untagged** scope. The memory's ow
 **Use when** your tags are per-call provenance (e.g. session ids) that you want for recall filtering and debugging but not as a consolidation boundary — keep the tag on `tags` and set `observation_scopes: "shared"`.
 
 > **🚨 `shared` vs `[[]]` vs `[]`**
-> 
+>
 `shared` is equivalent to the explicit scope `[[]]` — a list containing one empty scope. Do **not** confuse it with `[]` (an empty list), which declares *zero* scopes and silently falls back to `combined`.
 #### per_tag
 
@@ -471,7 +471,7 @@ hindsight memory retain-files my-bank "$SCRIPT_DIR/" --async
 ```
 
 > **ℹ️ File Storage**
-> 
+>
 Uploaded files are stored server-side (PostgreSQL by default, or S3/GCS/Azure for production). Configure storage via `HINDSIGHT_API_FILE_STORAGE_TYPE`. See [Configuration](../configuration#file-processing) for details.
 ---
 
@@ -522,6 +522,25 @@ hindsight memory retain my-bank "Meeting notes" --async
 
 When `async: true`, the call returns immediately with an `operation_id`. Processing runs in the background via the worker service. No `usage` metrics are returned for async operations.
 
+### Safe Retries with `operation_id`
+
+If an async retain response is lost or times out, you can't tell whether the operation was created. Retrying blindly risks enqueuing the same work twice — duplicate extraction, embeddings, and provider spend.
+
+Supply your own `operation_id` (any UUID) to make retries safe:
+
+```json
+{
+  "items": [{ "content": "Alice works at Google", "document_id": "conv_123" }],
+  "async": true,
+  "operation_id": "3f2b8c1a-9d4e-4a7b-9c2f-1e6d5a4b3c2d"
+}
+```
+
+- Re-submitting with the same `operation_id` returns the original operation and creates no new work, so a retry after a lost acknowledgement is a no-op.
+- Reusing an `operation_id` that already belongs to a different operation returns HTTP `409`.
+- Omitting `operation_id` keeps the default behavior — each request creates a new operation.
+- Generate the id **before** you send the request and reuse it across retries. `operation_id` is ignored for synchronous retain, and requires all items in the request to resolve to a single strategy.
+
 ### Cut Costs 50% with Provider Batch APIs
 
 When using async retain, enable the provider Batch API to reduce LLM fact-extraction costs by 50%. OpenAI, Groq, and Gemini all offer this discount in exchange for a processing window of up to 24 hours — a trade-off that's typically invisible when retain already runs in the background.
@@ -533,5 +552,5 @@ export HINDSIGHT_API_RETAIN_BATCH_ENABLED=true
 Hindsight submits fact extraction calls as a batch job to the provider, polls for completion, and processes results automatically. No changes to your API calls are needed.
 
 > **📝 Note**
-> 
+>
 Batch API cost savings require `async=true` in your retain request and a compatible provider (OpenAI, Groq, or Gemini).

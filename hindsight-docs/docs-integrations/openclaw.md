@@ -123,7 +123,14 @@ Optional settings in `~/.openclaw/openclaw.json`:
 - `llmModel` - LLM model used with `llmProvider` (provider default if omitted)
 - `llmApiKey` - API key for the LLM provider. **Sensitive** — set via `openclaw config set ... --ref-source env --ref-id OPENAI_API_KEY` to reference an env var.
 - `llmBaseUrl` - Optional base URL override for OpenAI-compatible providers (e.g. `https://openrouter.ai/api/v1`)
-- `bankMission` - Agent identity/purpose stored on the memory bank. Helps the memory engine understand context for better fact extraction during retain. Set once per bank on first use — not a recall prompt.
+- `bankMission` - Agent identity/purpose stored on the memory bank's `reflect_mission`. **Only affects `reflect`** — does not steer retain or recall. Set once per bank on first use.
+- `retainMission` - Stamped onto the bank's `retain_mission` on first use. Steers what gets extracted as facts during retain.
+- `observationsMission` - Stamped onto the bank's `observations_mission` on first use. Controls what gets synthesised into observations during consolidation.
+- `retainExtractionMode` - Fact extraction mode stamped on first bank use: `concise`, `verbose`, `custom`, `verbatim`, or `chunks`. Leave unset to keep the server default.
+- `enableObservations` - Toggle observation consolidation after retain, stamped on first bank use.
+- `enableAutoConsolidation` - Toggle automatic consolidation scheduling, stamped on first bank use (via the bank config API).
+- `dispositionSkepticism` / `dispositionLiteralism` / `dispositionEmpathy` - Reflect disposition traits (`1`–`5`) stamped on first bank use.
+- `entityLabels` - Controlled vocabulary for entity labels. Either a list of attribute defs (e.g. `[{ "name": "person", "description": "Human user" }]`) or a `{ "attributes": [...] }` object; other shapes are ignored. Stamped on first bank use.
 - `dynamicBankId` - Enable per-context memory banks (default: `true`)
 - `bankId` - Static bank ID used when `dynamicBankId` is `false`.
 - `bankIdPrefix` - Optional prefix for bank IDs (e.g. `"prod"` → `"prod-slack-C123"` or `"prod-shared-bank"`)
@@ -136,17 +143,18 @@ Optional settings in `~/.openclaw/openclaw.json`:
 - `recallMaxTokens` - Max tokens for recall response (default: `1024`). Controls how much memory context is injected per turn.
 - `recallTopK` - Max number of memories to inject per turn (default: unlimited).
 - `recallTypes` - Memory types to recall (default: `["observation"]`). Options: `world`, `experience`, `observation`. Defaults to observations — the consolidated, deduplicated view — to avoid surfacing the same answer multiple times when many raw memories say the same thing.
+- `preferObservations` - When `true`, recall drops raw facts already consolidated into an observation while keeping unconsolidated ones (default: `false`). Pair it with a `recallTypes` that includes raw types (e.g. `["observation", "world", "experience"]`) to surface just-retained facts before consolidation catches up — for example after a `/reset` followed by "what did I just say?" — without duplicating already-consolidated content.
 - `recallContextTurns` - Number of prior user turns to include in the recall query (default: `1`).
 - `recallMaxQueryChars` - Max characters for the composed recall query (default: `800`).
 - `recallPromptPreamble` - Custom preamble text placed above recalled memories. Overrides the built-in guidance text.
-- `recallInjectionPosition` - Where to inject recalled memories: `"prepend"` (default), `"append"`, or `"user"`. Use `"append"` to preserve prompt caching with large static system prompts. Use `"user"` to inject before the user message instead of in the system prompt.
+- `recallInjectionPosition` - Where to inject recalled memories: `"user"` (default), `"prepend"`, or `"append"`. The default injects before the user message and preserves the system prompt cache. Use `"prepend"` or `"append"` when memories need system-level context.
 - `recallRoles` - Which message roles to include when composing the contextual recall query (default: `["user", "assistant"]`).
 - `retainEveryNTurns` - Retain every Nth turn (default: `1` = every turn). Values > 1 enable chunked retention.
 - `retainOverlapTurns` - Extra prior turns included when chunked retention fires (default: `0`).
 - `enableKnowledgeTools` - Register `agent_knowledge_*` tools for explicit agent-driven lookup, reflection, ingest, and knowledge-page management (default: `false`).
 - `debug` - Enable debug logging (default: `false`).
 
-When using `agent_knowledge_recall` manually, pass `max_tokens` to control how much memory text the recall response may contain. Do not use `max_results` for this tool; OpenClaw auto-recall uses `recallTopK` when you need a count cap for automatically injected memories.
+When using `agent_knowledge_recall` manually, pass `max_tokens` to control how much memory text the recall response may contain. The tool has no `max_results` parameter — to cap the number of automatically injected memories, use `recallTopK` on auto-recall instead. When the answer needs verbatim wording or an exact number rather than an extracted fact, pass `include_chunks: true` to also get the raw source text those memories came from, and `max_chunk_tokens` to bound it (default `8192`).
 
 When using `agent_knowledge_reflect`, keep the default conservative settings unless you intentionally need a deeper synthesis: `budget` defaults to `low`, `max_tokens` defaults to `1024`, and `fact_types` defaults to `world`, `experience`, and `observation`. Reflect calls can be more expensive than recall because they retrieve memories and then call the configured Reflect LLM to generate an answer. For production banks, set a finite bank-level `reflect_source_facts_max_tokens` value (for example `4096` or `8192`) instead of leaving it unlimited, so ad-hoc reflection cannot pull an unbounded amount of source facts into the LLM context.
 
@@ -180,6 +188,41 @@ Available isolation fields:
 - `provider` - The message provider (e.g. Slack, Discord)
 
 Use `bankIdPrefix` to namespace bank IDs across environments (e.g. `"prod"`, `"staging"`). Set `dynamicBankId` to `false` to use a single shared bank for all conversations. In static mode, the plugin uses `bankId` if set, otherwise the default `openclaw` bank name.
+
+### Per-user bank defaults
+
+With `dynamicBankId` enabled (the default), each derived bank otherwise inherits only the Hindsight **server** defaults (`concise` extraction, no entity labels, etc.). To make every per-user bank match your intended base/shared bank, set the bank-default options below — they are stamped onto each bank **on first use**, before its first retain or recall:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "hindsight-openclaw": {
+        "enabled": true,
+        "config": {
+          "dynamicBankId": true,
+          "dynamicBankGranularity": ["agent", "channel", "user"],
+          "retainExtractionMode": "verbose",
+          "enableObservations": true,
+          "enableAutoConsolidation": true,
+          "dispositionSkepticism": 3,
+          "dispositionLiteralism": 3,
+          "dispositionEmpathy": 4,
+          "entityLabels": [
+            { "name": "person", "description": "A human user or contact" },
+            { "name": "project", "description": "A software project or product" }
+          ],
+          "retainMission": "Extract durable preferences, decisions, and project context.",
+          "observationsMission": "Synthesise stable user preferences and active projects.",
+          "bankMission": "You are a helpful assistant with long-term memory across channels."
+        }
+      }
+    }
+  }
+}
+```
+
+Unset options are not sent, so existing behaviour is unchanged when you only configure missions. Each bank is configured at most once per gateway process.
 
 ### Retention Controls
 
@@ -421,6 +464,20 @@ openclaw config get plugins.entries.hindsight-openclaw.config.llmProvider
 
 If you used `--ref-source env`, double-check that the referenced env var
 (e.g. `OPENAI_API_KEY`) is exported in the shell that runs `openclaw gateway`.
+
+## Limitations
+
+### `memory-wiki` bridge mode is not supported
+
+`hindsight-openclaw` does not export OpenClaw `publicArtifacts`, so OpenClaw's
+`memory-wiki` **bridge mode** (`vaultMode: "bridge"`) is not supported. With the
+Hindsight plugin active, `openclaw wiki bridge import` imports `0` artifacts and
+`openclaw wiki status` warns that the active memory plugin isn't exporting any
+public memory artifacts.
+
+This applies only to the wiki bridge. Hindsight's own memory works normally —
+retain / recall / reflect, shared banks, and the external-API setup above are all
+unaffected.
 
 ### Verify it's working
 

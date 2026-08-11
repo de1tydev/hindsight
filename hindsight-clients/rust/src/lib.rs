@@ -128,6 +128,7 @@ mod tests {
                 },
             ],
             document_tags: None,
+            operation_id: None,
         };
         let retain_response = client
             .retain_memories(&bank_id, None, &retain_request)
@@ -140,6 +141,7 @@ mod tests {
             query: "Who is Alice?".to_string(),
             max_tokens: 4096,
             trace: false,
+            prefer_observations: false,
             budget: None,
             include: None,
             query_timestamp: None,
@@ -147,6 +149,7 @@ mod tests {
             tags: None,
             tags_match: types::TagsMatch::Any,
             tag_groups: None,
+            min_scores: None,
         };
         let recall_response = client
             .recall_memories(&bank_id, None, &recall_request)

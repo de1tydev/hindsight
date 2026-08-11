@@ -36,18 +36,22 @@ async def _insert_unit(
     text: str,
     event_date: datetime | None = None,
     fact_type: str = "experience",
+    embedding: list[float] | None = None,
 ) -> uuid.UUID:
-    """Insert a memory unit directly. Skips embedding (NULL is fine for temporal tests)."""
+    """Insert a memory unit directly. Embedding defaults to NULL (fine for temporal tests); pass
+    a 384-dim vector to make the unit a candidate for the semantic top-up pass."""
     mem_id = uuid.uuid4()
+    emb = str(embedding) if embedding is not None else None
     await conn.execute(
         """
-        INSERT INTO memory_units (id, bank_id, text, fact_type, event_date, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+        INSERT INTO memory_units (id, bank_id, text, fact_type, embedding, event_date, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5::vector, $6, NOW(), NOW())
         """,
         mem_id,
         bank_id,
         text,
         fact_type,
+        emb,
         event_date or datetime.now(UTC),
     )
     return mem_id
@@ -161,7 +165,7 @@ class TestEnqueueRelinkVictims:
 
             backend = await memory._get_backend()
             async with conn.transaction():
-                count = await enqueue_relink_victims(conn, bank_id, [str(doomed)], ops=backend.ops)
+                count = await enqueue_relink_victims(conn, bank_id, [str(doomed)])
 
             assert count == 1
             assert await _queue_unit_ids(conn, bank_id) == [str(survivor)]
@@ -182,7 +186,7 @@ class TestEnqueueRelinkVictims:
             backend = await memory._get_backend()
             async with conn.transaction():
                 # Both a and b are being deleted — neither should be enqueued.
-                count = await enqueue_relink_victims(conn, bank_id, [str(a), str(b)], ops=backend.ops)
+                count = await enqueue_relink_victims(conn, bank_id, [str(a), str(b)])
 
             assert count == 0
             assert await _queue_unit_ids(conn, bank_id) == []
@@ -202,7 +206,7 @@ class TestEnqueueRelinkVictims:
 
             backend = await memory._get_backend()
             async with conn.transaction():
-                count = await enqueue_relink_victims(conn, bank_id, [str(doomed)], ops=backend.ops)
+                count = await enqueue_relink_victims(conn, bank_id, [str(doomed)])
 
             assert count == 0
 
@@ -223,10 +227,101 @@ class TestEnqueueRelinkVictims:
 
             backend = await memory._get_backend()
             async with conn.transaction():
-                await enqueue_relink_victims(conn, bank_id, [str(doomed1)], ops=backend.ops)
-                await enqueue_relink_victims(conn, bank_id, [str(doomed2)], ops=backend.ops)
+                await enqueue_relink_victims(conn, bank_id, [str(doomed1)])
+                await enqueue_relink_victims(conn, bank_id, [str(doomed2)])
 
             assert await _queue_unit_ids(conn, bank_id) == [str(survivor)]
+
+    @pytest.mark.asyncio
+    async def test_include_affected_is_opt_in(self, memory: MemoryEngine, request_context: RequestContext):
+        """Without ``include_affected_units`` an affected unit that survives is not enqueued —
+        the default (a delete) only needs the victims that pointed AT it."""
+        bank_id = f"test-gm-optin-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            edited = await _insert_unit(conn, bank_id, "edited")
+            async with conn.transaction():
+                count = await enqueue_relink_victims(conn, bank_id, [str(edited)])
+
+            assert count == 0
+            assert await _queue_unit_ids(conn, bank_id) == []
+
+    @pytest.mark.asyncio
+    async def test_include_affected_enqueues_self_without_victims(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """Regression for #2889: an edit that strips a unit's own links but leaves it live must
+        still enqueue the unit, even when nothing pointed at it — otherwise the edit is a silent
+        no-op and the unit's outgoing adjacency is never rebuilt."""
+        bank_id = f"test-gm-self-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            edited = await _insert_unit(conn, bank_id, "edited")
+            async with conn.transaction():
+                count = await enqueue_relink_victims(conn, bank_id, [str(edited)], include_affected_units=True)
+
+            assert count == 1
+            assert await _queue_unit_ids(conn, bank_id) == [str(edited)]
+
+    @pytest.mark.asyncio
+    async def test_include_affected_combines_self_and_victims_in_one_insert(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """Regression for the ordered-lock deadlock (#2529/#2534): self and its victims go in as
+        one enqueue so the queue's sorted insert ordering is preserved across the whole set — two
+        separate inserts could take the per-row locks in opposing orders and deadlock."""
+        bank_id = f"test-gm-combined-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            edited = await _insert_unit(conn, bank_id, "edited")
+            survivor = await _insert_unit(conn, bank_id, "survivor")
+            # survivor → edited, so survivor is a victim; edited is enqueued too via the opt-in.
+            await _insert_link(conn, bank_id, survivor, edited, "semantic")
+            async with conn.transaction():
+                count = await enqueue_relink_victims(conn, bank_id, [str(edited)], include_affected_units=True)
+
+            assert count == 2
+            # Both present, and the queue is in the sorted order the deadlock-safe insert guarantees.
+            assert await _queue_unit_ids(conn, bank_id) == sorted([str(edited), str(survivor)])
+
+    @pytest.mark.asyncio
+    async def test_semantic_topup_uses_configured_link_threshold(
+        self, memory: MemoryEngine, request_context: RequestContext, monkeypatch
+    ):
+        """The relink pass must probe for semantic neighbours at the CONFIGURED similarity floor
+        (``config.semantic_link_min_similarity``), not an implicit default — otherwise topped-up
+        links diverge from the ones retain would have created."""
+        from hindsight_api.config import get_config
+        from hindsight_api.engine.memories.pg import graph as pg_graph
+
+        captured: dict[str, float] = {}
+
+        async def _capture(conn, bank_id, seed_ids, seed_embs, *, fact_types=None, threshold, **kwargs):
+            captured["threshold"] = threshold
+            return []
+
+        monkeypatch.setattr(pg_graph, "compute_semantic_links_ann", _capture)
+
+        bank_id = f"test-gm-thresh-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            # A world/experience unit with an embedding and no semantic links → a semantic top-up
+            # candidate, so the relink pass reaches compute_semantic_links_ann.
+            unit = await _insert_unit(conn, bank_id, "needs topup", embedding=[0.1] * 384)
+            async with conn.transaction():
+                await enqueue_relink_victims(conn, bank_id, [str(unit)], include_affected_units=True)
+
+        await run_graph_maintenance_job(memory, bank_id, request_context)
+
+        assert captured.get("threshold") == get_config().semantic_link_min_similarity
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +354,68 @@ class TestDeleteDocumentEnqueue:
             # queue before delete_document returned — assert end-state, not the
             # intermediate enqueue. Queue should be empty.
             assert await _queue_unit_ids(conn, bank_id) == []
+
+    @pytest.mark.asyncio
+    async def test_delete_isolated_document_prunes_its_entities(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """#3196: an isolated document has no inbound links, so the delete enqueues
+        zero relink victims. The job must still be submitted — its bank-wide orphan
+        sweep is what reclaims the entities the deleted units were the only
+        reference for."""
+        bank_id = f"test-gm-solo-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            await _insert_document(conn, bank_id, "doc-solo")
+            unit = await _insert_unit(conn, bank_id, "the only unit in the bank")
+            await _attach_unit_to_doc(conn, unit, "doc-solo")
+            entity = await _insert_entity(conn, bank_id, "solo-entity")
+            await _link_unit_entity(conn, unit, entity)
+
+        await memory.delete_document("doc-solo", bank_id, request_context=request_context)
+
+        async with pool.acquire() as conn:
+            # Nothing was ever enqueued: this delete would have short-circuited
+            # on `no_work` before the fix.
+            assert await _queue_unit_ids(conn, bank_id) == []
+            remaining = await conn.fetchval("SELECT COUNT(*) FROM entities WHERE bank_id = $1", bank_id)
+            assert remaining == 0
+
+
+class TestSubmitForceSweep:
+    @pytest.mark.asyncio
+    async def test_empty_queue_short_circuits_by_default(self, memory: MemoryEngine, request_context: RequestContext):
+        """The default stays cheap for unconditional callers (every retain)."""
+        bank_id = f"test-gm-nowork-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        result = await memory.submit_async_graph_maintenance(bank_id=bank_id, request_context=request_context)
+
+        assert result == {"operation_id": None, "no_work": True}
+
+    @pytest.mark.asyncio
+    async def test_force_sweep_submits_on_empty_queue(self, memory: MemoryEngine, request_context: RequestContext):
+        """`force_sweep=True` submits the job even with nothing enqueued, so the
+        orphan-entity sweep runs for callers that dropped unit→entity references."""
+        bank_id = f"test-gm-force-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            orphan = await _insert_entity(conn, bank_id, "unreferenced")
+
+        result = await memory.submit_async_graph_maintenance(
+            bank_id=bank_id, request_context=request_context, force_sweep=True
+        )
+
+        assert result.get("no_work") is not True
+        assert result["operation_id"]
+
+        async with pool.acquire() as conn:
+            # SyncTaskBackend ran the job inline: the orphan is gone.
+            assert await conn.fetchval("SELECT 1 FROM entities WHERE id = $1", orphan) is None
 
 
 # ---------------------------------------------------------------------------

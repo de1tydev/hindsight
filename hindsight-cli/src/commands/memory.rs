@@ -277,6 +277,7 @@ pub fn recall(
     tags: Vec<String>,
     tags_match: Option<String>,
     query_timestamp: Option<String>,
+    prefer_observations: bool,
     verbose: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
@@ -310,10 +311,12 @@ pub fn recall(
         max_tokens,
         trace,
         query_timestamp,
+        prefer_observations,
         include,
         tags: if tags.is_empty() { None } else { Some(tags) },
         tags_match: parse_tags_match(&tags_match),
         tag_groups: None,
+        min_scores: None,
     };
 
     let response = client.recall(agent_id, &request, verbose);
@@ -405,6 +408,7 @@ pub fn reflect(
         tags: if tags.is_empty() { None } else { Some(tags) },
         tags_match: parse_tags_match(&tags_match),
         tag_groups: None,
+        apply_all_directives: false,
         fact_types: mapped_fact_types,
         exclude_mental_models,
         exclude_mental_model_ids,
@@ -467,6 +471,8 @@ pub fn retain(
         items: vec![item],
         async_: r#async,
         document_tags,
+        // The CLI does not expose idempotency keys; each invocation is a new operation.
+        operation_id: None,
     };
 
     let response = client.retain(agent_id, &request, r#async, verbose);

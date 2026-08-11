@@ -17,7 +17,6 @@ No alembic.ini required - all configuration is done programmatically.
 
 import hashlib
 import logging
-import os
 import threading
 import time
 from pathlib import Path
@@ -32,6 +31,7 @@ from sqlalchemy.pool import NullPool
 from ._pg_search import normalize_pg_search_tokenizer, pg_search_bm25_columns
 from ._vector_index import (
     bootstrap_extension,
+    configured_vector_extension,
     detect_vector_extension,
     index_type_keyword,
     index_using_clause,
@@ -55,9 +55,94 @@ MIGRATION_LOCK_ID = 123456789
 _alembic_lock = threading.Lock()
 
 
+def _set_alembic_main_option(config: Config, name: str, value: str) -> None:
+    """Set an Alembic option without treating URL percent escapes as interpolation."""
+    config.set_main_option(name, value.replace("%", "%%"))
+
+
 def _detect_vector_extension(conn, vector_extension: str = "pgvector") -> str:
     """Validate configured vector extension and preserve Azure DiskANN detection."""
     return detect_vector_extension(conn, vector_extension)
+
+
+def _ensure_pgvector_extension_in_public(conn: Connection) -> None:
+    """Ensure pgvector is installed before pgvector-backed migrations run."""
+    logger.debug("Checking pgvector extension availability...")
+
+    # First, check if extension already exists
+    ext_check = conn.execute(
+        text(
+            "SELECT extname, nspname FROM pg_extension e "
+            "JOIN pg_namespace n ON e.extnamespace = n.oid "
+            "WHERE extname = 'vector'"
+        )
+    ).fetchone()
+
+    if ext_check:
+        # Extension exists - check if in correct schema
+        ext_schema = ext_check[1]
+        if ext_schema == "public":
+            logger.info("pgvector extension found in public schema - ready to use")
+        else:
+            # Extension in wrong schema - try to fix if we have permissions
+            logger.warning(
+                f"pgvector extension found in schema '{ext_schema}' instead of 'public'. Attempting to relocate..."
+            )
+            try:
+                conn.execute(text("DROP EXTENSION vector CASCADE"))
+                conn.execute(text("SET search_path TO public"))
+                conn.execute(text("CREATE EXTENSION vector"))
+                conn.commit()
+                logger.info("pgvector extension relocated to public schema")
+            except Exception as e:
+                # Failed to relocate - log but don't fail if extension exists somewhere
+                logger.warning(
+                    f"Could not relocate pgvector extension to public schema: {e}. "
+                    f"Continuing with extension in '{ext_schema}' schema."
+                )
+                conn.rollback()
+    else:
+        # Extension doesn't exist - try to install
+        logger.info("pgvector extension not found, attempting to install...")
+        try:
+            conn.execute(text("SET search_path TO public"))
+            conn.execute(text("CREATE EXTENSION vector"))
+            conn.commit()
+            logger.info("pgvector extension installed in public schema")
+        except Exception as e:
+            # Installation failed - this is only fatal if extension truly doesn't exist
+            # Check one more time in case another process installed it
+            conn.rollback()
+            ext_recheck = conn.execute(
+                text(
+                    "SELECT nspname FROM pg_extension e "
+                    "JOIN pg_namespace n ON e.extnamespace = n.oid "
+                    "WHERE extname = 'vector'"
+                )
+            ).fetchone()
+
+            if ext_recheck:
+                logger.warning(
+                    f"Could not install pgvector extension (permission denied?), "
+                    f"but extension exists in '{ext_recheck[0]}' schema. Continuing..."
+                )
+            else:
+                # Extension truly doesn't exist and we can't install it
+                logger.error(
+                    f"pgvector extension is not installed and cannot be installed: {e}. "
+                    f"Please ensure pgvector is installed by a database administrator. "
+                    f"See: https://github.com/pgvector/pgvector#installation"
+                )
+                raise RuntimeError(
+                    "pgvector extension is required but not installed. Please install it with: CREATE EXTENSION vector;"
+                ) from e
+
+
+def _bootstrap_vector_extension_for_migrations(conn: Connection, vector_extension: str) -> None:
+    """Bootstrap the configured vector backend before schema migrations run."""
+    if vector_extension == "pgvector":
+        _ensure_pgvector_extension_in_public(conn)
+    bootstrap_extension(conn, vector_extension)
 
 
 def _drop_per_bank_vector_indexes(conn: Connection, schema_name: str) -> None:
@@ -110,22 +195,22 @@ def _run_migrations_internal(database_url: str, script_location: str, schema: st
     alembic_cfg = Config()
 
     # Set the script location (where alembic versions are stored)
-    alembic_cfg.set_main_option("script_location", script_location)
+    _set_alembic_main_option(alembic_cfg, "script_location", script_location)
 
     # Set the database URL
-    alembic_cfg.set_main_option("sqlalchemy.url", database_url)
+    _set_alembic_main_option(alembic_cfg, "sqlalchemy.url", database_url)
 
     # Configure logging (optional, but helps with debugging)
     # Uses Python's logging system instead of alembic.ini
-    alembic_cfg.set_main_option("prepend_sys_path", ".")
+    _set_alembic_main_option(alembic_cfg, "prepend_sys_path", ".")
 
     # Set path_separator to avoid deprecation warning
-    alembic_cfg.set_main_option("path_separator", "os")
+    _set_alembic_main_option(alembic_cfg, "path_separator", "os")
 
     # If targeting a specific schema, pass it to env.py via config
     # env.py will handle setting search_path and version_table_schema
     if schema:
-        alembic_cfg.set_main_option("target_schema", schema)
+        _set_alembic_main_option(alembic_cfg, "target_schema", schema)
 
     # Run migrations under a process-level lock.  Alembic uses module-level
     # global proxies that are not thread-safe, so concurrent command.upgrade()
@@ -275,83 +360,8 @@ def run_migrations(
             logger.debug("Migration advisory lock acquired")
 
             try:
-                # Ensure pgvector extension is installed globally BEFORE schema migrations
-                # This is critical: the extension must exist database-wide before any schema
-                # migrations run, otherwise custom schemas won't have access to vector types
-                logger.debug("Checking pgvector extension availability...")
-
-                # First, check if extension already exists
-                ext_check = conn.execute(
-                    text(
-                        "SELECT extname, nspname FROM pg_extension e "
-                        "JOIN pg_namespace n ON e.extnamespace = n.oid "
-                        "WHERE extname = 'vector'"
-                    )
-                ).fetchone()
-
-                if ext_check:
-                    # Extension exists - check if in correct schema
-                    ext_schema = ext_check[1]
-                    if ext_schema == "public":
-                        logger.info("pgvector extension found in public schema - ready to use")
-                    else:
-                        # Extension in wrong schema - try to fix if we have permissions
-                        logger.warning(
-                            f"pgvector extension found in schema '{ext_schema}' instead of 'public'. "
-                            f"Attempting to relocate..."
-                        )
-                        try:
-                            conn.execute(text("DROP EXTENSION vector CASCADE"))
-                            conn.execute(text("SET search_path TO public"))
-                            conn.execute(text("CREATE EXTENSION vector"))
-                            conn.commit()
-                            logger.info("pgvector extension relocated to public schema")
-                        except Exception as e:
-                            # Failed to relocate - log but don't fail if extension exists somewhere
-                            logger.warning(
-                                f"Could not relocate pgvector extension to public schema: {e}. "
-                                f"Continuing with extension in '{ext_schema}' schema."
-                            )
-                            conn.rollback()
-                else:
-                    # Extension doesn't exist - try to install
-                    logger.info("pgvector extension not found, attempting to install...")
-                    try:
-                        conn.execute(text("SET search_path TO public"))
-                        conn.execute(text("CREATE EXTENSION vector"))
-                        conn.commit()
-                        logger.info("pgvector extension installed in public schema")
-                    except Exception as e:
-                        # Installation failed - this is only fatal if extension truly doesn't exist
-                        # Check one more time in case another process installed it
-                        conn.rollback()
-                        ext_recheck = conn.execute(
-                            text(
-                                "SELECT nspname FROM pg_extension e "
-                                "JOIN pg_namespace n ON e.extnamespace = n.oid "
-                                "WHERE extname = 'vector'"
-                            )
-                        ).fetchone()
-
-                        if ext_recheck:
-                            logger.warning(
-                                f"Could not install pgvector extension (permission denied?), "
-                                f"but extension exists in '{ext_recheck[0]}' schema. Continuing..."
-                            )
-                        else:
-                            # Extension truly doesn't exist and we can't install it
-                            logger.error(
-                                f"pgvector extension is not installed and cannot be installed: {e}. "
-                                f"Please ensure pgvector is installed by a database administrator. "
-                                f"See: https://github.com/pgvector/pgvector#installation"
-                            )
-                            raise RuntimeError(
-                                "pgvector extension is required but not installed. "
-                                "Please install it with: CREATE EXTENSION vector;"
-                            ) from e
-
-                vector_extension = os.getenv("HINDSIGHT_API_VECTOR_EXTENSION", "pgvector").lower()
-                bootstrap_extension(conn, vector_extension)
+                vector_extension = configured_vector_extension()
+                _bootstrap_vector_extension_for_migrations(conn, vector_extension)
 
                 # Commit any pending transaction on the advisory-lock connection
                 # before running migrations.  Some code paths above (e.g., the
@@ -377,65 +387,6 @@ def run_migrations(
     except Exception as e:
         logger.error(f"Failed to run database migrations: {e}", exc_info=True)
         raise RuntimeError("Database migration failed") from e
-
-
-def check_migration_status(
-    database_url: str | None = None, script_location: str | None = None
-) -> tuple[str | None, str | None]:
-    """
-    Check current database schema version and latest available version.
-
-    Args:
-        database_url: SQLAlchemy database URL. If None, uses HINDSIGHT_API_DATABASE_URL env var.
-        script_location: Path to alembic migrations directory. If None, uses default location.
-
-    Returns:
-        Tuple of (current_revision, head_revision)
-        Returns (None, None) if unable to determine versions
-    """
-    try:
-        from alembic.runtime.migration import MigrationContext
-        from alembic.script import ScriptDirectory
-        from sqlalchemy import create_engine
-
-        # Get database URL
-        if database_url is None:
-            database_url = os.getenv("HINDSIGHT_API_DATABASE_URL")
-        if not database_url:
-            logger.warning(
-                "Database URL not provided and HINDSIGHT_API_DATABASE_URL not set, cannot check migration status"
-            )
-            return None, None
-
-        # Get current revision from database
-        engine = create_engine(to_libpq_url(database_url), poolclass=NullPool)
-        with engine.connect() as connection:
-            context = MigrationContext.configure(connection)
-            current_rev = context.get_current_revision()
-
-        # Get head revision from migration scripts
-        if script_location is None:
-            package_dir = Path(__file__).parent
-            script_location = str(package_dir / "alembic")
-
-        script_path = Path(script_location)
-        if not script_path.exists():
-            logger.warning(f"Script location not found at {script_location}")
-            return current_rev, None
-
-        # Create config programmatically
-        alembic_cfg = Config()
-        alembic_cfg.set_main_option("script_location", script_location)
-        alembic_cfg.set_main_option("path_separator", "os")
-
-        script = ScriptDirectory.from_config(alembic_cfg)
-        head_rev = script.get_current_head()
-
-        return current_rev, head_rev
-
-    except Exception as e:
-        logger.warning(f"Unable to check migration status: {e}")
-        return None, None
 
 
 def _migrate_table_embedding_dimension(
@@ -673,37 +624,51 @@ def ensure_vector_extension(
             ).scalar()
 
             # Check current index type by querying pg_indexes
-            current_index_info = conn.execute(
+            current_index_rows = conn.execute(
                 text("""
-                    SELECT indexdef
+                    SELECT indexdef, indexname
                     FROM pg_indexes
                     WHERE schemaname = :schema
                       AND tablename = :table_name
                       AND indexname LIKE :index_pattern
                 """),
                 {"schema": schema_name, "table_name": table_name, "index_pattern": "%embedding%"},
-            ).fetchone()
+            ).fetchall()
 
+            if table_name == "memory_units" and uses_per_bank_vector_indexes(target_ext):
+                # Per-bank backends never use a GLOBAL memory_units vector index.
+                # Every vector search is bank + fact_type scoped and served by the
+                # per-(bank, fact_type) partial indexes created at bank-creation time
+                # (bank_utils.create_bank_vector_indexes); the planner never picks a
+                # global index when bank_id is in the WHERE clause, which is exactly
+                # why migration d5e6f7a8b9c0 drops it for these backends.
+                #
+                # The reconcile is strictly hands-off here, in BOTH directions:
+                # never create the index (dead weight — an older version of this
+                # branch did, which is how legacy schemas ended up carrying it),
+                # and never drop or rebuild one that exists. Runtime DROP/CREATE
+                # INDEX takes an ACCESS EXCLUSIVE lock on memory_units at
+                # unpredictable times (startup, tenant provisioning); index DDL
+                # belongs in the versioned migration path. Leftover globals are
+                # removed by migration f2a6d8c4b1e9. This continue also keeps
+                # memory_units out of the type-mismatch reconcile below, which
+                # would otherwise recreate a global index with the new type on a
+                # backend switch.
+                if current_index_rows:
+                    stale_names = ", ".join(row[1] for row in current_index_rows)
+                    logger.info(
+                        f"Global vector index ({stale_names}) present on {schema_name}.memory_units "
+                        f"with per-bank backend ({target_ext}); left untouched — removed by "
+                        f"migration f2a6d8c4b1e9"
+                    )
+                else:
+                    logger.debug(
+                        f"Per-bank vector backend ({target_ext}); skipping global {index_name} creation on {table_name}"
+                    )
+                continue
+
+            current_index_info = current_index_rows[0] if current_index_rows else None
             if not current_index_info:
-                if table_name == "memory_units" and uses_per_bank_vector_indexes(target_ext):
-                    # Check whether per-bank partial vector indexes already cover this table
-                    # (created by the bank_utils lifecycle — no global index needed in that case)
-                    per_bank_index_count = conn.execute(
-                        text("""
-                            SELECT COUNT(*)
-                            FROM pg_indexes
-                            WHERE schemaname = :schema
-                              AND tablename = :table_name
-                              AND indexname LIKE 'idx_mu_emb_%'
-                        """),
-                        {"schema": schema_name, "table_name": table_name},
-                    ).scalar()
-                    if per_bank_index_count and per_bank_index_count > 0:
-                        logger.debug(
-                            f"No global embedding index on {table_name}, but {per_bank_index_count} "
-                            f"per-bank partial vector indexes exist — skipping global index creation"
-                        )
-                        continue
                 logger.warning(f"No embedding index found for {table_name}, will create it if safe")
                 mismatched_tables.append((table_name, index_name, None, row_count))
                 continue

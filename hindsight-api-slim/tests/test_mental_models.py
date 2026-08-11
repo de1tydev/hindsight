@@ -588,6 +588,54 @@ class TestDirectivesInReflect:
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
 
+    async def test_apply_all_directives_overrides_tag_isolation(self, memory: MemoryEngine, request_context):
+        """apply_all_directives=True loads every directive regardless of the reflect tag scope."""
+        bank_id = f"test-directive-apply-all-{uuid.uuid4().hex[:8]}"
+
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+
+        # Untagged + tagged directives in the bank.
+        await memory.create_directive(
+            bank_id=bank_id,
+            name="General Policy",
+            content="You MUST include the exact phrase 'MEMO-VERIFIED' somewhere in your response.",
+            request_context=request_context,
+        )
+        await memory.create_directive(
+            bank_id=bank_id,
+            name="Tagged Policy",
+            content="You MUST include the exact phrase 'PROJECT-X-CLASSIFIED' somewhere in your response.",
+            tags=["project-x"],
+            request_context=request_context,
+        )
+
+        # No reflect tags: default isolation drops the tagged directive...
+        default_result = await memory.reflect_async(
+            bank_id=bank_id,
+            query="What color is the sky?",
+            request_context=request_context,
+        )
+        default_names = [d.name for d in default_result.directives_applied]
+        assert "Tagged Policy" not in default_names, (
+            f"Tagged directive should be isolated out by default. Applied: {default_names}"
+        )
+
+        # ...but apply_all_directives=True loads both, ignoring tag scope.
+        all_result = await memory.reflect_async(
+            bank_id=bank_id,
+            query="What color is the sky?",
+            apply_all_directives=True,
+            request_context=request_context,
+        )
+        all_names = [d.name for d in all_result.directives_applied]
+        assert "General Policy" in all_names, f"Untagged directive should be loaded. Applied: {all_names}"
+        assert "Tagged Policy" in all_names, (
+            f"Tagged directive should be loaded when apply_all_directives=True. Applied: {all_names}"
+        )
+
+        # Cleanup
+        await memory.delete_bank(bank_id, request_context=request_context)
+
     async def test_reflect_based_on_structure(self, memory: MemoryEngine, request_context):
         """Test that reflect returns correct based_on structure with directives and memories separated."""
         bank_id = f"test-reflect-based-on-{uuid.uuid4().hex[:8]}"
@@ -1152,7 +1200,7 @@ class TestMentalModelStaleness:
         assert got["is_stale"] is False
         await memory.delete_bank(bank_id, request_context=request_context)
 
-    async def test_tagged_mm_stale_on_overlapping_memory(self, memory: MemoryEngine, request_context):
+    async def test_tagged_mm_defaults_to_all_strict(self, memory: MemoryEngine, request_context):
         bank_id = f"test-mm-stale-overlap-{uuid.uuid4().hex[:8]}"
         await memory.get_bank_profile(bank_id, request_context=request_context)
         mm = await memory.create_mental_model(
@@ -1160,10 +1208,121 @@ class TestMentalModelStaleness:
             name="MM",
             source_query="q",
             content="c",
-            tags=["user_a"],
+            tags=["user_a", "proj_x"],
             request_context=request_context,
         )
         await self._insert_memory(memory, bank_id, tags=["user_a", "extra"])
+        got = await memory.get_mental_model(bank_id, mm["id"], request_context=request_context)
+        assert got["is_stale"] is False
+
+        await self._insert_memory(memory, bank_id, tags=["user_a", "proj_x"])
+        got = await memory.get_mental_model(bank_id, mm["id"], request_context=request_context)
+        assert got["is_stale"] is True
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_tags_match_any_keeps_overlap_behavior(self, memory: MemoryEngine, request_context):
+        bank_id = f"test-mm-stale-any-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="MM",
+            source_query="q",
+            content="c",
+            tags=["user_a", "proj_x"],
+            trigger={"refresh_after_consolidation": False, "tags_match": "any"},
+            request_context=request_context,
+        )
+        await self._insert_memory(memory, bank_id, tags=["user_a"])
+        got = await memory.get_mental_model(bank_id, mm["id"], request_context=request_context)
+        assert got["is_stale"] is True
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_tag_groups_define_stale_scope(self, memory: MemoryEngine, request_context):
+        bank_id = f"test-mm-stale-groups-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="MM",
+            source_query="q",
+            content="c",
+            tags=["ignored-flat-tag"],
+            trigger={
+                "refresh_after_consolidation": False,
+                "tag_groups": [{"and": [{"tags": ["user_a"]}, {"tags": ["proj_x"]}]}],
+            },
+            request_context=request_context,
+        )
+        await self._insert_memory(memory, bank_id, tags=["user_a"])
+        got = await memory.get_mental_model(bank_id, mm["id"], request_context=request_context)
+        assert got["is_stale"] is False
+
+        await self._insert_memory(memory, bank_id, tags=["user_a", "proj_x"])
+        got = await memory.get_mental_model(bank_id, mm["id"], request_context=request_context)
+        assert got["is_stale"] is True
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_flat_tags_and_fact_types_share_stale_scope(self, memory: MemoryEngine, request_context):
+        bank_id = f"test-mm-stale-flat-fact-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="MM",
+            source_query="q",
+            content="c",
+            tags=["user_a"],
+            trigger={"refresh_after_consolidation": False, "fact_types": ["world"]},
+            request_context=request_context,
+        )
+        await self._insert_memory(memory, bank_id, tags=["user_a"], fact_type="experience")
+        got = await memory.get_mental_model(bank_id, mm["id"], request_context=request_context)
+        assert got["is_stale"] is False
+
+        await self._insert_memory(memory, bank_id, tags=["user_a"], fact_type="world")
+        got = await memory.get_mental_model(bank_id, mm["id"], request_context=request_context)
+        assert got["is_stale"] is True
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_tag_groups_and_fact_types_share_stale_scope(self, memory: MemoryEngine, request_context):
+        bank_id = f"test-mm-stale-group-fact-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="MM",
+            source_query="q",
+            content="c",
+            trigger={
+                "refresh_after_consolidation": False,
+                "tag_groups": [
+                    {"tags": ["user_a", "team_red"], "match": "all_strict"},
+                    {"or": [{"tags": ["proj_x"]}, {"tags": ["proj_y"]}]},
+                ],
+                "fact_types": ["world"],
+            },
+            request_context=request_context,
+        )
+        await self._insert_memory(memory, bank_id, tags=["user_a", "team_red"], fact_type="world")
+        got = await memory.get_mental_model(bank_id, mm["id"], request_context=request_context)
+        assert got["is_stale"] is False
+
+        await self._insert_memory(memory, bank_id, tags=["user_a", "proj_x"], fact_type="world")
+        got = await memory.get_mental_model(bank_id, mm["id"], request_context=request_context)
+        assert got["is_stale"] is False
+
+        await self._insert_memory(
+            memory,
+            bank_id,
+            tags=["user_a", "team_red", "proj_x"],
+            fact_type="experience",
+        )
+        got = await memory.get_mental_model(bank_id, mm["id"], request_context=request_context)
+        assert got["is_stale"] is False
+
+        await self._insert_memory(
+            memory,
+            bank_id,
+            tags=["user_a", "team_red", "proj_y"],
+            fact_type="world",
+        )
         got = await memory.get_mental_model(bank_id, mm["id"], request_context=request_context)
         assert got["is_stale"] is True
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -1274,6 +1433,83 @@ class TestMentalModelStaleness:
         assert by_id[stale["id"]]["is_stale"] is True
 
         await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_tool_search_mental_models_skips_the_scan_below_the_watermark(
+        self, memory: MemoryEngine, request_context
+    ):
+        """The bank watermark answers "fresh" without the per-model scope query.
+
+        That query scans the bank's memories in full (no index on updated_at), so a
+        model refreshed after the newest write must not pay for it. Models above the
+        watermark still get the exact, scope-aware answer.
+        """
+        from datetime import datetime
+
+        from hindsight_api.engine.reflect.tools import tool_search_mental_models
+
+        bank_id = f"test-mm-watermark-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+        # Written first, so both models end up refreshed *after* the watermark.
+        await self._insert_memory(memory, bank_id, tags=["user_a"])
+        scoped = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="scoped MM",
+            source_query="q",
+            content="scoped",
+            tags=["user_a"],
+            request_context=request_context,
+        )
+        other = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="other MM",
+            source_query="q",
+            content="other",
+            tags=["user_b"],
+            request_context=request_context,
+        )
+
+        scoped_checks = 0
+        original = memory.compute_mental_model_is_stale
+
+        async def counting_check(*args, **kwargs):
+            nonlocal scoped_checks
+            scoped_checks += 1
+            return await original(*args, **kwargs)
+
+        memory.compute_mental_model_is_stale = counting_check
+        try:
+            pool = await memory._get_pool()
+            embedding = (await embedding_utils.generate_embeddings_batch(memory.embeddings, ["q"]))[0]
+
+            async def search() -> dict:
+                freshness = await memory.get_bank_freshness(bank_id, request_context=request_context)
+                raw = freshness["last_memory_write_at"]
+                async with pool.acquire() as conn:
+                    return await tool_search_mental_models(
+                        memory,
+                        conn,
+                        bank_id,
+                        "q",
+                        embedding,
+                        max_results=10,
+                        last_memory_write_at=datetime.fromisoformat(raw) if raw else None,
+                    )
+
+            by_id = {m["id"]: m for m in (await search())["mental_models"]}
+            assert by_id[scoped["id"]]["is_stale"] is False
+            assert by_id[other["id"]]["is_stale"] is False
+            assert scoped_checks == 0, "a model refreshed after the newest write must not run the scoped query"
+
+            # A new memory moves the watermark past both models — now the exact,
+            # tag-aware answer is required, and only user_a's model is stale.
+            await self._insert_memory(memory, bank_id, tags=["user_a"])
+            by_id = {m["id"]: m for m in (await search())["mental_models"]}
+            assert scoped_checks == 2, "both models are above the watermark and must be checked exactly"
+            assert by_id[scoped["id"]]["is_stale"] is True
+            assert by_id[other["id"]]["is_stale"] is False
+        finally:
+            memory.compute_mental_model_is_stale = original
+            await memory.delete_bank(bank_id, request_context=request_context)
 
 
 @pytest.mark.hs_llm_core
@@ -1789,6 +2025,7 @@ class TestMentalModelRefreshMaxTokens:
     """
 
     async def test_refresh_passes_stored_max_tokens_to_reflect(self, request_context):
+        from datetime import datetime, timezone
         from unittest.mock import AsyncMock
 
         from hindsight_api.engine.memory_engine import MemoryEngine
@@ -1813,6 +2050,11 @@ class TestMentalModelRefreshMaxTokens:
             return_value=ReflectResult(text="stub synthesis", based_on={})
         )
         engine.update_mental_model = AsyncMock(return_value=mental_model)  # type: ignore[method-assign]
+        # DB-time refresh watermark — stub so this mock test doesn't reach a real pool.
+        engine._mental_model_refresh_cutoff = AsyncMock(  # type: ignore[method-assign]
+            return_value=datetime(2026, 1, 1, tzinfo=timezone.utc)
+        )
+        engine._mental_model_processed_watermark = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
         await engine.refresh_mental_model(
             bank_id="bank-1",

@@ -10,8 +10,10 @@ import uuid as uuid_mod
 from datetime import UTC, datetime
 
 from .base import DatabaseConnection
-from .ops import DataAccessOps, TagListingParts
+from .ops import DataAccessOps, LinkExpansionRows, TagListingParts, UpdatedWindow
 from .result import DictResultRow as ResultRow
+
+ORACLE_IN_LIST_LIMIT = 1000
 
 
 class OracleOps(DataAccessOps):
@@ -172,22 +174,24 @@ class OracleOps(DataAccessOps):
         bank_id: str,
         entity_names: list[str],
         entity_dates: list,
+        entity_kinds: list[str],
     ) -> dict[str, str]:
         # Row-by-row insert with duplicate suppression.
         # Can't use RETURNING with ON CONFLICT DO NOTHING reliably,
         # so INSERT (ignoring dups) then SELECT all IDs at the end.
         id_by_name: dict[str, str] = {}
-        for name, event_date in zip(entity_names, entity_dates):
+        for name, event_date, kind in zip(entity_names, entity_dates, entity_kinds):
             ts = event_date if event_date else datetime.now(UTC)
             await conn.execute(
                 f"""
-                INSERT INTO {table} (bank_id, canonical_name, first_seen, last_seen, mention_count)
-                VALUES ($1, $2, $3, $3, 0)
+                INSERT INTO {table} (bank_id, canonical_name, first_seen, last_seen, mention_count, entity_kind)
+                VALUES ($1, $2, $3, $3, 0, $4)
                 ON CONFLICT (bank_id, LOWER(canonical_name)) DO NOTHING
                 """,
                 bank_id,
                 name,
                 ts,
+                kind,
             )
         # Now SELECT all the entities we just inserted (or that already existed)
         for name in entity_names:
@@ -216,7 +220,7 @@ class OracleOps(DataAccessOps):
         for orig_name in missing_names:
             row = await conn.fetchrow(
                 f"""
-                SELECT id, LOWER(canonical_name) AS name_lower
+                SELECT id, canonical_name, LOWER(canonical_name) AS name_lower
                 FROM {table}
                 WHERE bank_id = $1 AND LOWER(canonical_name) = LOWER($2)
                 """,
@@ -224,9 +228,40 @@ class OracleOps(DataAccessOps):
                 orig_name,
             )
             if row:
-                # Wrap in a dict-like to include input_name for downstream compat
                 results.append(row)
         return results
+
+    async def bulk_reassert_entities(
+        self,
+        conn: DatabaseConnection,
+        table: str,
+        bank_id: str,
+        entity_ids: list[str],
+        canonical_names: list[str],
+        entity_kinds: list[str],
+    ) -> None:
+        # Oracle has no FOR KEY SHARE; FOR UPDATE is the row-lock equivalent that
+        # blocks a concurrent prune DELETE until this transaction commits. Lock
+        # each surviving parent in the caller's stable id order (pruned ids are
+        # simply absent here), then re-insert any that vanished. The translation
+        # layer rewrites ON CONFLICT DO NOTHING to strip-and-catch ORA-00001, so
+        # a name recreated under a new id is suppressed rather than raising.
+        for entity_id in entity_ids:
+            await conn.fetchrow(
+                f"SELECT id FROM {table} WHERE id = $1 FOR UPDATE",
+                entity_id,
+            )
+        await conn.executemany(
+            f"""
+            INSERT INTO {table} (id, bank_id, canonical_name, entity_kind)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT DO NOTHING
+            """,
+            [
+                (entity_id, bank_id, canonical_name, kind)
+                for entity_id, canonical_name, kind in zip(entity_ids, canonical_names, entity_kinds)
+            ],
+        )
 
     async def bulk_insert_unit_entities(
         self,
@@ -253,16 +288,31 @@ class OracleOps(DataAccessOps):
     ) -> None:
         if not unit_ids:
             return
-        # Oracle doesn't support ON CONFLICT; rely on the PK and the
-        # IGNORE_ROW_ON_DUPKEY_INDEX hint to skip duplicates server-side.
-        # The hint name must match the PK constraint exactly.
+        # Locking upsert (#3034), the Oracle analogue of the PG
+        # ``ON CONFLICT DO UPDATE``. The old IGNORE_ROW_ON_DUPKEY_INDEX insert
+        # skipped duplicates WITHOUT locking the existing row, so a mutation
+        # re-enqueueing an already-queued unit could not block a worker from
+        # concurrently claiming (deleting) that row and processing the unit's
+        # pre-mutation state — the re-enqueue signal was silently lost. MERGE
+        # WHEN MATCHED takes an exclusive row lock on the existing queue row
+        # (the SET is a deliberate no-op that preserves enqueued_at); WHEN NOT
+        # MATCHED inserts a fresh row. That serialises the mutation against the
+        # worker's claim for the same (bank_id, unit_id).
+        #
+        # Sort to enforce a global (bank_id, unit_id) lock-acquisition order,
+        # matching claim_graph_maintenance_batch's delete order, so overlapping
+        # mutation/worker sets acquire the shared row locks ascending and cannot
+        # cycle.
+        sorted_unit_ids = sorted(unit_ids)
         await conn.executemany(
             f"""
-            INSERT /*+ IGNORE_ROW_ON_DUPKEY_INDEX({table}, pk_graph_maintenance_queue) */
-            INTO {table} (bank_id, unit_id)
-            VALUES ($1, $2)
+            MERGE INTO {table} q
+            USING (SELECT $1 AS bank_id, $2 AS unit_id FROM dual) s
+            ON (q.bank_id = s.bank_id AND q.unit_id = s.unit_id)
+            WHEN MATCHED THEN UPDATE SET q.enqueued_at = q.enqueued_at
+            WHEN NOT MATCHED THEN INSERT (bank_id, unit_id) VALUES (s.bank_id, s.unit_id)
             """,
-            [(bank_id, uid) for uid in unit_ids],
+            [(bank_id, uid) for uid in sorted_unit_ids],
         )
 
     async def claim_graph_maintenance_batch(
@@ -285,7 +335,15 @@ class OracleOps(DataAccessOps):
             bank_id,
             limit,
         )
-        claimed = [str(row["unit_id"]) for row in rows]
+        # Ordered locking (#3034): the per-row DELETE takes the queue rows'
+        # exclusive locks in executemany array order. Sort the claimed keys by
+        # unit_id so those locks are acquired in the same (bank_id, unit_id)
+        # order the enqueue MERGE uses — overlapping mutation/worker sets then
+        # lock the shared rows ascending and cannot cycle. (The batch is still
+        # *chosen* oldest-first by enqueued_at above; only the lock/delete order
+        # is normalised.) The Pass 1 retry wrap in run_graph_maintenance_job is
+        # the ORA-00060 backstop for any residual interleaving.
+        claimed = sorted(str(row["unit_id"]) for row in rows)
         if claimed:
             await conn.executemany(
                 f"DELETE FROM {table} WHERE bank_id = $1 AND unit_id = $2",
@@ -321,6 +379,12 @@ class OracleOps(DataAccessOps):
         entities_table: str,
         bank_id: str,
     ) -> int:
+        # NB: the Postgres path additionally selects victims FOR UPDATE in sorted
+        # (entity_id_1, entity_id_2) order to prevent the #2529 deadlock against
+        # retain's sorted cooccurrence upsert. Oracle's DELETE can't carry that
+        # ordered-lock CTE the same way, so here we rely on the Pass 2/3 retry
+        # wrap in run_graph_maintenance_job (retry_with_backoff is ORA-00060
+        # deadlock-aware) to recover instead. Deliberate dialect asymmetry.
         deleted = await conn.execute(
             f"""
             DELETE FROM {ec_table}
@@ -422,6 +486,7 @@ class OracleOps(DataAccessOps):
         mu_table: str,
         ue_table: str,
         per_entity_limit: int,
+        window: UpdatedWindow,
     ) -> str:
         # Oracle: can't GROUP BY CLOB columns (text, context).
         # Restructure: count entities per unit_id in a subquery, then join to get full columns.
@@ -439,6 +504,16 @@ class OracleOps(DataAccessOps):
                     FROM {ue_table} ue_target
                     WHERE ue_target.entity_id = se.entity_id
                       AND ue_target.unit_id != ALL($1::uuid[])
+                      -- Filter before applying the cap: candidates from other fact
+                      -- types, or outside the recall window, must not consume this
+                      -- entity's bounded fan-out.
+                      AND EXISTS (
+                          SELECT 1
+                          FROM {mu_table} mu_target
+                          WHERE mu_target.id = ue_target.unit_id
+                            AND mu_target.fact_type = $2
+                            {window.clause("mu_target")}
+                      )
                     ORDER BY ue_target.unit_id DESC
                     FETCH FIRST {per_entity_limit} ROWS ONLY
                 ) t
@@ -451,7 +526,6 @@ class OracleOps(DataAccessOps):
                        es.score, 'entity' AS source
                 FROM entity_scores es
                 JOIN {mu_table} mu ON mu.id = es.unit_id
-                WHERE mu.fact_type = $2
                 ORDER BY es.score DESC
                 FETCH FIRST $3 ROWS ONLY
             )"""
@@ -460,6 +534,7 @@ class OracleOps(DataAccessOps):
         self,
         ml_table: str,
         mu_table: str,
+        window: UpdatedWindow,
     ) -> str:
         # Non-PG: can't GROUP BY CLOB columns, no DISTINCT ON.
         # Restructure semantic: compute max weight per id, then join for full columns.
@@ -474,6 +549,7 @@ class OracleOps(DataAccessOps):
                       AND ml.link_type = 'semantic'
                       AND mu.fact_type = $2
                       AND mu.id != ALL($1::uuid[])
+                      {window.clause("mu")}
                     UNION ALL
                     SELECT mu.id, ml.weight
                     FROM {ml_table} ml
@@ -482,6 +558,7 @@ class OracleOps(DataAccessOps):
                       AND ml.link_type = 'semantic'
                       AND mu.fact_type = $2
                       AND mu.id != ALL($1::uuid[])
+                      {window.clause("mu")}
                 ) sem_raw
                 GROUP BY id
             ),
@@ -508,6 +585,7 @@ class OracleOps(DataAccessOps):
                 WHERE ml.from_unit_id = ANY($1::uuid[])
                   AND ml.link_type IN ('causes', 'caused_by', 'enables', 'prevents')
                   AND mu.fact_type = $2
+                  {window.clause("mu")}
             ),
             causal_expanded AS (
                 SELECT id, text, context, event_date, occurred_start, occurred_end, mentioned_at,
@@ -526,7 +604,8 @@ class OracleOps(DataAccessOps):
         seed_ids: list,
         budget: int,
         per_entity_limit: int,
-    ) -> tuple[list[ResultRow], list[ResultRow], list[ResultRow]]:
+        window: UpdatedWindow,
+    ) -> LinkExpansionRows:
         import logging
 
         logger = logging.getLogger(__name__)
@@ -580,11 +659,13 @@ class OracleOps(DataAccessOps):
                   WHERE os3.observation_id = mu.id
                     AND os3.source_id IN (SELECT source_id FROM connected_sources)
               )
+              {window.clause("mu")}
             ORDER BY score DESC
             FETCH FIRST $2 ROWS ONLY
             """,
             seed_ids,
             budget,
+            *window.params,
         )
         logger.debug(f"[LinkExpansion] observation graph (Oracle): found {len(entity_rows)} connected observations")
 
@@ -600,12 +681,14 @@ class OracleOps(DataAccessOps):
                     WHERE ml.from_unit_id = ANY($1::uuid[])
                       AND ml.link_type = 'semantic' AND mu.fact_type = 'observation'
                       AND mu.id != ALL($1::uuid[])
+                      {window.clause("mu")}
                     UNION ALL
                     SELECT mu.id, ml.weight
                     FROM {ml_table} ml JOIN {mu_table} mu ON mu.id = ml.from_unit_id
                     WHERE ml.to_unit_id = ANY($1::uuid[])
                       AND ml.link_type = 'semantic' AND mu.fact_type = 'observation'
                       AND mu.id != ALL($1::uuid[])
+                      {window.clause("mu")}
                 ) sem_raw
                 GROUP BY id
             ),
@@ -631,6 +714,7 @@ class OracleOps(DataAccessOps):
                 WHERE ml.from_unit_id = ANY($1::uuid[])
                   AND ml.link_type IN ('causes', 'caused_by', 'enables', 'prevents')
                   AND mu.fact_type = 'observation'
+                  {window.clause("mu")}
             ),
             causal_expanded AS (
                 SELECT id, text, context, event_date, occurred_start, occurred_end, mentioned_at,
@@ -645,11 +729,12 @@ class OracleOps(DataAccessOps):
             """,
             seed_ids,
             budget,
+            *window.params,
         )
 
         semantic_rows = [r for r in sem_causal_rows if r["source"] == "semantic"]
         causal_rows = [r for r in sem_causal_rows if r["source"] == "causal"]
-        return list(entity_rows), semantic_rows, causal_rows
+        return LinkExpansionRows(entity=list(entity_rows), semantic=semantic_rows, causal=causal_rows)
 
     def build_tag_listing_parts(self, mu_table: str) -> TagListingParts:
         return TagListingParts(
@@ -815,6 +900,157 @@ class OracleOps(DataAccessOps):
         )
 
     # -- Task claiming operations ------------------------------------------
+
+    async def prune_terminal_operations(
+        self,
+        conn: DatabaseConnection,
+        table: str,
+        cutoff: datetime,
+        *,
+        batch_size: int,
+    ) -> int:
+        # Oracle rejects a row-limited SELECT ... FOR UPDATE (ORA-02014). Pick
+        # the deterministic bounded IDs first, then lock only that candidate
+        # set and re-check eligibility before deleting in the same transaction.
+        # Clamp to Oracle's 1000-expression IN-list limit because the adapter
+        # expands the candidate UUID list into individual bind variables.
+        # Cancelled children cannot complete parent aggregation, so retain the
+        # parent guard only for completed/failed children. Before removing a
+        # cancelled child, preserve its signal by cancelling a pending parent
+        # in this transaction and refreshing the parent's retention window.
+        # Validate metadata before HEXTORAW: CASE makes malformed UUIDs yield
+        # NULL while keeping the indexed RAW parent.operation_id key unwrapped.
+        effective_batch_size = min(batch_size, ORACLE_IN_LIST_LIMIT)
+        candidates = await conn.fetch(
+            f"""
+            SELECT candidate_operation.operation_id
+            FROM {table} candidate_operation
+            WHERE candidate_operation.status IN ('completed', 'failed', 'cancelled')
+              AND candidate_operation.updated_at < $1
+              AND (
+                  candidate_operation.status = 'cancelled'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM {table} parent
+                      WHERE parent.operation_id = CASE
+                          WHEN REGEXP_LIKE(
+                              JSON_VALUE(
+                                  candidate_operation.result_metadata,
+                                  '$.parent_operation_id' RETURNING VARCHAR2(36) NULL ON ERROR
+                              ),
+                              '^[0-9A-Fa-f]{{8}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{12}}$'
+                          )
+                          THEN HEXTORAW(REPLACE(
+                              JSON_VALUE(
+                                  candidate_operation.result_metadata,
+                                  '$.parent_operation_id' RETURNING VARCHAR2(36) NULL ON ERROR
+                              ),
+                              '-',
+                              ''
+                          ))
+                          ELSE NULL
+                      END
+                        AND parent.bank_id = candidate_operation.bank_id
+                  )
+              )
+            ORDER BY candidate_operation.updated_at, candidate_operation.operation_id
+            LIMIT $2
+            """,
+            cutoff,
+            effective_batch_size,
+        )
+        if not candidates:
+            return 0
+
+        candidate_ids = [row["operation_id"] for row in candidates]
+        locked = await conn.fetch(
+            f"""
+            SELECT candidate_operation.operation_id
+            FROM {table} candidate_operation
+            WHERE candidate_operation.operation_id = ANY($1)
+              AND candidate_operation.status IN ('completed', 'failed', 'cancelled')
+              AND candidate_operation.updated_at < $2
+              AND (
+                  candidate_operation.status = 'cancelled'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM {table} parent
+                      WHERE parent.operation_id = CASE
+                          WHEN REGEXP_LIKE(
+                              JSON_VALUE(
+                                  candidate_operation.result_metadata,
+                                  '$.parent_operation_id' RETURNING VARCHAR2(36) NULL ON ERROR
+                              ),
+                              '^[0-9A-Fa-f]{{8}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{12}}$'
+                          )
+                          THEN HEXTORAW(REPLACE(
+                              JSON_VALUE(
+                                  candidate_operation.result_metadata,
+                                  '$.parent_operation_id' RETURNING VARCHAR2(36) NULL ON ERROR
+                              ),
+                              '-',
+                              ''
+                          ))
+                          ELSE NULL
+                      END
+                        AND parent.bank_id = candidate_operation.bank_id
+                  )
+              )
+            ORDER BY candidate_operation.updated_at, candidate_operation.operation_id
+            FOR UPDATE OF candidate_operation.operation_id SKIP LOCKED
+            """,
+            candidate_ids,
+            cutoff,
+        )
+        if not locked:
+            return 0
+        operation_ids = [row["operation_id"] for row in locked]
+        await conn.execute(
+            f"""
+            UPDATE {table} parent
+            SET status = 'cancelled',
+                updated_at = now(),
+                completed_at = COALESCE(parent.completed_at, now()),
+                error_message = COALESCE(
+                    parent.error_message,
+                    'Cancelled because a child operation was cancelled'
+                )
+            WHERE parent.status = 'pending'
+              AND EXISTS (
+                  SELECT 1
+                  FROM {table} candidate_operation
+                  WHERE candidate_operation.operation_id = ANY($1)
+                    AND candidate_operation.status = 'cancelled'
+                    AND candidate_operation.updated_at < $2
+                    AND candidate_operation.bank_id = parent.bank_id
+                    AND parent.operation_id = CASE
+                        WHEN REGEXP_LIKE(
+                            JSON_VALUE(
+                                candidate_operation.result_metadata,
+                                '$.parent_operation_id' RETURNING VARCHAR2(36) NULL ON ERROR
+                            ),
+                            '^[0-9A-Fa-f]{{8}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{12}}$'
+                        )
+                        THEN HEXTORAW(REPLACE(
+                            JSON_VALUE(
+                                candidate_operation.result_metadata,
+                                '$.parent_operation_id' RETURNING VARCHAR2(36) NULL ON ERROR
+                            ),
+                            '-',
+                            ''
+                        ))
+                        ELSE NULL
+                    END
+              )
+            """,
+            operation_ids,
+            cutoff,
+        )
+        await conn.execute(
+            f"DELETE FROM {table} WHERE operation_id = ANY($1)",
+            operation_ids,
+        )
+        return len(operation_ids)
 
     async def _claim_consolidation_tasks(
         self,

@@ -1,6 +1,5 @@
 import type {
   MoltbotPluginAPI,
-  PluginPromptHookResult,
   PluginConfig,
   PluginHookAgentContext,
   PluginToolContext,
@@ -11,16 +10,6 @@ import { HindsightServer, type Logger } from "@vectorize-io/hindsight-all";
 import { HindsightClient, type HindsightClientOptions } from "@vectorize-io/hindsight-client";
 import { RetainQueue } from "./retain-queue.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
-import { SessionSummaryStore, type SessionSummaryRecord } from "./session-summary-store.js";
-import {
-  DEFAULT_SESSION_SUMMARY_BUDGET,
-  HindsightApiSessionSummaryGenerator,
-  shouldUpdateSessionSummary,
-  type SessionSummaryBudget,
-  type SessionSummaryGenerator,
-  type SessionSummaryResult,
-} from "./session-summary-generator.js";
-import { composeSummaryRecallQuery } from "./session-summary-assembly.js";
 import { createHash } from "crypto";
 import { dirname, join } from "path";
 import * as log from "./logger.js";
@@ -29,9 +18,13 @@ import { mkdirSync } from "fs";
 import { createRequire } from "module";
 import { homedir } from "os";
 import { createKnowledgeTools, TOOL_NAMES } from "@vectorize-io/hindsight-agent-sdk";
-
-export * from "./session-summary-generator.js";
-export * from "./session-summary-assembly.js";
+import {
+  applyConfiguredBankDefaults,
+  hasConfiguredBankDefaults,
+  normalizeDispositionTrait,
+  normalizeEntityLabels,
+  normalizeRetainExtractionMode,
+} from "./bank-defaults.js";
 
 function loadPackageVersion(): string {
   try {
@@ -89,8 +82,9 @@ let usingExternalApi = false; // Track if using external API (skip daemon manage
 
 // Capability detected once per service.start() against `<apiUrl>/version`.
 // `true` when the Hindsight API supports `update_mode: 'append'` (added in
-// 0.5.0 — see vectorize-io/hindsight#932). When false, retain falls back to a
-// per-turn document id so prior turns aren't silently overwritten.
+// 0.5.0 — see vectorize-io/hindsight#932) and stores document text. When false,
+// retain falls back to a per-turn document id so prior turns aren't silently
+// overwritten or rejected by text-disabled deployments.
 let supportsUpdateModeAppend = false;
 let appendCapabilityProbed = false;
 const MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0";
@@ -98,11 +92,8 @@ const MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0";
 // Store the current plugin config for bank ID derivation
 let currentPluginConfig: PluginConfig | null = null;
 
-// Track which banks have had their mission set (to avoid re-setting on every request).
-// Under the old bespoke client we also cached a client instance per bank because the
-// client carried a mutable bankId. HindsightClient takes bankId as a parameter on every
-// call, so no per-bank caching is needed anymore — one module-level client is enough.
-const banksWithMissionSet = new Set<string>();
+// Track which banks have had configured defaults applied (missions + bank config).
+const banksWithDefaultsApplied = new Set<string>();
 
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from "./types.js";
@@ -122,6 +113,7 @@ export interface BankScopedClient {
       maxTokens?: number;
       budget?: "low" | "mid" | "high";
       types?: Array<"world" | "experience" | "observation">;
+      preferObservations?: boolean;
     },
     timeoutMs?: number
   ): Promise<RecallResponse>;
@@ -152,6 +144,7 @@ function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
         maxTokens: req.maxTokens,
         budget: req.budget,
         types: req.types,
+        preferObservations: req.preferObservations,
       });
       if (!timeoutMs) return call;
       // The generated client doesn't accept a per-call AbortSignal, so we race
@@ -183,34 +176,22 @@ function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
   };
 }
 
-/**
- * Stamp configured missions onto a bank exactly once per process lifetime.
- * No-op if no mission fields are set in plugin config — this is what lets
- * users manage per-bank missions out-of-band without the plugin clobbering
- * them on every gateway restart.
- */
-async function applyConfiguredMissions(
-  scoped: BankScopedClient,
-  config: PluginConfig
-): Promise<void> {
-  const missions: BankMissionsUpdate = {};
-  if (typeof config.bankMission === "string" && config.bankMission.length > 0) {
-    missions.reflectMission = config.bankMission;
-  }
-  if (typeof config.retainMission === "string" && config.retainMission.length > 0) {
-    missions.retainMission = config.retainMission;
-  }
-  if (typeof config.observationsMission === "string" && config.observationsMission.length > 0) {
-    missions.observationsMission = config.observationsMission;
-  }
-  if (
-    missions.reflectMission === undefined &&
-    missions.retainMission === undefined &&
-    missions.observationsMission === undefined
-  ) {
+async function ensureBankDefaultsApplied(bankId: string, config: PluginConfig): Promise<void> {
+  if (!client || !clientOptions || !hasConfiguredBankDefaults(config)) {
     return;
   }
-  await scoped.setMissions(missions);
+  if (banksWithDefaultsApplied.has(bankId)) {
+    return;
+  }
+  try {
+    await applyConfiguredBankDefaults(client, bankId, config, clientOptions);
+    banksWithDefaultsApplied.add(bankId);
+    debug(`[Hindsight] Applied configured defaults for bank: ${bankId}`);
+  } catch (error) {
+    log.warn(
+      `could not apply bank defaults for ${bankId}: ${error instanceof Error ? error.message : error}`
+    );
+  }
 }
 
 /**
@@ -232,14 +213,6 @@ export function formatHookPerf(
   return `perf: ${hook} ${parts.join(" ")}`;
 }
 
-function hasConfiguredMissions(config: PluginConfig): boolean {
-  return (
-    (typeof config.bankMission === "string" && config.bankMission.length > 0) ||
-    (typeof config.retainMission === "string" && config.retainMission.length > 0) ||
-    (typeof config.observationsMission === "string" && config.observationsMission.length > 0)
-  );
-}
-
 /**
  * The generated client's metadata type is `Record<string, string>`; the
  * openclaw builder uses `Record<string, unknown>` because some fields come
@@ -259,13 +232,6 @@ function toStringMetadata(
 const turnCountBySession = new Map<string, number>();
 const MAX_TRACKED_SESSIONS = 10_000;
 const DEFAULT_RECALL_TIMEOUT_MS = 10_000;
-const DEFAULT_SESSION_SUMMARY_STORE_PATH = join(
-  homedir(),
-  ".openclaw",
-  "data",
-  "hindsight-session-summaries.sqlite"
-);
-const DEFAULT_SERVICE_STOP_FLUSH_TIMEOUT_MS = 2_000;
 
 type SessionIdentityRecord = Pick<
   PluginHookAgentContext,
@@ -292,13 +258,6 @@ let retainQueue: RetainQueue | null = null;
 let retainQueueFlushTimer: ReturnType<typeof setInterval> | null = null;
 let isFlushInProgress = false;
 const DEFAULT_FLUSH_INTERVAL_MS = 60_000; // 1 min
-
-// Rolling session summary state. Generation is delegated to the Hindsight API
-// so the OpenClaw plugin owns only cadence, storage, and recall-query assembly.
-let sessionSummaryStore: SessionSummaryStore | null = null;
-let sessionSummaryStorePath: string | null = null;
-let sessionSummaryGenerator: SessionSummaryGenerator | null = null;
-let loggedSessionSummaryGeneratorBoundary = false;
 
 /**
  * Attempt to flush pending retains from the queue.
@@ -355,391 +314,6 @@ async function flushRetainQueue(): Promise<void> {
   }
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  const timeout = Math.max(1, Math.trunc(timeoutMs || 1));
-  return Promise.race([
-    promise,
-    new Promise<never>((_, reject) =>
-      setTimeout(
-        () => reject(new DOMException(`${label} timed out after ${timeout}ms`, "TimeoutError")),
-        timeout
-      )
-    ),
-  ]);
-}
-
-function stringValue(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
-}
-
-export function extractHookSessionIdentity(
-  event: any,
-  ctx?: PluginHookAgentContext
-): { sessionId?: string; sessionKey?: string } {
-  const eventContext =
-    event?.context && typeof event.context === "object"
-      ? (event.context as Record<string, unknown>)
-      : {};
-  return {
-    sessionId:
-      stringValue(ctx?.sessionId) ??
-      stringValue(event?.sessionId) ??
-      stringValue(eventContext.sessionId),
-    sessionKey:
-      stringValue(ctx?.sessionKey) ??
-      stringValue(event?.sessionKey) ??
-      stringValue(eventContext.sessionKey),
-  };
-}
-
-export function isSessionSummaryLifecycleActive(config: PluginConfig): boolean {
-  return (
-    config.sessionSummaryEnabled === true &&
-    (config.sessionSummaryEnrichRecallQuery === true ||
-      typeof config.sessionSummaryUpdateEveryNTurns === "number")
-  );
-}
-
-export function getSessionSummaryBudgetFromConfig(config: PluginConfig): SessionSummaryBudget {
-  return {
-    ...DEFAULT_SESSION_SUMMARY_BUDGET,
-    maxInputChars:
-      config.sessionSummaryMaxInputChars ?? DEFAULT_SESSION_SUMMARY_BUDGET.maxInputChars,
-    maxOutputChars:
-      config.sessionSummaryMaxOutputChars ?? DEFAULT_SESSION_SUMMARY_BUDGET.maxOutputChars,
-    maxRecallQueryChars:
-      config.sessionSummaryMaxRecallQueryChars ??
-      DEFAULT_SESSION_SUMMARY_BUDGET.maxRecallQueryChars,
-    recallQueryBudgetRatio:
-      config.sessionSummaryRecallQueryBudgetRatio ??
-      DEFAULT_SESSION_SUMMARY_BUDGET.recallQueryBudgetRatio,
-    minLatestQueryReserveChars:
-      config.sessionSummaryMinLatestQueryReserveChars ??
-      DEFAULT_SESSION_SUMMARY_BUDGET.minLatestQueryReserveChars,
-    dropCompletedTodosAfterTurns:
-      config.sessionSummaryDropCompletedTodosAfterTurns ??
-      DEFAULT_SESSION_SUMMARY_BUDGET.dropCompletedTodosAfterTurns,
-  };
-}
-
-function getSessionSummaryStorePath(config: PluginConfig): string {
-  return typeof config.sessionSummaryStorePath === "string" &&
-    config.sessionSummaryStorePath.trim().length > 0
-    ? config.sessionSummaryStorePath.trim()
-    : DEFAULT_SESSION_SUMMARY_STORE_PATH;
-}
-
-function ensureSessionSummaryStore(
-  config: PluginConfig,
-  opts: { replaceExisting?: boolean } = {}
-): SessionSummaryStore | null {
-  if (!isSessionSummaryLifecycleActive(config)) return null;
-  const dbPath = getSessionSummaryStorePath(config);
-  if (sessionSummaryStore && sessionSummaryStorePath === dbPath) return sessionSummaryStore;
-  if (sessionSummaryStore && opts.replaceExisting === false) return null;
-  closeSessionSummaryStore();
-  try {
-    sessionSummaryStore = new SessionSummaryStore({
-      dbPath,
-    });
-    sessionSummaryStorePath = dbPath;
-    return sessionSummaryStore;
-  } catch (err) {
-    log.warn(`session summary store unavailable; summary lifecycle no-op: ${err}`);
-    return null;
-  }
-}
-
-/**
- * Pure factory: given a resolved PluginConfig (and optional test overrides),
- * returns the correct SessionSummaryGenerator or null.
- *
- * Priority:
- *   1. hindsightApiUrl configured → HindsightApiSessionSummaryGenerator (real, production)
- *   2. Session summary lifecycle active but no API URL → null (fail-closed; never silently Fake)
- *   3. Lifecycle not active → null
- *
- * FakeSessionSummaryGenerator is never returned in the production path.
- */
-export function makeSessionSummaryGenerator(
-  config: PluginConfig,
-  opts?: { fetchFn?: typeof fetch }
-): SessionSummaryGenerator | null {
-  if (!isSessionSummaryLifecycleActive(config)) return null;
-  const apiUrl = config.hindsightApiUrl;
-  if (!apiUrl) {
-    log.warn(
-      "session summary lifecycle is active but hindsightApiUrl is not configured; " +
-        "no real generator is available — session summary generation is disabled. " +
-        "Set hindsightApiUrl to enable server-side summary generation."
-    );
-    return null;
-  }
-  const timeoutMs =
-    typeof config.sessionSummaryTimeoutMs === "number" && config.sessionSummaryTimeoutMs > 0
-      ? config.sessionSummaryTimeoutMs
-      : 20_000;
-  return new HindsightApiSessionSummaryGenerator({
-    apiUrl,
-    apiToken: config.hindsightApiToken ?? undefined,
-    timeoutMs,
-    fetchFn: opts?.fetchFn,
-  });
-}
-
-function ensureSessionSummaryGenerator(config: PluginConfig): SessionSummaryGenerator | null {
-  if (!isSessionSummaryLifecycleActive(config)) return null;
-  if (!loggedSessionSummaryGeneratorBoundary) {
-    loggedSessionSummaryGeneratorBoundary = true;
-  }
-  if (!sessionSummaryGenerator) {
-    sessionSummaryGenerator = makeSessionSummaryGenerator(config);
-  }
-  return sessionSummaryGenerator;
-}
-
-function closeSessionSummaryStore(): void {
-  if (!sessionSummaryStore) return;
-  try {
-    sessionSummaryStore.close();
-  } catch (err) {
-    log.warn(`session summary store close failed: ${err}`);
-  } finally {
-    sessionSummaryStore = null;
-    sessionSummaryStorePath = null;
-    sessionSummaryGenerator = null;
-  }
-}
-
-export function buildSessionSummaryIdentity(
-  resolvedCtx: PluginHookAgentContext | undefined,
-  config: PluginConfig
-): { summaryKey: string; identityScope: string } {
-  const bankId = deriveBankId(resolvedCtx, config);
-  const bankPart = sanitizeDocumentIdPart(bankId, "bank");
-  const sessionId = resolvedCtx?.sessionId?.trim();
-  const sessionKey = resolvedCtx?.sessionKey?.trim();
-  const sessionIdentityPart = sessionId
-    ? `session-id:${sanitizeDocumentIdPart(sessionId, "session")}`
-    : `session-key:${sanitizeDocumentIdPart(sessionKey, "session")}`;
-  return {
-    identityScope: bankId,
-    summaryKey: `openclaw:${bankPart}:${sessionIdentityPart}`,
-  };
-}
-
-function readSessionSummary(
-  resolvedCtx: PluginHookAgentContext | undefined,
-  config: PluginConfig
-): SessionSummaryRecord | null {
-  const store = ensureSessionSummaryStore(config);
-  if (!store) return null;
-  try {
-    return store.get(buildSessionSummaryIdentity(resolvedCtx, config).summaryKey);
-  } catch (err) {
-    log.warn(`session summary read failed; continuing without summary: ${err}`);
-    return null;
-  }
-}
-
-function getSessionSummarySurfaceText(
-  record: SessionSummaryRecord | null,
-  config: PluginConfig
-): string {
-  if (!record || record.status !== "ready") return "";
-  const budget = getSessionSummaryBudgetFromConfig(config);
-  return record.summaryText.slice(0, Math.max(0, budget.maxRecallQueryChars)).trim();
-}
-
-function latestUserText(messages: any[]): string {
-  if (!Array.isArray(messages)) return "";
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg?.role !== "user") continue;
-    if (typeof msg.content === "string") {
-      return stripRuntimeEnvelope(
-        stripInlineTimestampPrefix(stripMetadataEnvelopes(stripMemoryTags(msg.content)))
-      ).trim();
-    }
-    if (Array.isArray(msg.content)) {
-      return msg.content
-        .filter((block: any) => block?.type === "text" && typeof block?.text === "string")
-        .map((block: any) =>
-          stripRuntimeEnvelope(
-            stripInlineTimestampPrefix(stripMetadataEnvelopes(stripMemoryTags(block.text)))
-          ).trim()
-        )
-        .filter(Boolean)
-        .join("\n");
-    }
-  }
-  return "";
-}
-
-function normalizeSummaryMessages(messages: any[]): Array<Record<string, unknown>> {
-  if (!Array.isArray(messages)) return [];
-  return messages.map((msg) => {
-    let content = "";
-    if (typeof msg?.content === "string") {
-      content = msg.content;
-    } else if (Array.isArray(msg?.content)) {
-      content = msg.content
-        .filter((block: any) => block?.type === "text" && typeof block?.text === "string")
-        .map((block: any) => block.text)
-        .join("\n");
-    }
-    return {
-      role: msg?.role,
-      content: stripRuntimeEnvelope(
-        stripInlineTimestampPrefix(
-          stripMetadataEnvelopes(stripInlineRetainTags(stripMemoryTags(content)))
-        )
-      ),
-      timestamp: normalizeMessageTimestamp(msg),
-    };
-  });
-}
-
-function stableHash(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
-
-async function updateSessionSummaryForMessages(input: {
-  messages: any[];
-  resolvedCtx: PluginHookAgentContext | undefined;
-  config: PluginConfig;
-  force?: boolean;
-  latestQuery?: string;
-}): Promise<SessionSummaryRecord | null> {
-  const config = input.config;
-  if (!isSessionSummaryLifecycleActive(config)) return null;
-  const generator = ensureSessionSummaryGenerator(config);
-  if (!generator) return readSessionSummary(input.resolvedCtx, config);
-
-  const turnIndex = countUserTurns(input.messages);
-  const existing = readSessionSummary(input.resolvedCtx, config);
-  if (turnIndex <= 0) return existing;
-  if (input.force && existing && existing.turn >= turnIndex) return existing;
-  if (
-    !input.force &&
-    !shouldUpdateSessionSummary({
-      turnIndex,
-      retainEveryNTurns: config.retainEveryNTurns ?? 1,
-      retainOverlapTurns: config.retainOverlapTurns ?? 0,
-      recallContextTurns: config.recallContextTurns ?? 1,
-      updateEveryNTurns: config.sessionSummaryUpdateEveryNTurns,
-      minUpdateEveryNTurns: config.sessionSummaryMinUpdateEveryNTurns,
-    })
-  ) {
-    return existing;
-  }
-
-  const { summaryKey, identityScope } = buildSessionSummaryIdentity(input.resolvedCtx, config);
-  const messages = normalizeSummaryMessages(input.messages);
-  const latestQuery = input.latestQuery || latestUserText(input.messages);
-  const lastInputHash = stableHash({
-    messages,
-    latestQuery,
-    previousVersion: existing?.version ?? 0,
-    turnIndex,
-  });
-
-  let result: SessionSummaryResult;
-  try {
-    result = await withTimeout(
-      Promise.resolve(
-        generator.generate({
-          sessionId: summaryKey,
-          identityScope,
-          messages,
-          previousSummaryText: existing?.summaryText ?? "",
-          latestQuery,
-          turnIndex,
-          metadata: {
-            source: "openclaw",
-            sessionId: input.resolvedCtx?.sessionId,
-            sessionKey: input.resolvedCtx?.sessionKey,
-            provider: input.resolvedCtx?.messageProvider,
-            channelId: input.resolvedCtx?.channelId,
-            senderId: input.resolvedCtx?.senderId,
-          },
-          budget: getSessionSummaryBudgetFromConfig(config),
-        })
-      ),
-      config.sessionSummaryTimeoutMs ?? 20_000,
-      "session summary generation"
-    );
-  } catch (err) {
-    result = {
-      summaryJson: {
-        schemaVersion: existing?.schemaVersion ?? 2,
-        summaryText: existing?.summaryText ?? "",
-      },
-      summaryText: existing?.summaryText ?? "",
-      schemaVersion: existing?.schemaVersion ?? 2,
-      status: "error",
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
-
-  // On transient generation error, keep an existing ready summary rather than
-  // overwriting it with an error record (which would disable all summary surfaces).
-  if (result.status === "error" && existing?.status === "ready") {
-    log.warn(`session summary update failed; keeping existing ready summary: ${result.error}`);
-    return existing;
-  }
-
-  try {
-    const store = ensureSessionSummaryStore(config, { replaceExisting: false });
-    if (!store) return existing;
-    const write = store.upsert({
-      summaryKey,
-      identityScope,
-      summaryJson: result.summaryJson,
-      summaryText: result.status === "ready" ? result.summaryText : (existing?.summaryText ?? ""),
-      schemaVersion: result.schemaVersion,
-      turn: turnIndex,
-      turnHash: stableHash({ turnIndex, messages }),
-      lastInputHash,
-      parentSummaryKey: existing?.parentSummaryKey ?? null,
-      status: result.status,
-      lastError: result.status === "error" ? (result.error ?? "session summary error") : null,
-      expectedVersion: existing?.version ?? 0,
-    });
-    if (write.stale) {
-      return store.get(summaryKey);
-    }
-    return write.record ?? existing;
-  } catch (err) {
-    log.warn(`session summary write failed; continuing without update: ${err}`);
-    return existing;
-  }
-}
-
-function mergePromptHookResult(input: {
-  memoryBlock?: string;
-  memoryPosition?: PluginConfig["recallInjectionPosition"];
-}): PluginPromptHookResult | undefined {
-  const result: PluginPromptHookResult = {};
-  const memoryBlock = input.memoryBlock?.trim();
-  if (memoryBlock) {
-    const position = input.memoryPosition || "prepend";
-    if (position === "append") {
-      result.appendSystemContext = memoryBlock;
-    } else if (position === "user") {
-      result.prependContext = memoryBlock;
-    } else {
-      result.prependSystemContext = result.prependSystemContext
-        ? `${result.prependSystemContext}\n\n${memoryBlock}`
-        : memoryBlock;
-    }
-  }
-
-  return result.prependSystemContext || result.appendSystemContext || result.prependContext
-    ? result
-    : undefined;
-}
-
 const DEFAULT_RECALL_PROMPT_PREAMBLE =
   "Relevant memories from past conversations (prioritize recent when conflicting). Only use memories that are directly useful to continue this conversation; ignore the rest:";
 
@@ -791,19 +365,11 @@ async function lazyReinit(configOverride?: PluginConfig): Promise<void> {
 
     const llmConfig = detectLLMConfig(config);
     clientOptions = buildClientOptions(llmConfig, config, externalApi);
-    banksWithMissionSet.clear();
+    banksWithDefaultsApplied.clear();
     client = new HindsightClient(clientOptions);
 
-    if (hasConfiguredMissions(config) && usesStaticBank(config)) {
-      const bankId = getStaticBankId(config);
-      try {
-        await applyConfiguredMissions(scopeClient(client, bankId), config);
-        banksWithMissionSet.add(bankId);
-      } catch (err) {
-        log.warn(
-          `could not set bank missions for ${bankId}: ${err instanceof Error ? err.message : err}`
-        );
-      }
+    if (usesStaticBank(config)) {
+      await ensureBankDefaultsApplied(getStaticBankId(config), config);
     }
 
     usingExternalApi = true;
@@ -867,17 +433,8 @@ if (typeof global !== "undefined") {
       const bankId = usesStaticBank(config) ? getStaticBankId(config) : deriveBankId(ctx, config);
       const scoped = scopeClient(client, bankId);
 
-      // Stamp configured missions onto this bank on first use.
-      if (hasConfiguredMissions(config) && !banksWithMissionSet.has(bankId)) {
-        try {
-          await applyConfiguredMissions(scoped, config);
-          banksWithMissionSet.add(bankId);
-          debug(`[Hindsight] Set missions for new bank: ${bankId}`);
-        } catch (error) {
-          // Log but don't fail - bank missions are not critical
-          log.warn(`could not set bank missions for ${bankId}: ${error}`);
-        }
-      }
+      // Stamp configured defaults onto this bank on first use (recall or retain).
+      await ensureBankDefaultsApplied(bankId, config);
 
       return scoped;
     },
@@ -1168,44 +725,6 @@ export function composeRecallQuery(
   return ["Prior context:", contextLines.join("\n"), latest].join("\n\n");
 }
 
-export function composeRecallQueryLatestFirst(
-  latestQuery: string,
-  messages: any[] | undefined,
-  recallContextTurns: number,
-  recallRoles: Array<"user" | "assistant" | "system" | "tool"> = ["user", "assistant"]
-): string {
-  const latest = latestQuery.trim();
-  if (recallContextTurns <= 1 || !Array.isArray(messages) || messages.length === 0) {
-    return latest;
-  }
-
-  const allowedRoles = new Set(recallRoles);
-  const contextualMessages = sliceLastTurnsByUserBoundary(messages, recallContextTurns);
-  const contextLines = contextualMessages
-    .map((msg: any) => {
-      const role = msg?.role;
-      if (!allowedRoles.has(role)) return null;
-      const content =
-        typeof msg?.content === "string"
-          ? msg.content
-          : Array.isArray(msg?.content)
-            ? msg.content
-                .filter((block: any) => block?.type === "text" && typeof block?.text === "string")
-                .map((block: any) => block.text)
-                .join("\n")
-            : "";
-      const cleaned = stripRuntimeEnvelope(
-        stripInlineTimestampPrefix(stripMetadataEnvelopes(stripMemoryTags(content)))
-      ).trim();
-      if (!cleaned || (role === "user" && cleaned === latest)) return null;
-      return `${role}: ${cleaned}`;
-    })
-    .filter((line: string | null): line is string => Boolean(line));
-
-  if (contextLines.length === 0) return latest;
-  return [latest, "Prior context:", contextLines.join("\n")].join("\n\n");
-}
-
 export function truncateRecallQuery(query: string, latestQuery: string, maxChars: number): string {
   if (maxChars <= 0) {
     return query;
@@ -1338,9 +857,8 @@ export function resolveSessionIdentity(
   const sessionParsed = ctx.sessionKey ? parseSessionKey(ctx.sessionKey) : {};
   const messageProvider = ctx.messageProvider || sessionParsed.provider;
   const channelId = ctx.channelId || sessionParsed.channel;
-  const senderId =
-    ctx.senderId ||
-    (messageProvider === "telegram" ? extractTelegramDirectSenderId(channelId) : undefined);
+  // direct:<id> channel ids carry the user id for any provider (telegram, msteams, …).
+  const senderId = ctx.senderId || extractTelegramDirectSenderId(channelId);
 
   return {
     ...ctx,
@@ -1662,6 +1180,84 @@ export function deriveBankId(
   return pluginConfig.bankIdPrefix ? `${pluginConfig.bankIdPrefix}-${baseBankId}` : baseBankId;
 }
 
+function usesUserScopedBanking(pluginConfig: PluginConfig): boolean {
+  if (usesStaticBank(pluginConfig)) {
+    return false;
+  }
+  const granularity = pluginConfig.dynamicBankGranularity?.length
+    ? pluginConfig.dynamicBankGranularity
+    : DEFAULT_DYNAMIC_BANK_GRANULARITY;
+  return granularity.includes("user");
+}
+
+export interface KnowledgeToolBankResolution {
+  bankId: string;
+  resolvedCtx: PluginHookAgentContext | undefined;
+  identityError?: string;
+}
+
+/**
+ * Resolve the Hindsight bank for knowledge tools using the same identity path as
+ * auto-recall/retain. When user-scoped dynamic banking is enabled, unresolved
+ * identity must not silently route to the shared default or anonymous bank.
+ */
+export function resolveBankIdForKnowledgeTools(
+  toolCtx: PluginToolContext,
+  pluginConfig: PluginConfig
+): KnowledgeToolBankResolution {
+  if (usesStaticBank(pluginConfig)) {
+    return { bankId: getStaticBankId(pluginConfig), resolvedCtx: undefined };
+  }
+
+  const hookCtx: PluginHookAgentContext = {
+    agentId: toolCtx.agentId,
+    sessionKey: toolCtx.sessionKey,
+    workspaceDir: toolCtx.workspaceDir,
+  };
+
+  const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
+    sessionKey: toolCtx.sessionKey,
+    ctx: hookCtx,
+    pluginConfig,
+  });
+  const { reason: identityReason } = getIdentitySkipReason(resolvedCtx, pluginConfig);
+  const effectiveSkip = skipReason ?? identityReason;
+  const bankId = deriveBankId(resolvedCtx, pluginConfig);
+
+  if (usesUserScopedBanking(pluginConfig)) {
+    const userSegment = resolvedCtx?.senderId || "anonymous";
+    if (effectiveSkip) {
+      return {
+        bankId,
+        resolvedCtx,
+        identityError:
+          `Hindsight knowledge tools skipped: ${formatIdentitySkipReason(effectiveSkip)}. ` +
+          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
+      };
+    }
+    if (userSegment === "anonymous") {
+      return {
+        bankId,
+        resolvedCtx,
+        identityError:
+          "Hindsight knowledge tools skipped: missing stable sender identity. " +
+          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
+      };
+    }
+    if (bankId === getDefaultBankId(pluginConfig)) {
+      return {
+        bankId,
+        resolvedCtx,
+        identityError:
+          "Hindsight knowledge tools skipped: could not resolve per-user memory bank. " +
+          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
+      };
+    }
+  }
+
+  return { bankId, resolvedCtx };
+}
+
 export function formatMemories(results: MemoryResult[]): string {
   if (!results || results.length === 0) return "";
   return results
@@ -1789,16 +1385,52 @@ export function meetsMinimumVersion(actual: string, minimum: string): boolean {
   return true;
 }
 
+export interface HindsightApiCapabilities {
+  version: string;
+  storeDocumentText: boolean;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+export function parseHindsightApiCapabilities(payload: unknown): HindsightApiCapabilities | null {
+  if (!isRecord(payload) || typeof payload.api_version !== "string") {
+    return null;
+  }
+
+  let storeDocumentText = true;
+  if ("features" in payload) {
+    const features = payload.features;
+    storeDocumentText = isRecord(features) && features.store_document_text === true;
+  }
+
+  return {
+    version: payload.api_version,
+    storeDocumentText,
+  };
+}
+
+export function supportsAppendFromCapabilities(
+  capabilities: HindsightApiCapabilities | null
+): boolean {
+  return (
+    capabilities !== null &&
+    capabilities.storeDocumentText &&
+    meetsMinimumVersion(capabilities.version, MIN_VERSION_FOR_UPDATE_MODE_APPEND)
+  );
+}
+
 /**
  * Probe `<apiUrl>/version` once at service.start to learn the running
- * Hindsight API version. Returns `null` (treated as "no append support") if
- * the endpoint is unreachable or returns malformed payload — conservative
+ * Hindsight API capabilities. Returns `null` (treated as "no append support")
+ * if the endpoint is unreachable or returns malformed payload — conservative
  * fallback path is the right call when we can't be sure.
  */
-async function fetchHindsightApiVersion(
+async function fetchHindsightApiCapabilities(
   apiUrl: string,
   apiToken?: string | null
-): Promise<string | null> {
+): Promise<HindsightApiCapabilities | null> {
   const versionUrl = `${apiUrl.replace(/\/$/, "")}/version`;
   try {
     const headers: Record<string, string> = { "User-Agent": USER_AGENT };
@@ -1811,12 +1443,12 @@ async function fetchHindsightApiVersion(
       debug(`[Hindsight] /version returned HTTP ${response.status}; assuming legacy`);
       return null;
     }
-    const data = (await response.json()) as { api_version?: unknown };
-    const v = typeof data.api_version === "string" ? data.api_version : null;
-    if (!v) {
+    const data = await response.json();
+    const capabilities = parseHindsightApiCapabilities(data);
+    if (!capabilities) {
       debug(`[Hindsight] /version payload missing api_version; assuming legacy`);
     }
-    return v;
+    return capabilities;
   } catch (error) {
     debug(`[Hindsight] /version probe failed: ${String(error)}; assuming legacy`);
     return null;
@@ -1826,32 +1458,42 @@ async function fetchHindsightApiVersion(
 /**
  * Probe `/version` and update the module-level `supportsUpdateModeAppend`
  * capability flag accordingly. Logs a one-time WARN block when the API is
- * older than 0.5.0 — without `update_mode: 'append'`, every retain on the
- * same session id silently overwrites prior turns server-side.
+ * older than 0.5.0 or cannot store document text — without
+ * `update_mode: 'append'`, every retain on the same session id silently
+ * overwrites prior turns server-side, and append itself requires stored
+ * document text.
  *
  * Called from the same code paths as the health check, so capability is
  * always re-evaluated when the plugin (re)connects to the API.
  */
 async function detectAppendCapability(apiUrl: string, apiToken?: string | null): Promise<void> {
-  const version = await fetchHindsightApiVersion(apiUrl, apiToken);
-  const supported =
-    version !== null && meetsMinimumVersion(version, MIN_VERSION_FOR_UPDATE_MODE_APPEND);
+  const capabilities = await fetchHindsightApiCapabilities(apiUrl, apiToken);
+  const supported = supportsAppendFromCapabilities(capabilities);
   const transitionedToUnsupported = supportsUpdateModeAppend && !supported;
   const firstProbe = !appendCapabilityProbed;
   appendCapabilityProbed = true;
   supportsUpdateModeAppend = supported;
-  if (supported) {
-    debug(`[Hindsight] API version ${version} supports update_mode=append`);
+  if (supported && capabilities) {
+    debug(
+      `[Hindsight] API version ${capabilities.version} supports update_mode=append with stored document text`
+    );
     return;
   }
   // Warn on the first probe when unsupported, and on any transition from
   // supported -> unsupported. Stay silent on subsequent re-probes that
   // confirm the same unsupported state.
   if (!firstProbe && !transitionedToUnsupported) return;
+  const version = capabilities?.version ?? null;
+  const reason =
+    capabilities !== null &&
+    meetsMinimumVersion(capabilities.version, MIN_VERSION_FOR_UPDATE_MODE_APPEND) &&
+    !capabilities.storeDocumentText
+      ? `reports version "${capabilities.version}" but has features.store_document_text disabled`
+      : `reports version "${version ?? "unknown"}", which is older than ${MIN_VERSION_FOR_UPDATE_MODE_APPEND}`;
   log.warn(
-    `[Hindsight] ⚠️  API at ${apiUrl} reports version "${version ?? "unknown"}", which is older than ${MIN_VERSION_FOR_UPDATE_MODE_APPEND}. ` +
+    `[Hindsight] ⚠️  API at ${apiUrl} ${reason}. ` +
       `Falling back to per-turn document ids — each retain becomes its own document instead of accumulating into one per-session document. ` +
-      `Upgrade Hindsight to ${MIN_VERSION_FOR_UPDATE_MODE_APPEND} or newer to enable session-scoped retention with update_mode=append.`
+      `Enable document text storage on Hindsight ${MIN_VERSION_FOR_UPDATE_MODE_APPEND} or newer to use session-scoped retention with update_mode=append.`
   );
 }
 
@@ -1925,6 +1567,17 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       typeof config.observationsMission === "string" && config.observationsMission.length > 0
         ? config.observationsMission
         : undefined,
+    retainExtractionMode: normalizeRetainExtractionMode(config.retainExtractionMode),
+    enableObservations:
+      typeof config.enableObservations === "boolean" ? config.enableObservations : undefined,
+    enableAutoConsolidation:
+      typeof config.enableAutoConsolidation === "boolean"
+        ? config.enableAutoConsolidation
+        : undefined,
+    dispositionSkepticism: normalizeDispositionTrait(config.dispositionSkepticism),
+    dispositionLiteralism: normalizeDispositionTrait(config.dispositionLiteralism),
+    dispositionEmpathy: normalizeDispositionTrait(config.dispositionEmpathy),
+    entityLabels: normalizeEntityLabels(config.entityLabels),
     embedPort: config.embedPort || 0,
     daemonIdleTimeout: config.daemonIdleTimeout !== undefined ? config.daemonIdleTimeout : 0,
     embedVersion: config.embedVersion || "latest",
@@ -1973,6 +1626,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
     recallBudget: config.recallBudget || "mid",
     recallMaxTokens: config.recallMaxTokens || 1024,
     recallTypes: Array.isArray(config.recallTypes) ? config.recallTypes : ["observation"],
+    preferObservations: config.preferObservations === true, // Default: false — backward compatible
     recallRoles: Array.isArray(config.recallRoles) ? config.recallRoles : ["user", "assistant"],
     retainEveryNTurns:
       typeof config.retainEveryNTurns === "number" && config.retainEveryNTurns >= 1
@@ -2000,88 +1654,11 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       typeof config.recallInjectionPosition === "string" &&
       ["prepend", "append", "user"].includes(config.recallInjectionPosition)
         ? (config.recallInjectionPosition as PluginConfig["recallInjectionPosition"])
-        : undefined,
+        : "user",
     recallTimeoutMs:
       typeof config.recallTimeoutMs === "number" && config.recallTimeoutMs >= 1000
         ? config.recallTimeoutMs
         : undefined,
-    sessionSummaryEnabled: config.sessionSummaryEnabled === true,
-    sessionSummaryStorePath:
-      typeof config.sessionSummaryStorePath === "string" &&
-      config.sessionSummaryStorePath.trim().length > 0
-        ? config.sessionSummaryStorePath.trim()
-        : undefined,
-    sessionSummaryEnrichRecallQuery: config.sessionSummaryEnrichRecallQuery === true,
-    sessionSummaryReuseHindsightLlmConfig: config.sessionSummaryReuseHindsightLlmConfig !== false,
-    sessionSummaryGeneratorProvider:
-      typeof config.sessionSummaryGeneratorProvider === "string" &&
-      config.sessionSummaryGeneratorProvider.trim().length > 0
-        ? config.sessionSummaryGeneratorProvider.trim()
-        : config.sessionSummaryReuseHindsightLlmConfig === false
-          ? undefined
-          : config.llmProvider,
-    sessionSummaryGeneratorModel:
-      typeof config.sessionSummaryGeneratorModel === "string" &&
-      config.sessionSummaryGeneratorModel.trim().length > 0
-        ? config.sessionSummaryGeneratorModel.trim()
-        : config.sessionSummaryReuseHindsightLlmConfig === false
-          ? undefined
-          : config.llmModel,
-    sessionSummaryGeneratorBaseUrl:
-      typeof config.sessionSummaryGeneratorBaseUrl === "string" &&
-      config.sessionSummaryGeneratorBaseUrl.trim().length > 0
-        ? config.sessionSummaryGeneratorBaseUrl.trim()
-        : config.sessionSummaryReuseHindsightLlmConfig === false
-          ? undefined
-          : config.llmBaseUrl,
-    sessionSummaryGeneratorApiKeyEnv:
-      typeof config.sessionSummaryGeneratorApiKeyEnv === "string" &&
-      config.sessionSummaryGeneratorApiKeyEnv.trim().length > 0
-        ? config.sessionSummaryGeneratorApiKeyEnv.trim()
-        : "HINDSIGHT_LLM_API_KEY",
-    sessionSummaryUpdateEveryNTurns:
-      typeof config.sessionSummaryUpdateEveryNTurns === "number" &&
-      config.sessionSummaryUpdateEveryNTurns >= 1
-        ? Math.trunc(config.sessionSummaryUpdateEveryNTurns)
-        : undefined,
-    sessionSummaryMinUpdateEveryNTurns:
-      typeof config.sessionSummaryMinUpdateEveryNTurns === "number" &&
-      config.sessionSummaryMinUpdateEveryNTurns >= 2
-        ? Math.trunc(config.sessionSummaryMinUpdateEveryNTurns)
-        : 2,
-    sessionSummaryTimeoutMs:
-      typeof config.sessionSummaryTimeoutMs === "number" && config.sessionSummaryTimeoutMs >= 1
-        ? Math.trunc(config.sessionSummaryTimeoutMs)
-        : 20_000,
-    sessionSummaryMaxInputChars:
-      typeof config.sessionSummaryMaxInputChars === "number" &&
-      config.sessionSummaryMaxInputChars >= 1
-        ? Math.trunc(config.sessionSummaryMaxInputChars)
-        : 16_000,
-    sessionSummaryMaxOutputChars:
-      typeof config.sessionSummaryMaxOutputChars === "number" &&
-      config.sessionSummaryMaxOutputChars >= 1
-        ? Math.trunc(config.sessionSummaryMaxOutputChars)
-        : 2_000,
-    sessionSummaryMaxRecallQueryChars:
-      typeof config.sessionSummaryMaxRecallQueryChars === "number" &&
-      config.sessionSummaryMaxRecallQueryChars >= 1
-        ? Math.trunc(config.sessionSummaryMaxRecallQueryChars)
-        : 800,
-    sessionSummaryRecallQueryBudgetRatio:
-      typeof config.sessionSummaryRecallQueryBudgetRatio === "number"
-        ? Math.min(1, Math.max(0, config.sessionSummaryRecallQueryBudgetRatio))
-        : 0.25,
-    sessionSummaryMinLatestQueryReserveChars:
-      typeof config.sessionSummaryMinLatestQueryReserveChars === "number" &&
-      config.sessionSummaryMinLatestQueryReserveChars >= 0
-        ? Math.trunc(config.sessionSummaryMinLatestQueryReserveChars)
-        : 400,
-    sessionSummaryDropCompletedTodosAfterTurns:
-      typeof config.sessionSummaryDropCompletedTodosAfterTurns === "number" &&
-      config.sessionSummaryDropCompletedTodosAfterTurns >= 0
-        ? Math.trunc(config.sessionSummaryDropCompletedTodosAfterTurns)
-        : 20,
     ignoreSessionPatterns: Array.isArray(config.ignoreSessionPatterns)
       ? config.ignoreSessionPatterns
       : [],
@@ -2174,12 +1751,6 @@ export default function (api: MoltbotPluginAPI) {
           );
         }
 
-        if (isSessionSummaryLifecycleActive(pluginConfig)) {
-          ensureSessionSummaryStore(pluginConfig);
-          ensureSessionSummaryGenerator(pluginConfig);
-          debug("[Hindsight] Session summary lifecycle enabled");
-        }
-
         // Log bank ID mode
         if (pluginConfig.dynamicBankId) {
           const prefixInfo = pluginConfig.bankIdPrefix
@@ -2258,24 +1829,17 @@ export default function (api: MoltbotPluginAPI) {
               // Initialize client for external API
               debug("[Hindsight] Creating HindsightClient (external API)...");
               clientOptions = buildClientOptions(llmConfig, pluginConfig, externalApi);
-              banksWithMissionSet.clear();
+              banksWithDefaultsApplied.clear();
               client = new HindsightClient(clientOptions);
 
               const defaultBankId = deriveBankId(undefined, pluginConfig);
               debug(`[Hindsight] Default bank: ${defaultBankId}`);
 
-              // Note: Missions are stamped per-bank when dynamic bank IDs are
-              // enabled. For static banks, stamp once here on init.
-              if (hasConfiguredMissions(pluginConfig) && usesStaticBank(pluginConfig)) {
-                debug(`[Hindsight] Setting bank missions...`);
-                try {
-                  await applyConfiguredMissions(scopeClient(client, defaultBankId), pluginConfig);
-                  banksWithMissionSet.add(defaultBankId);
-                } catch (err) {
-                  log.warn(
-                    `could not set bank missions for ${defaultBankId}: ${err instanceof Error ? err.message : err}`
-                  );
-                }
+              // Defaults are stamped per-bank when dynamic bank IDs are enabled.
+              // For static banks, stamp once here on init.
+              if (usesStaticBank(pluginConfig)) {
+                debug(`[Hindsight] Applying configured bank defaults...`);
+                await ensureBankDefaultsApplied(defaultBankId, pluginConfig);
               }
 
               if (!isInitialized) {
@@ -2313,24 +1877,17 @@ export default function (api: MoltbotPluginAPI) {
               // Initialize client pointed at the local daemon URL
               debug("[Hindsight] Creating HindsightClient (local daemon)...");
               clientOptions = { baseUrl: hindsightServer.getBaseUrl() };
-              banksWithMissionSet.clear();
+              banksWithDefaultsApplied.clear();
               client = new HindsightClient(clientOptions);
 
               const defaultBankId = deriveBankId(undefined, pluginConfig);
               debug(`[Hindsight] Default bank: ${defaultBankId}`);
 
-              // Note: Missions are stamped per-bank when dynamic bank IDs are
-              // enabled. For static banks, stamp once here on init.
-              if (hasConfiguredMissions(pluginConfig) && usesStaticBank(pluginConfig)) {
-                debug(`[Hindsight] Setting bank missions...`);
-                try {
-                  await applyConfiguredMissions(scopeClient(client, defaultBankId), pluginConfig);
-                  banksWithMissionSet.add(defaultBankId);
-                } catch (err) {
-                  log.warn(
-                    `could not set bank missions for ${defaultBankId}: ${err instanceof Error ? err.message : err}`
-                  );
-                }
+              // Defaults are stamped per-bank when dynamic bank IDs are enabled.
+              // For static banks, stamp once here on init.
+              if (usesStaticBank(pluginConfig)) {
+                debug(`[Hindsight] Applying configured bank defaults...`);
+                await ensureBankDefaultsApplied(defaultBankId, pluginConfig);
               }
 
               if (!isInitialized) {
@@ -2372,7 +1929,7 @@ export default function (api: MoltbotPluginAPI) {
               // Reset state for reinitialization attempt
               client = null;
               clientOptions = null;
-              banksWithMissionSet.clear();
+              banksWithDefaultsApplied.clear();
               isInitialized = false;
             }
           }
@@ -2390,7 +1947,7 @@ export default function (api: MoltbotPluginAPI) {
             hindsightServer = null;
             client = null;
             clientOptions = null;
-            banksWithMissionSet.clear();
+            banksWithDefaultsApplied.clear();
             isInitialized = false;
           }
         }
@@ -2412,22 +1969,12 @@ export default function (api: MoltbotPluginAPI) {
             await detectAppendCapability(externalApi.apiUrl, externalApi.apiToken);
 
             clientOptions = buildClientOptions(llmConfig, reinitPluginConfig, externalApi);
-            banksWithMissionSet.clear();
+            banksWithDefaultsApplied.clear();
             client = new HindsightClient(clientOptions);
             const defaultBankId = deriveBankId(undefined, reinitPluginConfig);
 
-            if (hasConfiguredMissions(reinitPluginConfig) && usesStaticBank(reinitPluginConfig)) {
-              try {
-                await applyConfiguredMissions(
-                  scopeClient(client, defaultBankId),
-                  reinitPluginConfig
-                );
-                banksWithMissionSet.add(defaultBankId);
-              } catch (err) {
-                log.warn(
-                  `could not set bank missions for ${defaultBankId}: ${err instanceof Error ? err.message : err}`
-                );
-              }
+            if (usesStaticBank(reinitPluginConfig)) {
+              await ensureBankDefaultsApplied(defaultBankId, reinitPluginConfig);
             }
 
             isInitialized = true;
@@ -2454,22 +2001,12 @@ export default function (api: MoltbotPluginAPI) {
             await hindsightServer.start();
 
             clientOptions = { baseUrl: hindsightServer.getBaseUrl() };
-            banksWithMissionSet.clear();
+            banksWithDefaultsApplied.clear();
             client = new HindsightClient(clientOptions);
             const defaultBankId = deriveBankId(undefined, reinitPluginConfig);
 
-            if (hasConfiguredMissions(reinitPluginConfig) && usesStaticBank(reinitPluginConfig)) {
-              try {
-                await applyConfiguredMissions(
-                  scopeClient(client, defaultBankId),
-                  reinitPluginConfig
-                );
-                banksWithMissionSet.add(defaultBankId);
-              } catch (err) {
-                log.warn(
-                  `could not set bank missions for ${defaultBankId}: ${err instanceof Error ? err.message : err}`
-                );
-              }
+            if (usesStaticBank(reinitPluginConfig)) {
+              await ensureBankDefaultsApplied(defaultBankId, reinitPluginConfig);
             }
 
             isInitialized = true;
@@ -2493,17 +2030,6 @@ export default function (api: MoltbotPluginAPI) {
             clearInterval(retainQueueFlushTimer);
             retainQueueFlushTimer = null;
           }
-          if (retainQueue && retainQueue.size() > 0 && client) {
-            await withTimeout(
-              flushRetainQueue().catch((err) => {
-                log.warn(`retain queue stop flush failed: ${err}`);
-              }),
-              DEFAULT_SERVICE_STOP_FLUSH_TIMEOUT_MS,
-              "retain queue stop flush"
-            ).catch((err) => {
-              log.warn(`retain queue stop flush bounded: ${err}`);
-            });
-          }
           if (retainQueue) {
             const pending = retainQueue.size();
             if (pending > 0) {
@@ -2517,9 +2043,8 @@ export default function (api: MoltbotPluginAPI) {
 
           client = null;
           clientOptions = null;
-          banksWithMissionSet.clear();
+          banksWithDefaultsApplied.clear();
           isInitialized = false;
-          closeSessionSummaryStore();
 
           stopLogger();
           debug("[Hindsight] Service stopped");
@@ -2546,7 +2071,8 @@ export default function (api: MoltbotPluginAPI) {
 
     api.on("before_dispatch", async (event: any, ctx?: PluginHookAgentContext) => {
       try {
-        const { sessionId, sessionKey } = extractHookSessionIdentity(event, ctx);
+        const sessionKey =
+          ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
         if (!sessionKey) {
           return;
         }
@@ -2559,7 +2085,6 @@ export default function (api: MoltbotPluginAPI) {
           sessionKey,
           ctx: {
             ...ctx,
-            sessionId,
             sessionKey,
             senderId:
               (typeof event?.senderId === "string" ? event.senderId : undefined) || ctx?.senderId,
@@ -2610,7 +2135,7 @@ export default function (api: MoltbotPluginAPI) {
         }
 
         // Session pattern filtering
-        const { sessionId: hookSessionId, sessionKey } = extractHookSessionIdentity(event, ctx);
+        const sessionKey = ctx?.sessionKey;
         if (sessionKey) {
           const ignorePatterns = compileSessionPatterns(pluginConfig.ignoreSessionPatterns ?? []);
           if (ignorePatterns.length > 0 && matchesSessionPattern(sessionKey, ignorePatterns)) {
@@ -2636,15 +2161,14 @@ export default function (api: MoltbotPluginAPI) {
           }
         }
 
-        const sessionKeyForCache = sessionKey;
-        const ctxForRecall =
-          ctx || hookSessionId || sessionKeyForCache
-            ? ({
-                ...ctx,
-                sessionId: ctx?.sessionId ?? hookSessionId,
-                sessionKey: ctx?.sessionKey ?? sessionKeyForCache,
-              } as PluginHookAgentContext)
-            : undefined;
+        // Skip auto-recall when disabled (agent has its own recall tool)
+        if (!pluginConfig.autoRecall) {
+          debug("[Hindsight] Auto-recall disabled via config, skipping");
+          return;
+        }
+
+        const sessionKeyForCache =
+          ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
         const skipTurnReason = sessionKeyForCache
           ? skipHindsightTurnBySession.get(sessionKeyForCache)
           : undefined;
@@ -2662,7 +2186,7 @@ export default function (api: MoltbotPluginAPI) {
         const { resolvedCtx: resolvedCtxForRecall, skipReason: identitySkipReason } =
           resolveAndCacheIdentity({
             sessionKey: sessionKeyForCache,
-            ctx: ctxForRecall,
+            ctx,
             senderIdHint: senderIdFromPrompt,
             pluginConfig,
           });
@@ -2671,18 +2195,6 @@ export default function (api: MoltbotPluginAPI) {
             `[Hindsight] Skipping recall for session ${sessionKeyForCache}: ${formatIdentitySkipReason(identitySkipReason)}`
           );
           logSkipOnce("recall", sessionKeyForCache, identitySkipReason);
-          return;
-        }
-
-        const summaryRecord =
-          pluginConfig.sessionSummaryEnrichRecallQuery === true
-            ? readSessionSummary(resolvedCtxForRecall, pluginConfig)
-            : null;
-        const summaryTextForRecall = getSessionSummarySurfaceText(summaryRecord, pluginConfig);
-
-        // Skip auto-recall when disabled (agent has its own recall tool).
-        if (!pluginConfig.autoRecall) {
-          debug("[Hindsight] Auto-recall disabled via config, skipping");
           return;
         }
 
@@ -2699,25 +2211,15 @@ export default function (api: MoltbotPluginAPI) {
           `[Hindsight] extractRecallQuery input lengths - raw: ${event.rawMessage?.length ?? 0}, prompt: ${event.prompt?.length ?? 0}`
         );
         const extracted = extractRecallQuery(event.rawMessage, event.prompt);
-        const hasSummaryRecallFallback =
-          pluginConfig.sessionSummaryEnrichRecallQuery === true && summaryTextForRecall.length > 0;
-        if (!extracted && !hasSummaryRecallFallback) {
-          debug(
-            "[Hindsight] extractRecallQuery returned null and no summary fallback is available, skipping recall"
-          );
+        if (!extracted) {
+          debug("[Hindsight] extractRecallQuery returned null, skipping recall");
           return;
         }
-        if (extracted && isEphemeralOperationalText(extracted)) {
+        if (isEphemeralOperationalText(extracted)) {
           debug("[Hindsight] Recall query is operational/ephemeral noise, skipping recall");
           return;
         }
-        if (extracted) {
-          debug(`[Hindsight] extractRecallQuery result length: ${extracted.length}`);
-        } else {
-          debug(
-            "[Hindsight] extractRecallQuery returned null, using rolling session summary fallback"
-          );
-        }
+        debug(`[Hindsight] extractRecallQuery result length: ${extracted.length}`);
         const recallContextTurns = pluginConfig.recallContextTurns ?? 1;
         const recallMaxQueryChars = pluginConfig.recallMaxQueryChars ?? 800;
         const sessionMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
@@ -2731,35 +2233,17 @@ export default function (api: MoltbotPluginAPI) {
           );
         }
         const recallRoles = pluginConfig.recallRoles ?? ["user", "assistant"];
-        const composedPrompt = extracted
-          ? pluginConfig.sessionSummaryEnrichRecallQuery === true
-            ? composeRecallQueryLatestFirst(
-                extracted,
-                sessionMessages,
-                recallContextTurns,
-                recallRoles
-              )
-            : composeRecallQuery(extracted, sessionMessages, recallContextTurns, recallRoles)
-          : "";
-        let prompt = extracted
-          ? truncateRecallQuery(composedPrompt, extracted, recallMaxQueryChars)
-          : "";
-        if (pluginConfig.sessionSummaryEnrichRecallQuery === true) {
-          prompt = composeSummaryRecallQuery({
-            latestQuery: prompt,
-            summaryText: summaryTextForRecall,
-            maxChars: recallMaxQueryChars,
-            budget: getSessionSummaryBudgetFromConfig(pluginConfig),
-          });
-        }
+        const composedPrompt = composeRecallQuery(
+          extracted,
+          sessionMessages,
+          recallContextTurns,
+          recallRoles
+        );
+        let prompt = truncateRecallQuery(composedPrompt, extracted, recallMaxQueryChars);
 
         // Final defensive cap
         if (prompt.length > recallMaxQueryChars) {
           prompt = prompt.substring(0, recallMaxQueryChars);
-        }
-        if (!prompt.trim()) {
-          debug("[Hindsight] Recall query is empty after summary/query assembly, skipping recall");
-          return;
         }
 
         // Wait for client to be ready
@@ -2797,6 +2281,7 @@ export default function (api: MoltbotPluginAPI) {
               maxTokens: pluginConfig.recallMaxTokens || 1024,
               budget: pluginConfig.recallBudget,
               types: pluginConfig.recallTypes,
+              preferObservations: pluginConfig.preferObservations,
             },
             recallTimeoutMs
           );
@@ -2858,12 +2343,19 @@ ${memoriesFormatted}
           );
         }
 
-        // Inject recalled memories. Position is configurable to preserve prompt caching
-        // when agents have large static system prompts.
-        return mergePromptHookResult({
-          memoryBlock: contextMessage,
-          memoryPosition: pluginConfig.recallInjectionPosition,
-        });
+        // Keep recalled memories outside the system prompt by default so the
+        // provider can reuse its stable prompt prefix across turns. Users who
+        // need system-level memory context can still opt into prepend or append.
+        const position = pluginConfig.recallInjectionPosition ?? "user";
+        switch (position) {
+          case "append":
+            return { appendSystemContext: contextMessage };
+          case "user":
+            return { prependContext: contextMessage };
+          case "prepend":
+          default:
+            return { prependSystemContext: contextMessage };
+        }
       } catch (error) {
         if (error instanceof DOMException && error.name === "TimeoutError") {
           log.warn(
@@ -2897,16 +2389,13 @@ ${memoriesFormatted}
       const perfHookStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
       try {
         // Avoid cross-session contamination: only use context carried by this event.
-        const { sessionId: eventSessionId, sessionKey: eventSessionKey } =
-          extractHookSessionIdentity(event, ctx);
+        const eventSessionKey =
+          typeof event?.sessionKey === "string" ? event.sessionKey : undefined;
         const effectiveCtx =
-          ctx || eventSessionKey || eventSessionId
-            ? ({
-                ...ctx,
-                sessionId: eventSessionId,
-                sessionKey: ctx?.sessionKey ?? eventSessionKey,
-              } as PluginHookAgentContext)
-            : undefined;
+          ctx ||
+          (eventSessionKey
+            ? ({ sessionKey: eventSessionKey } as PluginHookAgentContext)
+            : undefined);
 
         // Check if this provider is excluded
         if (
@@ -2996,18 +2485,13 @@ ${memoriesFormatted}
           return;
         }
 
-        const allMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
-        if (!Array.isArray(allMessages) || allMessages.length === 0) {
+        if (
+          !Array.isArray(event.context?.sessionEntry?.messages ?? event.messages) ||
+          (event.context?.sessionEntry?.messages ?? event.messages ?? []).length === 0
+        ) {
           debug("[Hindsight Hook] No messages in event, skipping retention");
           return;
         }
-
-        await updateSessionSummaryForMessages({
-          messages: allMessages,
-          resolvedCtx: resolvedCtxForRetain,
-          config: pluginConfig,
-          force,
-        });
 
         if (pluginConfig.autoRetain === false) {
           debug("[Hindsight Hook] autoRetain is disabled, skipping retention");
@@ -3016,6 +2500,7 @@ ${memoriesFormatted}
 
         // Chunked retention: skip non-Nth turns and use a sliding window when firing
         const retainEveryN = pluginConfig.retainEveryNTurns ?? 1;
+        const allMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
         let messagesToRetain = allMessages;
         let retainFullWindow = false;
 
@@ -3150,6 +2635,7 @@ ${memoriesFormatted}
             appendSupported: supportsUpdateModeAppend,
           }
         );
+
         // Retain to Hindsight
         debug(
           `[Hindsight] Retaining to bank ${bankId}, document: ${retainRequest.documentId}, chars: ${transcript.length}\n---\n${transcript.substring(0, 500)}${transcript.length > 500 ? "\n...(truncated)" : ""}\n---`
@@ -3224,16 +2710,30 @@ ${memoriesFormatted}
         })();
         const apiToken = pluginConfig.hindsightApiToken || undefined;
 
-        // Factory: called per session with agent context, returns tools scoped to that bank
+        // Factory: called per session with agent context, returns tools scoped to that bank.
+        // Identity is resolved the same way as auto-recall/retain so PluginToolContext
+        // (which lacks senderId/messageProvider) still routes to the per-user bank.
         const factory = (ctx: PluginToolContext) => {
-          const bankId = deriveBankId(ctx as any, pluginConfig);
-          const tools = createKnowledgeTools({ apiUrl, apiToken, bankId });
+          const resolution = resolveBankIdForKnowledgeTools(ctx, pluginConfig);
+          const tools = createKnowledgeTools({
+            apiUrl,
+            apiToken,
+            bankId: resolution.bankId,
+          });
           return tools.map((t) => ({
             name: t.name,
             label: t.label,
             description: t.description,
             parameters: t.parameters,
             async execute(_id: string, params: Record<string, unknown>) {
+              if (resolution.identityError) {
+                return {
+                  content: [{ type: "text", text: resolution.identityError }],
+                  details: {},
+                };
+              }
+              const config = currentPluginConfig || pluginConfig;
+              await ensureBankDefaultsApplied(resolution.bankId, config);
               return { ...(await t.execute(params)), details: {} };
             },
           }));
@@ -3359,33 +2859,10 @@ export function buildRetainRequest(
   };
 }
 
-export interface RetentionSessionContext {
-  senderId?: string;
-  channelId?: string;
-  provider?: string;
-}
-
-/**
- * Build a session-context block for legacy callers that need to render routing
- * metadata separately from retained transcript content.
- */
-export function formatRetentionSessionContext(
-  ctx: RetentionSessionContext | null | undefined
-): string | null {
-  if (!ctx) return null;
-  const lines: string[] = [];
-  if (ctx.senderId) lines.push(`sender: ${ctx.senderId}`);
-  if (ctx.channelId) lines.push(`channel: ${ctx.channelId}`);
-  if (ctx.provider) lines.push(`provider: ${ctx.provider}`);
-  if (lines.length === 0) return null;
-  return ["[context]", ...lines, "[/context]"].join("\n");
-}
-
 export function prepareRetentionTranscript(
   messages: any[],
   pluginConfig: PluginConfig,
-  retainFullWindow = false,
-  _sessionContext?: RetentionSessionContext | null
+  retainFullWindow = false
 ): { transcript: string; messageCount: number } | null {
   if (!messages || messages.length === 0) {
     return null;
@@ -3607,46 +3084,33 @@ function buildToolResultBlock(msg: any): any | null {
   return block;
 }
 
-export function countUserTurns(messages: any[]): number {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return 0;
-  }
-
-  return messages.reduce(
-    (count: number, message: any) => count + (message?.role === "user" ? 1 : 0),
-    0
-  );
-}
-
-export function getRetentionTurnIndex(
-  conversationTurnCount: number,
-  retainEveryN: number
-): number | null {
-  if (conversationTurnCount <= 0 || retainEveryN <= 0) {
-    return null;
-  }
-
-  if (retainEveryN === 1) {
-    return conversationTurnCount;
-  }
-
-  if (conversationTurnCount % retainEveryN !== 0) {
-    return null;
-  }
-
-  return Math.floor(conversationTurnCount / retainEveryN);
-}
-
 export function sliceLastTurnsByUserBoundary(messages: any[], turns: number): any[] {
   if (!Array.isArray(messages) || messages.length === 0 || turns <= 0) {
     return [];
+  }
+
+  // Count only user messages that contain actual text content.
+  // OpenClaw normalizes tool_result blocks into role:"user" messages with a
+  // tool_result content block. Without this filter those synthetic messages
+  // would be counted as real user turns, causing the window to exclude actual
+  // user input from the retained transcript.
+  function hasRealTextContent(msg: any): boolean {
+    if (msg?.role !== "user") return false;
+    const content = msg.content;
+    if (typeof content === "string") return content.trim().length > 0;
+    if (Array.isArray(content)) {
+      return content.some(
+        (b: any) => b?.type === "text" && typeof b?.text === "string" && b.text.trim().length > 0
+      );
+    }
+    return false;
   }
 
   let userTurnsSeen = 0;
   let startIndex = -1;
 
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") {
+    if (messages[i]?.role === "user" && hasRealTextContent(messages[i])) {
       userTurnsSeen += 1;
       if (userTurnsSeen >= turns) {
         startIndex = i;

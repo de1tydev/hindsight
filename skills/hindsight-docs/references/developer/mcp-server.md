@@ -107,6 +107,21 @@ The MCP server operates in two modes depending on the URL:
 
 **Multi-bank mode** exposes all tools with an optional `bank_id` parameter, plus bank management tools (`list_banks`, `create_bank`, `get_bank_stats`).
 
+## Tool Metadata and Instructions
+
+Hindsight can append deployment-specific guidance to the `retain` and `recall` MCP tool descriptions. Set `HINDSIGHT_API_MCP_INSTRUCTIONS` on the API server when clients should see local rules, such as which tags to use or which memories should be retained.
+
+```bash
+export HINDSIGHT_API_MCP_INSTRUCTIONS="Use project:<name> tags for project-specific memories."
+```
+
+MCP clients that read tool annotations also receive safety hints from the built-in tools:
+
+- Read-only operations such as `recall`, `reflect`, `list_*`, and `get_*` are marked with `readOnlyHint: true`.
+- Delete, clear, and invalidate operations are marked with `destructiveHint: true`.
+- `openWorldHint` is `false` for the built-in tools because Hindsight operates on its configured memory store rather than the open internet.
+- Write operations such as `retain`, `create_*`, `update_*`, `refresh_mental_model`, and `cancel_operation` are not marked destructive.
+
 ---
 
 ## Available Tools
@@ -189,6 +204,7 @@ Search memories to provide personalized responses.
 | `tags` | list[string] | No | Filter memories by tags |
 | `tags_match` | string | No | Tag matching mode: `any` (default) or `all` |
 | `query_timestamp` | string | No | ISO 8601 timestamp — recall as if asking at this point in time; anchors relative temporal expressions and recency scoring |
+| `min_scores` | object | No | Optional per-stage score floors, e.g. `{"reranker": 0.5}`. Keys: `semantic`/`keyword` (retrieval-level cutoffs), `reranker`/`final` (post-ranking). All inclusive and AND-ed; omit for no filtering. Reranker scores aren't calibrated across queries — calibrate before use |
 
 **Example:**
 ```json
@@ -254,8 +270,27 @@ Create a mental model — a living document that stays current with your memorie
 | `source_query` | string | Yes | The query used to generate and refresh the model |
 | `mental_model_id` | string | No | Custom ID (alphanumeric lowercase with hyphens). Auto-generated if not provided |
 | `tags` | list[string] | No | Tags for organizing and filtering models |
+| `tags_match` | string | No | How the model's tags are matched against memories on refresh: `any`, `all`, `any_strict`, `all_strict`, or `exact`. See the note below on the default |
 | `max_tokens` | integer | No | Maximum tokens for model content (default: 2048) |
 | `trigger_refresh_after_consolidation` | boolean | No | Auto-refresh this model after memory consolidation (default: `false`) |
+
+:::warning Tagged models default to `all_strict`
+When a mental model has `tags` but no explicit `tags_match`, its refresh matches memories with **`all_strict`** — a memory must carry **every** one of the model's tags to be included. If your memories use narrow, single-topic tags (e.g. `["project:status"]`) while the model is tagged broadly (e.g. `["projects", "mental-model"]`), the refresh filters out everything and the content comes back empty.
+
+Pass `tags_match: "any"` (the same default that `recall` and `reflect` use) to match memories that carry *any* of the model's tags:
+
+```json
+{
+  "name": "create_mental_model",
+  "arguments": {
+    "name": "Current projects",
+    "source_query": "Which projects is the user currently working on?",
+    "tags": ["projects", "mental-model"],
+    "tags_match": "any"
+  }
+}
+```
+:::
 
 **Example:**
 ```json
@@ -264,7 +299,8 @@ Create a mental model — a living document that stays current with your memorie
   "arguments": {
     "name": "Team Directory",
     "source_query": "Who works here and what do they do?",
-    "tags": ["team", "people"]
+    "tags": ["team", "people"],
+    "tags_match": "any"
   }
 }
 ```

@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from ..config import get_config
 from ..engine.schema import fq_table_explicit as fq_table
 from ..metrics import get_metrics_collector
 from .exceptions import DeferOperation, RetryTaskAt
@@ -30,11 +31,59 @@ from .stage import StageHolder, bind_holder
 # pass through unchanged.
 _RETAIN_OP_TYPES = {"retain", "batch_retain", "file_convert_retain"}
 
+# How long shutdown waits for cancelled tasks to unwind before it reconciles
+# their operations. Short: the tasks have already been cancelled and the process
+# is on its way out — this only gives a task mid-way through its own terminal
+# write the chance to land it, so shutdown does not hand back a row that is
+# about to be marked completed.
+_CANCEL_DRAIN_TIMEOUT = 5.0
+
 
 def _metric_operation_label(operation_type: str | None) -> str:
     if operation_type in _RETAIN_OP_TYPES:
         return "retain"
     return operation_type or "unknown"
+
+
+def _wall_timeout_for(task_type: str) -> float | None:
+    """Wall-clock ceiling for one task of this type, or None when unbounded.
+
+    A task that wedges (a lock wait with no deadlock cycle to break it, an LLM
+    permit that never frees, a producer blocked on a queue nobody drains) holds
+    its worker slot forever: the operation stays 'processing', which the API
+    refuses to retry *or* cancel, and once every slot is held the worker stops
+    claiming work entirely (#3002). Per-operation timeouts elsewhere bound one
+    LLM call or one query, never the whole task — this is the outer backstop
+    that turns "wedged until restart" into "failed and retryable".
+
+    Only retain is bounded today; reflect self-bounds inside the engine
+    (``reflect_wall_timeout``) and the remaining types have no reported wedge.
+    """
+    if task_type in _RETAIN_OP_TYPES:
+        timeout = get_config().retain_wall_timeout
+        return float(timeout) if timeout > 0 else None
+    return None
+
+
+class _WallTimeoutExceeded(Exception):
+    """A task was cancelled because it blew through its wall-clock ceiling."""
+
+    def __init__(self, timeout: float) -> None:
+        super().__init__(f"wall-clock timeout after {timeout:.0f}s")
+        self.timeout = timeout
+
+
+def _updated_row_count(result: Any) -> int:
+    """Extract a row count from backend execute() results."""
+    if isinstance(result, int):
+        return result
+    if isinstance(result, str):
+        try:
+            return int(result.rsplit(" ", 1)[-1])
+        except (TypeError, ValueError):
+            return 0
+    rowcount = getattr(result, "rowcount", None)
+    return rowcount if isinstance(rowcount, int) else 0
 
 
 if TYPE_CHECKING:
@@ -148,6 +197,7 @@ class WorkerPoller:
         max_slots: int = 10,
         slot_reservations: dict[str, int] | None = None,
         consolidation_bank_priority: dict[str, int] | None = None,
+        max_retries: int = 3,
     ):
         """
         Initialize the worker poller.
@@ -170,6 +220,8 @@ class WorkerPoller:
                 Patterns support ``*`` as wildcard. A bare ``*`` key is the catch-all default.
                 When set, consolidation tasks are claimed in priority tiers rather than
                 pure created_at order. None or empty dict preserves current behavior.
+            max_retries: Maximum retry attempts before a task is marked failed.
+                Must be >= 0. Default 3 (matches DEFAULT_WORKER_MAX_RETRIES).
         """
         self._backend = backend
         self._worker_id = worker_id
@@ -191,6 +243,7 @@ class WorkerPoller:
         self._consolidation_bank_priority: dict[str, int] | None = (
             consolidation_bank_priority if consolidation_bank_priority else None
         )
+        self._max_retries = max(0, max_retries)  # Never negative
         # Cache of which optional PG routines are installed on the server
         # (probed once, memoised for the life of the poller).
         from ..engine.db.optional_routines import OptionalRoutines
@@ -209,6 +262,8 @@ class WorkerPoller:
         # Rotation offset for per-tenant fair claiming. Advances past the last
         # schema we serviced so a busy tenant can't monopolize the poll order.
         self._next_schema_idx: int = 0
+        # Retention cleanup runs outside the claim loop. Keep one task per
+        # poller so maintenance cannot overlap with itself or block slot refill.
 
     @staticmethod
     def _normalize_poll_schema(schema: str | None) -> str | None:
@@ -504,17 +559,20 @@ class WorkerPoller:
                 return result
 
     async def _mark_completed(self, operation_id: str, schema: str | None):
-        """Mark a task as completed."""
+        """Mark a processing task as completed, then propagate to parent if needed."""
         table = fq_table("async_operations", schema)
         async with self._backend.acquire() as conn:
-            await conn.execute(
-                f"""
-                UPDATE {table}
-                SET status = 'completed', completed_at = now(), updated_at = now()
-                WHERE operation_id = $1
-                """,
-                operation_id,
-            )
+            async with conn.transaction():
+                result = await conn.execute(
+                    f"""
+                    UPDATE {table}
+                    SET status = 'completed', completed_at = now(), updated_at = now()
+                    WHERE operation_id = $1 AND status = 'processing'
+                    """,
+                    operation_id,
+                )
+                if _updated_row_count(result):
+                    await self._maybe_update_parent_operation(operation_id, schema, conn)
 
     async def _mark_failed(self, operation_id: str, error_message: str, schema: str | None):
         """Mark a task as failed with error message, then propagate to parent if applicable."""
@@ -705,6 +763,26 @@ class WorkerPoller:
                     if self._in_flight_by_type[operation_type] == 0:
                         del self._in_flight_by_type[operation_type]
 
+    async def _run_executor(self, task: ClaimedTask, task_type: str) -> None:
+        """Run the task executor under its type's wall-clock ceiling, if it has one."""
+        wall_timeout = _wall_timeout_for(task_type)
+        if wall_timeout is None:
+            await self._executor(task.task_dict)
+            return
+
+        # asyncio.timeout() rather than wait_for(): `expired()` distinguishes our
+        # ceiling firing from an inner TimeoutError merely bubbling out (an asyncpg
+        # command timeout, say), which wait_for would surface as the same exception.
+        # Reporting a task's own timeout as a wedge would send operators hunting for
+        # the wrong thing.
+        try:
+            async with asyncio.timeout(wall_timeout) as cm:
+                await self._executor(task.task_dict)
+        except asyncio.TimeoutError as e:
+            if cm.expired():
+                raise _WallTimeoutExceeded(wall_timeout) from e
+            raise
+
     async def _execute_task_inner(self, task: ClaimedTask, holder: StageHolder | None = None):
         """Inner task execution with retry/fail handling.
 
@@ -747,9 +825,25 @@ class WorkerPoller:
             logger.debug(f"Executing task {task.operation_id} (type={task_type}, bank={bank_id}{schema_info})")
             if task.schema:
                 task.task_dict["_schema"] = task.schema
-            await self._executor(task.task_dict)
+            await self._run_executor(task, task_type)
             logger.debug(f"Task {task.operation_id} execution finished")
+            await self._mark_completed(task.operation_id, task.schema)
             terminal_success = True
+        except _WallTimeoutExceeded as e:
+            # The executor has already been cancelled; all that's left is to say so
+            # clearly. Handled apart from the generic branch below so the operator
+            # sees the wedge for what it is rather than a bare "TimeoutError", and
+            # so the stage that was current when the ceiling fired is preserved —
+            # that breadcrumb is the only pointer to where the task was stuck.
+            stage = holder.stage if holder is not None else "unknown"
+            message = (
+                f"Task exceeded the {e.timeout:.0f}s wall-clock limit for '{task_type}' "
+                f"(stage={stage}) and was cancelled. Raise HINDSIGHT_API_RETAIN_WALL_TIMEOUT "
+                f"if this is a legitimately long operation, or set it to 0 to disable the limit."
+            )
+            logger.error(f"Task {task.operation_id} timed out: {message}")
+            await self._mark_failed(task.operation_id, message, task.schema)
+            terminal_success = False
         except DeferOperation as e:
             # Deferral is not a terminal outcome — do not record a completion.
             await self._defer_operation(task.operation_id, e.exec_date, e.reason, task.schema)
@@ -759,7 +853,20 @@ class WorkerPoller:
         except Exception as e:
             logger.error(f"Task {task.operation_id} failed: {e}")
             traceback.print_exc()
-            await self._mark_failed(task.operation_id, str(e), task.schema)
+            try:
+                await self._mark_failed(task.operation_id, str(e), task.schema)
+            except Exception:
+                # Marking a task failed is itself a DB write, and it can fail
+                # (pool exhausted, connection reset, statement timeout). Without
+                # this rescue the row stays 'processing' under a worker that has
+                # already forgotten it: _cleanup_task drops it from _active_tasks,
+                # recover_own_tasks only runs at startup, and no dead-worker logic
+                # applies because the worker is alive. See issue #3228.
+                logger.exception(f"Could not mark task {task.operation_id} failed; reconciling it for re-claim")
+                try:
+                    await self._reclaim_own_processing_tasks(task.schema, operation_id=task.operation_id)
+                except Exception:
+                    logger.exception(f"Could not reconcile task {task.operation_id}; it stays 'processing'")
             terminal_success = False
 
         # Record the metric outside the executor's exception scope so a metrics
@@ -772,46 +879,123 @@ class WorkerPoller:
             except Exception:
                 logger.warning(f"Failed to record worker operation metric for {task.operation_id}", exc_info=True)
 
+    async def _reclaim_own_processing_tasks(self, schema: str | None, *, operation_id: str | None = None) -> int:
+        """Reconcile rows still claimed by this worker in one schema.
+
+        Rows under the retry budget go back to 'pending'; rows at/over it are
+        moved to 'failed' so a task that reliably kills its worker cannot be
+        re-claimed forever (claim → grind → die → reclaim → …, see #2675/#2834).
+        Batch API operations are excluded — they are long-lived by design and
+        `_recover_batch_operations` resets them without spending a retry.
+
+        Every caller that reconciles this worker's own rows goes through here so
+        the guards stay in one place: startup recovery (`recover_own_tasks`),
+        shutdown release (`release_own_tasks`), and the single-operation rescue
+        when a terminal write itself fails (`operation_id` set).
+
+        Returns:
+            Number of rows reset to pending (not including those failed).
+        """
+        table = fq_table("async_operations", schema)
+        max_retries = self._max_retries
+        # Two separate UPDATEs so their row counts are meaningful:
+        #   1. Rows under the limit → increment retry_count, reset to pending
+        #   2. Rows at/over the limit → move to failed with a clear reason
+        op_filter = "AND operation_id = $3" if operation_id is not None else ""
+        op_args = [operation_id] if operation_id is not None else []
+        async with self._backend.acquire() as conn:
+            # Rows under the limit: increment retry_count and reset to pending
+            result = await conn.execute(
+                f"""
+                UPDATE {table}
+                SET status = 'pending', worker_id = NULL, claimed_at = NULL,
+                    retry_count = COALESCE(retry_count, 0) + 1, updated_at = now()
+                WHERE status = 'processing' AND worker_id = $1
+                  AND result_metadata->>'batch_id' IS NULL
+                  AND COALESCE(retry_count, 0) < $2
+                  {op_filter}
+                """,
+                self._worker_id,
+                max_retries,
+                *op_args,
+            )
+            # Rows that exceeded the limit: move to failed. RETURNING gives us
+            # the ids so their parent aggregators can be rolled up below — a
+            # batch_retain child sub-batch carries parent_operation_id (not
+            # batch_id) in its metadata, so it IS eligible to be failed here,
+            # and without propagating that terminal state the parent is stranded
+            # in 'processing' forever (the same crash loop this fixes, one level up).
+            failed_rows = await conn.fetch(
+                f"""
+                UPDATE {table}
+                SET status = 'failed', worker_id = NULL, claimed_at = NULL,
+                    error_message = 'exceeded max recovery attempts (retry_count >= {max_retries})',
+                    completed_at = now(), updated_at = now()
+                WHERE status = 'processing' AND worker_id = $1
+                  AND result_metadata->>'batch_id' IS NULL
+                  AND COALESCE(retry_count, 0) >= $2
+                  {op_filter}
+                RETURNING operation_id
+                """,
+                self._worker_id,
+                max_retries,
+                *op_args,
+            )
+
+        # Roll each failed child up to its parent aggregator, one transaction
+        # per child so a single problematic parent can't undo the others —
+        # mirrors the per-task transaction the in-process _mark_failed path uses.
+        # The failing UPDATE above already committed, so the children stay failed
+        # regardless; _maybe_update_parent_operation no-ops for tasks without a
+        # parent_operation_id.
+        for failed_row in failed_rows:
+            async with self._backend.acquire() as conn:
+                async with conn.transaction():
+                    await self._maybe_update_parent_operation(str(failed_row["operation_id"]), schema, conn)
+
+        if failed_rows:
+            schema_display = f'"{schema}"' if schema else str(schema)
+            logger.warning(
+                f"Worker {self._worker_id} moved {len(failed_rows)} tasks to 'failed' "
+                f"(exceeded {max_retries} recovery attempts in schema {schema_display})"
+            )
+        return _updated_row_count(result)
+
     async def recover_own_tasks(self) -> int:
         """
         Recover tasks that were assigned to this worker but not completed.
 
         This handles the case where a worker crashes while processing tasks.
         On startup, we reset any tasks stuck in 'processing' for this worker_id
-        back to 'pending' so they can be picked up again.
+        back to 'pending' so they can be picked up again — provided their
+        ``retry_count`` has not reached ``max_retries``. Tasks at/over the
+        limit are moved to 'failed' with an explanatory error message,
+        breaking the infinite loop where a task that kills the worker
+        (OOM, infinite loop) is re-claimed forever.
 
         Also recovers batch API operations that were in-flight.
 
         If tenant_extension is configured, recovers across all tenant schemas.
 
         Returns:
-            Number of tasks recovered
+            Number of tasks recovered (reset to pending, not including failed)
         """
         schemas = await self._get_schemas()
         total_count = 0
 
         for schema in schemas:
             try:
-                table = fq_table("async_operations", schema)
-
                 # First, recover batch API operations (before resetting worker tasks)
-                batch_count = await self._recover_batch_operations(schema)
-                total_count += batch_count
+                total_count += await self._recover_batch_operations(schema)
 
-                # Then reset normal worker tasks
-                async with self._backend.acquire() as conn:
-                    result = await conn.execute(
-                        f"""
-                        UPDATE {table}
-                        SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
-                        WHERE status = 'processing' AND worker_id = $1 AND result_metadata->>'batch_id' IS NULL
-                        """,
-                        self._worker_id,
-                    )
+                total_count += await self._reclaim_own_processing_tasks(schema)
 
-                # Parse "UPDATE N" to get count
-                count = int(result.split()[-1]) if result else 0
-                total_count += count
+                # Finalize batch_retain parents that the aggregation left behind
+                # (crash between a child's terminal commit and the parent update,
+                # or children that never committed). These sit 'pending' with a
+                # NULL payload — unclaimable and invisible to failed_operations —
+                # until reconciled. See issue #2985.
+                await self._reconcile_orphaned_parents(schema)
             except Exception as e:
                 # Format schema for logging: custom schemas in quotes, None as-is
                 schema_display = f'"{schema}"' if schema else str(schema)
@@ -819,6 +1003,41 @@ class WorkerPoller:
 
         if total_count > 0:
             logger.info(f"Worker {self._worker_id} recovered {total_count} stale tasks from previous run")
+        return total_count
+
+    async def release_own_tasks(self) -> int:
+        """Hand back every operation this worker still owns, at shutdown.
+
+        The counterpart to `recover_own_tasks`: the same reconciliation, run when
+        the worker stops rather than when it starts. Without it, work cancelled
+        past the drain timeout stays 'processing' under a worker id that is never
+        coming back (the default id is derived from the hostname, so in a
+        container it never recurs) and no client polling that operation ever sees
+        it finish. See issue #3228.
+
+        Deliberately skips the batch-operation and orphaned-parent passes:
+        those are not scoped to this worker's rows, so they stay a startup
+        concern where no other worker can be mid-flight on them.
+
+        Returns:
+            Number of operations returned to pending.
+        """
+        # Nothing here may raise: this runs on the shutdown path, where the DB
+        # being unwell is exactly the case that strands rows, and an exception
+        # escaping would abort the rest of the teardown.
+        try:
+            schemas = await self._get_schemas()
+        except Exception as e:
+            logger.warning(f"Worker {self._worker_id} could not list schemas to release its in-flight tasks: {e}")
+            return 0
+
+        total_count = 0
+        for schema in schemas:
+            try:
+                total_count += await self._reclaim_own_processing_tasks(schema)
+            except Exception as e:
+                schema_display = f'"{schema}"' if schema else str(schema)
+                logger.warning(f"Worker {self._worker_id} failed to release tasks for schema {schema_display}: {e}")
         return total_count
 
     async def _recover_batch_operations(self, schema: str | None) -> int:
@@ -890,6 +1109,126 @@ class WorkerPoller:
             logger.error(f"Failed to recover batch operations for schema {schema_display}: {e}")
             return 0
 
+    async def _reconcile_orphaned_parents(self, schema: str | None) -> int:
+        """Drive stranded batch_retain parent operations to a terminal state.
+
+        A batch_retain parent is a status *aggregator*: it carries no
+        task_payload (workers never claim it) and is normally promoted to a
+        terminal state by ``_maybe_update_parent_operation`` when its last child
+        sub-batch finishes. Two crash windows can strand a parent 'pending'
+        forever:
+
+          * every child reached a terminal state but the promotion was skipped
+            (the aggregation swallows and logs errors rather than failing the
+            child, so a transient error there leaves the parent behind), or
+          * the children never committed at all, leaving a parent with zero
+            children (older non-atomic create paths, a hard kill mid-submission).
+
+        Either way the parent sits 'pending' with ``task_payload IS NULL``: it is
+        unclaimable, never counted in ``failed_operations``, unretryable via the
+        API, and its documents are silently absent. See issue #2985.
+
+        On worker startup we reconcile every such parent:
+
+          * children present, all terminal -> completed / failed (mirrors the
+            aggregator, inheriting a representative child error on failure),
+          * no children at all -> failed, with an explicit reason so an operator
+            can see the loss and resubmit the source documents.
+
+        Parents with at least one still-live child are left untouched — the
+        normal aggregation path will finish them once their children drain.
+
+        Returns the number of parents driven to a terminal state.
+        """
+        table = fq_table("async_operations", schema)
+        schema_display = f'"{schema}"' if schema else str(schema)
+        reconciled = 0
+        try:
+            async with self._backend.acquire() as conn:
+                parents = await conn.fetch(
+                    f"""
+                    SELECT operation_id, bank_id FROM {table}
+                    WHERE operation_type = 'batch_retain'
+                      AND status = 'pending'
+                      AND task_payload IS NULL
+                    """
+                )
+
+            for parent in parents:
+                parent_id = parent["operation_id"]
+                bank_id = parent["bank_id"]
+                # One transaction per parent so a single problematic row can't
+                # roll back the others (mirrors the per-child rollup above).
+                async with self._backend.acquire() as conn:
+                    async with conn.transaction():
+                        # Re-read under a row lock: skip if the normal aggregation
+                        # path (or another worker) already moved it off 'pending'.
+                        locked = await conn.fetchrow(
+                            f"SELECT status FROM {table} WHERE operation_id = $1 FOR UPDATE",
+                            parent_id,
+                        )
+                        if locked is None or locked["status"] != "pending":
+                            continue
+
+                        siblings = await conn.fetch(
+                            f"""
+                            SELECT status, error_message FROM {table}
+                            WHERE bank_id = $1
+                              AND result_metadata::jsonb @> $2::jsonb
+                            """,
+                            bank_id,
+                            json.dumps({"parent_operation_id": str(parent_id)}),
+                        )
+
+                        # A still-live child will drive the aggregation itself.
+                        if any(s["status"] not in ("completed", "failed") for s in siblings):
+                            continue
+
+                        if not siblings:
+                            await conn.execute(
+                                f"""
+                                UPDATE {table}
+                                SET status = 'failed', error_message = $2,
+                                    completed_at = now(), updated_at = now()
+                                WHERE operation_id = $1
+                                """,
+                                parent_id,
+                                "orphaned batch_retain parent: no child sub-batches were "
+                                "persisted (worker crashed mid-submission); resubmit the "
+                                "source documents",
+                            )
+                        elif any(s["status"] == "failed" for s in siblings):
+                            await conn.execute(
+                                f"""
+                                UPDATE {table}
+                                SET status = 'failed', error_message = $2, updated_at = now()
+                                WHERE operation_id = $1
+                                """,
+                                parent_id,
+                                _summarise_child_error_messages(siblings),
+                            )
+                        else:
+                            await conn.execute(
+                                f"""
+                                UPDATE {table}
+                                SET status = 'completed', completed_at = now(), updated_at = now()
+                                WHERE operation_id = $1
+                                """,
+                                parent_id,
+                            )
+                        reconciled += 1
+
+            if reconciled:
+                logger.warning(
+                    f"Worker {self._worker_id} reconciled {reconciled} stranded "
+                    f"batch_retain parent(s) in schema {schema_display}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Worker {self._worker_id} failed to reconcile orphaned parents in schema {schema_display}: {e}"
+            )
+        return reconciled
+
     async def run(self):
         """
         Main polling loop with fire-and-forget task execution.
@@ -938,6 +1277,7 @@ class WorkerPoller:
                     for task in tasks:
                         await self.execute_task(task)
 
+                if tasks:
                     # Continue immediately to claim more tasks (if slots available)
                     continue
 
@@ -969,6 +1309,10 @@ class WorkerPoller:
         """
         Signal shutdown and wait for current tasks to complete.
 
+        Whatever is still claimed by this worker once the drain is over — work
+        cancelled past the timeout, or a row stranded earlier by a terminal
+        write that never landed — is handed back to 'pending' before returning.
+
         Args:
             timeout: Maximum time to wait for in-flight tasks (seconds)
         """
@@ -976,6 +1320,7 @@ class WorkerPoller:
         self._shutdown.set()
 
         # Wait for in-flight tasks to complete
+        drained = False
         start_time = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - start_time < timeout:
             async with self._in_flight_lock:
@@ -984,7 +1329,8 @@ class WorkerPoller:
 
             if in_flight == 0:
                 logger.info(f"Worker {self._worker_id} graceful shutdown complete")
-                return
+                drained = True
+                break
 
             logger.info(f"Worker {self._worker_id} waiting for {in_flight} in-flight tasks")
 
@@ -994,13 +1340,31 @@ class WorkerPoller:
             else:
                 await asyncio.sleep(0.5)
 
-        logger.warning(f"Worker {self._worker_id} shutdown timeout after {timeout}s, cancelling remaining tasks")
+        if not drained:
+            logger.warning(f"Worker {self._worker_id} shutdown timeout after {timeout}s, cancelling remaining tasks")
 
-        # Cancel remaining tasks
-        async with self._in_flight_lock:
-            for operation_id, info in list(self._active_tasks.items()):
-                if not info.bg_task.done():
-                    info.bg_task.cancel()
+            # Cancel remaining tasks
+            cancelled: list[asyncio.Task] = []
+            async with self._in_flight_lock:
+                for operation_id, info in list(self._active_tasks.items()):
+                    if not info.bg_task.done():
+                        info.bg_task.cancel()
+                        cancelled.append(info.bg_task)
+
+            # Let the cancellations land before reconciling. asyncio.CancelledError
+            # derives from BaseException, so it escapes every `except Exception` in
+            # _execute_task_inner and no terminal state is ever written — but a task
+            # partway through its own terminal write must be allowed to finish it,
+            # or we would hand back a row it is about to complete.
+            if cancelled:
+                await asyncio.wait(cancelled, timeout=_CANCEL_DRAIN_TIMEOUT)
+
+        # Anything still 'processing' under this worker id is work nobody is
+        # running. Hand it back now instead of waiting for a startup recovery
+        # that a hostname-derived worker id will never see again (issue #3228).
+        released = await self.release_own_tasks()
+        if released:
+            logger.warning(f"Worker {self._worker_id} returned {released} in-flight operations to 'pending'")
 
     async def _log_progress_if_due(self):
         """Log progress stats every PROGRESS_LOG_INTERVAL seconds.

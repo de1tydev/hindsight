@@ -18,21 +18,12 @@ DEFAULTS = {
     "recallContextTurns": 1,
     "recallMaxQueryChars": 800,
     "recallRoles": ["user", "assistant"],
+    "recallMinScores": {},
     "recallPromptPreamble": (
         "Relevant memories from past conversations (prioritize recent when "
         "conflicting). Only use memories that are directly useful to continue "
         "this conversation; ignore the rest:"
     ),
-    # Rolling session summary. Disabled by default for compatibility; when
-    # enabled, Codex keeps a local per-session summary and uses it to enrich
-    # recall queries without retaining the summary back into Hindsight.
-    "sessionSummaryEnabled": False,
-    "sessionSummaryUpdateEveryNTurns": 2,
-    "sessionSummaryTimeout": 20,
-    "sessionSummaryMaxMessages": 24,
-    "sessionSummaryMaxInputChars": 16_000,
-    "sessionSummaryMaxOutputChars": 2_000,
-    "sessionSummaryMaxOutputTokens": 700,
     # Retain
     "autoRetain": True,
     "retainMode": "full-session",
@@ -43,6 +34,7 @@ DEFAULTS = {
     "retainTags": [],
     "retainMetadata": {},
     # Connection
+    "upgradeNotice": True,  # show the superseded-by-coding-agents notice (capped, see lib/upgrade_notice.py)
     "hindsightApiUrl": None,
     "hindsightApiToken": None,
     "apiPort": 9077,
@@ -79,13 +71,6 @@ ENV_OVERRIDES = {
     "HINDSIGHT_RECALL_TIMEOUT": ("recallTimeout", int),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
-    "HINDSIGHT_SESSION_SUMMARY_ENABLED": ("sessionSummaryEnabled", bool),
-    "HINDSIGHT_SESSION_SUMMARY_UPDATE_EVERY_N_TURNS": ("sessionSummaryUpdateEveryNTurns", int),
-    "HINDSIGHT_SESSION_SUMMARY_TIMEOUT": ("sessionSummaryTimeout", int),
-    "HINDSIGHT_SESSION_SUMMARY_MAX_MESSAGES": ("sessionSummaryMaxMessages", int),
-    "HINDSIGHT_SESSION_SUMMARY_MAX_INPUT_CHARS": ("sessionSummaryMaxInputChars", int),
-    "HINDSIGHT_SESSION_SUMMARY_MAX_OUTPUT_CHARS": ("sessionSummaryMaxOutputChars", int),
-    "HINDSIGHT_SESSION_SUMMARY_MAX_OUTPUT_TOKENS": ("sessionSummaryMaxOutputTokens", int),
     "HINDSIGHT_API_PORT": ("apiPort", int),
     "HINDSIGHT_DAEMON_IDLE_TIMEOUT": ("daemonIdleTimeout", int),
     "HINDSIGHT_EMBED_VERSION": ("embedVersion", str),

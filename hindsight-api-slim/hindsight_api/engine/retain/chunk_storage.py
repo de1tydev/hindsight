@@ -8,7 +8,7 @@ import hashlib
 import logging
 from dataclasses import dataclass
 
-from ...config import get_config
+from ...config import _get_raw_config
 from ..memory_engine import fq_table
 from .types import ChunkMetadata
 
@@ -55,23 +55,88 @@ async def load_existing_chunks(conn, bank_id: str, document_id: str) -> list[Exi
     ]
 
 
-async def delete_chunks_by_ids(conn, chunk_ids: list[str]) -> None:
+async def delete_chunks_by_ids(conn, chunk_ids: list[str], bank_id: str | None = None, txn=None) -> None:
     """
     Delete specific chunks by their IDs.
 
     This cascades to memory_units (via FK with CASCADE delete)
     and their links.
+
+    ``txn`` carries a cross-store write-group handle when this delete is part of a re-ingest:
+    the store's tombstones must ride the same txn as the replacement writes so they commit
+    (become visible) together — otherwise an aborted re-ingest could drop the old memories
+    without landing the new ones.
     """
     if not chunk_ids:
         return
+
+    # The chunks->memory_units FK cascade below does not reach a store that keeps memories
+    # outside SQL (its memory_units is empty), so drop the memories carrying each deleted
+    # chunk_id through the store — otherwise a delta re-ingest leaves the old ones as duplicates.
+    from ..memories import META_CHUNK_ID, DeletePredicate, get_memories
+
+    _store = get_memories()
+    if bank_id and not _store.writes_memory_rows_in_sql:
+        for _cid in chunk_ids:
+            await _store.delete_where(bank_id, DeletePredicate(metadata_equals={META_CHUNK_ID: _cid}), txn=txn)
+
+    # PostgreSQL's FK cascade deletes child memory_links in executor-chosen
+    # order. Concurrent chunk deletes for the same bank can then lock overlapping
+    # memory_links in opposite orders and deadlock. Delete links explicitly in a
+    # total order before deleting chunks so every writer takes row locks the same
+    # way; the FK cascade still handles anything inserted later in this txn.
     await conn.execute(
-        f"DELETE FROM {fq_table('chunks')} WHERE chunk_id = ANY($1::text[])",
+        f"""
+        WITH target_units AS MATERIALIZED (
+            SELECT id
+            FROM {fq_table("memory_units")}
+            WHERE chunk_id = ANY($1::text[])
+        ),
+        ordered_links AS MATERIALIZED (
+            SELECT ml.ctid
+            FROM {fq_table("memory_links")} ml
+            WHERE EXISTS (
+                SELECT 1
+                FROM target_units tu
+                WHERE tu.id = ml.from_unit_id OR tu.id = ml.to_unit_id
+            )
+            ORDER BY
+                LEAST(ml.from_unit_id, ml.to_unit_id),
+                GREATEST(ml.from_unit_id, ml.to_unit_id),
+                ml.link_type,
+                COALESCE(ml.entity_id, '00000000-0000-0000-0000-000000000000'::uuid)
+            FOR UPDATE OF ml
+        )
+        DELETE FROM {fq_table("memory_links")} ml
+        USING ordered_links ol
+        WHERE ml.ctid = ol.ctid
+        """,
+        chunk_ids,
+    )
+    await conn.execute(
+        f"""
+        WITH ordered_chunks AS MATERIALIZED (
+            SELECT chunk_id
+            FROM {fq_table("chunks")}
+            WHERE chunk_id = ANY($1::text[])
+            ORDER BY chunk_id
+            FOR UPDATE
+        )
+        DELETE FROM {fq_table("chunks")} c
+        USING ordered_chunks oc
+        WHERE c.chunk_id = oc.chunk_id
+        """,
         chunk_ids,
     )
 
 
 async def store_chunks_batch(
-    conn, bank_id: str, document_id: str, chunks: list[ChunkMetadata], ops=None
+    conn,
+    bank_id: str,
+    document_id: str,
+    chunks: list[ChunkMetadata],
+    ops=None,
+    store_document_text: bool | None = None,
 ) -> dict[int, str]:
     """
     Store document chunks in the database.
@@ -82,6 +147,9 @@ async def store_chunks_batch(
         document_id: Document identifier
         chunks: List of ChunkMetadata objects
         ops: DataAccessOps instance (from backend.ops)
+        store_document_text: Whether to persist raw chunk text. When ``None``,
+            falls back to the server-level default; callers on the retain path
+            pass the per-bank resolved value.
 
     Returns:
         Dictionary mapping global chunk index to chunk_id
@@ -92,7 +160,16 @@ async def store_chunks_batch(
     # When document text storage is disabled, persist empty chunk_text (the
     # column is NOT NULL) while still computing content_hash from the real text
     # so delta-retain dedup is unaffected.
-    store_text = get_config().store_document_text
+    # Fallback to the raw global default (not get_config(), which guards
+    # bank-configurable fields); the retain path always passes the resolved value.
+    store_text = store_document_text if store_document_text is not None else _get_raw_config().store_document_text
+    # A store that owns a dedicated document store keeps the chunk TEXT there, so the
+    # SQL chunks row carries only its metadata (chunk_id, index, content_hash) with empty text —
+    # same shape as store_document_text=False, and idempotency is unaffected (content_hash stays).
+    from ..memories import get_memories
+
+    if get_memories().owns_document_store:
+        store_text = False
 
     # Prepare chunk data for batch insert
     chunk_ids = []
@@ -124,21 +201,3 @@ async def store_chunks_batch(
     )
 
     return chunk_id_map
-
-
-def map_facts_to_chunks(facts_chunk_indices: list[int], chunk_id_map: dict[int, str]) -> list[str | None]:
-    """
-    Map fact chunk indices to chunk IDs.
-
-    Args:
-        facts_chunk_indices: List of chunk indices for each fact
-        chunk_id_map: Dictionary mapping chunk index to chunk_id
-
-    Returns:
-        List of chunk_ids (same length as facts_chunk_indices)
-    """
-    chunk_ids = []
-    for chunk_idx in facts_chunk_indices:
-        chunk_id = chunk_id_map.get(chunk_idx)
-        chunk_ids.append(chunk_id)
-    return chunk_ids

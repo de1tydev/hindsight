@@ -17,7 +17,9 @@ A **memory unit** is the atomic fact Hindsight extracts and stores. This page co
 
 ## List memory units
 
-List the memory units in a bank. The response includes each unit's `fact_type` (`world` | `experience` | `observation`), `state` (`valid` | `invalidated`), entities, occurred dates, and — for facts a user has edited — an `edited_at` timestamp. Invalidated rows are **included by default** so curation stays auditable; filter with `state=`.
+List the memory units in a bank. The response includes each unit's `fact_type` (`world` | `experience` | `observation`), `state` (`valid` | `invalidated`), metadata, entities, occurred dates, and — for facts a user has edited — an `edited_at` timestamp. Invalidated rows are **included by default** so curation stays auditable; filter with `state=`.
+
+Narrow the results with query parameters: `type=` (fact type), `q=` (full-text search over text and context), `document_id=` (a single source document), and `entity_id=` (memory units linked to a given entity). The `entity_id` filter is an exact reverse lookup over stored entity links — not a text or semantic match — so you can list an entity's evidence (e.g. its observations, with `type=observation`) without scanning every memory. Because entity links exist only for live units, combining `entity_id` with `state=invalidated` returns nothing.
 
 ### Python
 
@@ -57,6 +59,8 @@ curl -s "$HINDSIGHT_URL/v1/default/banks/$BANK_ID/memories/list?state=invalidate
 
 ## Fetch a single memory unit
 
+Fetch a memory unit by ID, including its content, metadata, entities, timestamps, tags, and curation state.
+
 ### Python
 
 ```python
@@ -66,7 +70,7 @@ curl -s "$HINDSIGHT_URL/v1/default/banks/$BANK_ID/memories/list?state=invalidate
 ### Node.js
 
 ```javascript
-// Fetch a single memory unit (entities, dates, state).
+// Fetch a single memory unit (metadata, entities, dates, state).
 const memory = await (
     await fetch(`${HINDSIGHT_URL}/v1/default/banks/${BANK_ID}/memories/${memoryId}`)
 ).json();
@@ -136,6 +140,8 @@ Only raw **world** and **experience** facts can be curated. Observations are *de
 
 Correct what the LLM extracted. You can change the **text**, **context**, **occurred dates**, **fact type**, and **entities** — anything the extractor could have gotten wrong. Hindsight re-embeds the fact, drops the observations and links derived from the old version, and re-consolidates, so downstream knowledge reflects the correction. Edited facts are marked with an `edited_at` timestamp (surfaced as an **Edited** badge in the control plane).
 
+Correcting a fact never discards the **cause-and-effect relationships** it takes part in: those come from reading the original source, so an edit (or an invalidate/restore round-trip) keeps them intact rather than dropping links nothing could rebuild.
+
 You don't need to rebuild anything yourself: an edit **automatically recomputes the knowledge graph and links** in the background. The fact's entity associations are re-resolved from the new text/entities, its temporal and semantic links are re-derived, and consolidation re-runs — all triggered by the edit. The PATCH returns as soon as the change is committed; the graph/observation rebuild happens asynchronously right after.
 
 ### Python
@@ -201,7 +207,7 @@ await patchMemory(memoryId, {
 Soft-retire a fact. An invalidated memory:
 
 - **disappears from recall**, consolidation, and the knowledge graph,
-- has its **links pruned** and its **derived observations re-computed** without it,
+- has its **links pruned** and its **derived observations re-computed** without it (cause-and-effect relationships are kept aside and come back if you restore it),
 - **stays in the bank** for audit (visible via the memory and document views), and
 - can be **restored** at any time.
 
@@ -231,7 +237,7 @@ await patchMemory(memoryId, { state: 'invalidated', reason: 'server decommission
 # Section 'invalidate-memory' not found in api/memories.go
 ```
 
-Restoring moves the fact back into the active set and re-consolidates:
+Restoring moves the fact back into the active set, brings back the cause-and-effect relationships it took part in, and re-consolidates:
 
 ### Python
 
@@ -261,7 +267,7 @@ await patchMemory(memoryId, { state: 'valid' });
 Behind the scenes, invalidating **moves** the row out of the active `memory_units` table into a separate archive, so recall and consolidation never need a "skip invalidated" filter — the rows simply aren't there.
 
 > **📝 Documents are the source of truth**
-> 
+>
 A memory is extracted from a document. Editing or invalidating a memory does **not** change the document it came from — that's deliberate: the document stays as an accurate historical record. As a result, **reprocessing a document resets curation** of the facts it produced (extraction runs fresh from the original text). Fix systematic issues at the mission level and reprocess; use edit/invalidate for the residue.
 ### A pruning workflow
 

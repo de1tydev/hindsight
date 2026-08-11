@@ -23,9 +23,6 @@ import {
   vi,
   type MockInstance,
 } from "vitest";
-import { mkdtempSync, rmSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
 import type { RecallResponse, RetainResponse } from "@vectorize-io/hindsight-client";
 import type { MoltbotPluginAPI, PluginConfig } from "../src/types.js";
 
@@ -152,7 +149,6 @@ let stopServicesFn: () => Promise<void>;
 // play nicely with the hindsight-client class shape (method overloads).
 let recallSpy: MockInstance;
 let retainSpy: MockInstance;
-const tempDirs: string[] = [];
 
 beforeAll(async () => {
   apiReachable = await waitForApi(HINDSIGHT_API_URL, 8000);
@@ -211,10 +207,6 @@ afterEach(() => {
   // Reset spy call history between tests; don't remove the implementation.
   recallSpy?.mockReset();
   retainSpy?.mockReset();
-  while (tempDirs.length > 0) {
-    const dir = tempDirs.pop();
-    if (dir) rmSync(dir, { recursive: true, force: true });
-  }
 });
 
 // ---------------------------------------------------------------------------
@@ -262,7 +254,7 @@ describe("before_prompt_build hook", () => {
     expect(result).toBeUndefined();
   });
 
-  it("returns { prependSystemContext } with <hindsight_memories> when recall returns results", async () => {
+  it("returns { prependContext } by default when recall returns results", async () => {
     if (!apiReachable) return;
     recallSpy.mockResolvedValue({
       results: [makeMemoryResult("User likes Python")],
@@ -275,16 +267,17 @@ describe("before_prompt_build hook", () => {
       "before_prompt_build",
       { rawMessage: "What programming language do I prefer?", prompt: "", messages: [] },
       { messageProvider: "telegram", senderId: "U003" }
-    )) as { prependSystemContext: string; prependContext?: string };
+    )) as { prependContext: string; prependSystemContext?: string; appendSystemContext?: string };
 
     expect(result).toBeDefined();
-    expect(result.prependContext).toBeUndefined();
-    expect(result.prependSystemContext).toContain("<hindsight_memories>");
-    expect(result.prependSystemContext).toContain("User likes Python");
-    expect(result.prependSystemContext).toContain("</hindsight_memories>");
+    expect(result.prependSystemContext).toBeUndefined();
+    expect(result.appendSystemContext).toBeUndefined();
+    expect(result.prependContext).toContain("<hindsight_memories>");
+    expect(result.prependContext).toContain("User likes Python");
+    expect(result.prependContext).toContain("</hindsight_memories>");
   });
 
-  it("injects all memory result fields in the prependSystemContext", async () => {
+  it("injects all memory result fields in the default prependContext", async () => {
     if (!apiReachable) return;
     const mem = makeMemoryResult("User prefers dark mode");
     mem.tags = ["preference"];
@@ -300,13 +293,13 @@ describe("before_prompt_build hook", () => {
       "before_prompt_build",
       { rawMessage: "Do I prefer dark or light mode?", prompt: "", messages: [] },
       { messageProvider: "telegram", senderId: "U004" }
-    )) as { prependSystemContext: string; prependContext?: string };
+    )) as { prependContext: string; prependSystemContext?: string };
 
     // formatMemories returns a bullet list, not JSON
-    expect(result.prependContext).toBeUndefined();
-    expect(result.prependSystemContext).toContain("- User prefers dark mode");
-    expect(result.prependSystemContext).toContain("<hindsight_memories>");
-    expect(result.prependSystemContext).toContain("</hindsight_memories>");
+    expect(result.prependSystemContext).toBeUndefined();
+    expect(result.prependContext).toContain("- User prefers dark mode");
+    expect(result.prependContext).toContain("<hindsight_memories>");
+    expect(result.prependContext).toContain("</hindsight_memories>");
   });
 
   it("extracts the inner query from an envelope-formatted prompt when rawMessage is absent", async () => {
@@ -369,7 +362,7 @@ describe("before_prompt_build hook", () => {
     expect(options?.maxTokens).toBeGreaterThan(0);
   });
 
-  it("includes recalled memories in the prependSystemContext block", async () => {
+  it("includes recalled memories in the default prependContext block", async () => {
     if (!apiReachable) return;
     recallSpy.mockResolvedValue({
       results: [makeMemoryResult("User loves hiking")],
@@ -382,11 +375,11 @@ describe("before_prompt_build hook", () => {
       "before_prompt_build",
       { rawMessage: "What outdoor activities do I enjoy?", prompt: "", messages: [] },
       { messageProvider: "telegram", senderId: "U007" }
-    )) as { prependSystemContext: string; prependContext?: string };
+    )) as { prependContext: string; prependSystemContext?: string };
 
-    expect(result.prependContext).toBeUndefined();
-    expect(result.prependSystemContext).toContain("User loves hiking");
-    expect(result.prependSystemContext).toContain("<hindsight_memories>");
+    expect(result.prependSystemContext).toBeUndefined();
+    expect(result.prependContext).toContain("User loves hiking");
+    expect(result.prependContext).toContain("<hindsight_memories>");
   });
 
   it("uses identity cached in before_dispatch when later hooks lack sender metadata", async () => {
@@ -709,55 +702,6 @@ describe("agent_end hook", () => {
     ]);
     expect(content).not.toContain("My name is Carol.");
     expect(options?.metadata?.message_count).toBe("2");
-  });
-
-  it("enriches recall query with a rolling summary without changing retain content", async () => {
-    if (!apiReachable) return;
-    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-int-"));
-    tempDirs.push(dir);
-    retainSpy.mockResolvedValue(OK_RETAIN);
-    recallSpy.mockResolvedValue(EMPTY_RECALL);
-    const mod = await import("../src/index.js");
-    const handle = createMockApi({
-      hindsightApiUrl: HINDSIGHT_API_URL,
-      dynamicBankId: true,
-      retainEveryNTurns: 1,
-      sessionSummaryEnabled: true,
-      sessionSummaryEnrichRecallQuery: true,
-      sessionSummaryStorePath: join(dir, "summary.sqlite"),
-    });
-    mod.default(handle.api);
-    await handle.startServices();
-
-    await handle.trigger(
-      "agent_end",
-      {
-        success: true,
-        messages: [
-          { role: "user", content: "I work on project aurora." },
-          { role: "assistant", content: "Noted." },
-          { role: "user", content: "We decided to use TypeScript for project aurora." },
-        ],
-      },
-      { messageProvider: "telegram", senderId: "U019S", sessionKey: "sess-summary-retain" }
-    );
-
-    expect(retainSpy).toHaveBeenCalledOnce();
-    const [, content, options] = retainSpy.mock.calls[0];
-    expect(content).not.toContain("Rolling session summary");
-    expect(options?.context ?? "").not.toContain("Rolling session summary");
-
-    await handle.trigger(
-      "before_prompt_build",
-      { rawMessage: "What did we decide for aurora?", prompt: "", messages: [] },
-      { messageProvider: "telegram", senderId: "U019S", sessionKey: "sess-summary-retain" }
-    );
-
-    expect(recallSpy).toHaveBeenCalledOnce();
-    const [, query] = recallSpy.mock.calls[0];
-    expect(query).toContain("Rolling session summary:");
-    expect(query).toContain("project aurora");
-    await handle.stopServices();
   });
 });
 

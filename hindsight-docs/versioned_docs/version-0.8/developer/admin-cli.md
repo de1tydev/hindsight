@@ -49,6 +49,8 @@ hindsight-admin run-db-migration [OPTIONS]
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--schema`, `-s` | Database schema to run migrations on. If omitted, migrate the base schema plus all discovered tenant schemas. | All schemas |
+| `--embedding-dimension` | Expected embedding dimension to enforce after migrations. Omit to skip the post-migration dimension sync. | Skipped |
+| `--skip-extension-reconcile` | Skip the post-migration vector / text-search index reconcile (it only does work when `HINDSIGHT_API_VECTOR_EXTENSION` / `HINDSIGHT_API_TEXT_SEARCH_EXTENSION` differs from a schema's existing indexes). Makes a no-change re-migration across many tenant schemas much faster; only use when the backend is unchanged. | Reconcile runs |
 
 **Examples:**
 
@@ -63,6 +65,44 @@ hindsight-admin run-db-migration --schema tenant_acme
 :::tip Disabling Auto-Migrations
 To disable automatic migrations on API startup, set `HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP=false`. This is useful when you want to run migrations as a separate step in your deployment pipeline.
 :::
+
+---
+
+### repair-bank
+
+Verify and repair a bank's per-`(bank, fact_type)` vector index coverage.
+
+These partial indexes are normally created when a bank is first created (instant on an empty bank), and PostgreSQL maintains them incrementally as the bank grows. A bank that becomes **populated outside that create-time path** — via a logical restore, a cross-version upgrade, or a vector-extension switch — never gets them, so its bank-scoped recall silently falls back to a global index + post-filter. That fallback is both **slower** and can **under-return** results (the approximate nearest-neighbour search draws its candidates from every bank, then filters to yours afterward).
+
+Run this after any of those events to restore full coverage. It detects **missing or invalid** coverage (an INVALID leftover from an interrupted build, or an index whose type drifted after a backend switch, both count as missing) and rebuilds it with `CREATE INDEX CONCURRENTLY`, so it never blocks live retain/recall/consolidation. It is idempotent and safe to re-run.
+
+```bash
+hindsight-admin repair-bank (--bank BANK_ID | --all) [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--bank`, `-b` | Bank id to repair. Mutually exclusive with `--all`. | — |
+| `--all` | Repair every bank in the base schema and all discovered tenant schemas. | — |
+| `--schema`, `-s` | Limit to a single schema. | All schemas |
+| `--dry-run` | Report what would be repaired without creating or dropping any index. | Off |
+
+Exactly one of `--bank` or `--all` is required. No-op for backends that use a single global vector index (AlloyDB ScaNN, Oracle). It is idempotent — safe to re-run and safe to run while the API is serving traffic.
+
+**Examples:**
+
+```bash
+# See which banks are missing coverage without changing anything
+hindsight-admin repair-bank --all --dry-run
+
+# Repair every bank across all schemas (run once after a restore/upgrade)
+hindsight-admin repair-bank --all
+
+# Repair a single bank
+hindsight-admin repair-bank --bank acme-prod
+```
 
 ---
 

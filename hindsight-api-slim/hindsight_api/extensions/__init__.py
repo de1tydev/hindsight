@@ -15,6 +15,7 @@ Extensions receive an ExtensionContext that provides a controlled API for intera
 with the system (e.g., running migrations for tenant schemas).
 """
 
+from hindsight_api.extensions.bank_tables import BankScopedTable
 from hindsight_api.extensions.base import Extension
 from hindsight_api.extensions.builtin import (
     ApiKeyTenantExtension,
@@ -39,10 +40,13 @@ from hindsight_api.extensions.operation_validator import (
     BankListContext,
     BankListResult,
     BankReadContext,
+    BankReadOperation,
     BankWriteContext,
+    BankWriteOperation,
     # Consolidation operation
     ConsolidateContext,
     ConsolidateResult,
+    CreateBankContext,
     # File Conversion
     FileConvertResult,
     # Mental Model operations
@@ -54,6 +58,7 @@ from hindsight_api.extensions.operation_validator import (
     OperationValidationError,
     OperationValidatorExtension,
     PrecheckContext,
+    PrecheckOperation,
     RecallContext,
     RecallResult,
     ReflectContext,
@@ -74,6 +79,7 @@ from hindsight_api.worker.exceptions import DeferOperation
 __all__ = [
     # Base
     "Extension",
+    "BankScopedTable",
     "load_extension",
     # Context
     "ExtensionContext",
@@ -87,6 +93,7 @@ __all__ = [
     "OperationValidationError",
     "OperationValidatorExtension",
     "PrecheckContext",
+    "PrecheckOperation",
     "RecallContext",
     "RecallResult",
     "ReflectContext",
@@ -98,7 +105,10 @@ __all__ = [
     "BankListContext",
     "BankListResult",
     "BankReadContext",
+    "BankReadOperation",
     "BankWriteContext",
+    "BankWriteOperation",
+    "CreateBankContext",
     # Operation Validator - Consolidation
     "ConsolidateContext",
     "ConsolidateResult",

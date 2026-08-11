@@ -132,7 +132,7 @@ The reflect mission frames how the agent reasons and responds:
 - Keeps reasoning consistent across conversations
 
 > **ℹ️ Per-operation missions**
-> 
+>
 The reflect mission only affects `reflect()`. To steer what gets extracted during `retain()`, use [`retain_mission`](api/memory-banks.md#retain-configuration). To control what gets synthesised into observations, use [`observations_mission`](api/memory-banks.md#observations-configuration).
 ---
 
@@ -177,6 +177,10 @@ Use directives for constraints that must never be violated:
 - **Style requirements**: "Always respond in formal English"
 - **Domain guardrails**: "Always cite sources when making factual claims"
 
+### Directive Scope and Tags
+
+Directive `tags` scope when a directive applies, just like they scope memories. Untagged directives always apply; tagged directives apply only when the `reflect` request carries matching tags. A `reflect` with no tags therefore applies only the untagged directives. Set `apply_all_directives: true` on the request to enforce **every** active directive regardless of tags. See [Memory Banks: Directive Scope and Tags](api/memory-banks.md#directive-scope-and-tags).
+
 ### Directives vs Disposition
 
 | Aspect | Disposition | Directives |
@@ -187,7 +191,7 @@ Use directives for constraints that must never be violated:
 | **Example** | High skepticism → questions claims | "Never make medical diagnoses" |
 
 > **💡 Tip**
-> 
+>
 Use disposition for personality and character. Use directives for compliance and guardrails.
 See [Memory Banks: Directives](api/memory-banks.md#directives) for how to create and manage directives.
 
@@ -223,6 +227,65 @@ When you call `reflect()`:
 ```
 
 The agent automatically gathers evidence, validates citations, and generates a grounded response.
+
+---
+
+## Structured Output
+
+Reflect returns prose by default. Pass a `response_schema` (a JSON Schema **object** with a
+`properties` map) to *also* get a machine-readable version of the same answer:
+
+```json
+{
+  "query": "How does Alice fit the research lead role?",
+  "response_schema": {
+    "type": "object",
+    "properties": {
+      "recommendation": { "type": "string" },
+      "strengths": { "type": "array", "items": { "type": "string" } },
+      "confidence": { "type": "number" }
+    },
+    "required": ["recommendation"]
+  }
+}
+```
+
+The response then carries **both** the prose and the structured view:
+
+```json
+{
+  "text": "Based on Alice's ML expertise and her work at Google, she'd be an excellent fit...",
+  "structured_output": {
+    "recommendation": "Strong fit for research lead",
+    "strengths": ["5 years of ML experience", "Search ranking at Google"],
+    "confidence": 0.9
+  }
+}
+```
+
+**How it works.** The agent first reasons to a natural-language answer, then a second pass
+extracts that answer into JSON matching your schema. `structured_output` is therefore always a
+faithful projection of `text` — you get the readable answer **and** a typed object to program
+against, never one instead of the other.
+
+**Schema rules.** The schema must be an object with at least one property. Each property's `type`
+is one of `string`, `number`, `integer`, `boolean`, `array`, or `object`, and `required` lists
+property names. Invalid schemas are rejected before the call runs, so a malformed schema fails
+fast instead of silently returning nothing.
+
+### Structured output for mental models
+
+A pinned mental model can carry its own `response_schema` in its trigger config. Every refresh
+then stores a `structured_output` next to the markdown content — extracted from the **final
+stored document**. This matters for delta-mode (surgical) refreshes: the structured view reflects
+the whole merged document, not just the facts that changed in that refresh.
+
+### Building a schema (no code)
+
+In the control plane, the reflect view and the mental-model dialogs include a **Build schema**
+editor with a **Visual** mode (add fields — name, type, required, description) and a **Code** mode
+(raw JSON). The page itself shows only whether a schema is set; all editing happens in the
+builder, so you never hand-write JSON unless you want to.
 
 ---
 

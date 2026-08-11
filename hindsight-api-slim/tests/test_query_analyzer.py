@@ -6,6 +6,8 @@ from datetime import datetime
 
 import pytest
 
+from hindsight_api.engine.query_analyzer import DateparserQueryAnalyzer
+
 
 def test_query_analyzer_june_2024(query_analyzer):
     reference_date = datetime(2025, 1, 15, 12, 0, 0)
@@ -649,6 +651,71 @@ def test_query_analyzer_chinese_rolling_windows(query_analyzer, query, start, en
     assert analysis.temporal_constraint.end_date.date() == end.date()
 
 
+def test_query_analyzer_chinese_rolling_year_underflow_returns_no_constraint(query_analyzer):
+    """Impossible Chinese rolling windows should not block retrieval."""
+    reference_date = datetime(1, 1, 15, 12, 0, 0)
+
+    analysis = query_analyzer.analyze("过去一年做了什么", reference_date)
+
+    assert analysis.temporal_constraint is None
+
+
+@pytest.mark.parametrize(
+    ("query", "reference_date"),
+    [
+        ("去年今天做了什么", datetime(1, 1, 15, 12, 0, 0)),
+        ("大前年今天做了什么", datetime(1, 1, 15, 12, 0, 0)),
+        ("去年昨天做了什么", datetime(1, 1, 15, 12, 0, 0)),
+        ("昨晚做了什么", datetime(1, 1, 1, 12, 0, 0)),
+        ("前晚做了什么", datetime(1, 1, 1, 12, 0, 0)),
+    ],
+)
+def test_query_analyzer_chinese_fixed_day_underflow_returns_no_constraint(
+    query_analyzer,
+    query,
+    reference_date,
+):
+    """Impossible Chinese fixed-day shifts should not block retrieval."""
+    analysis = query_analyzer.analyze(query, reference_date)
+
+    assert analysis.temporal_constraint is None
+
+
+def test_query_analyzer_chinese_rolling_year_low_safe_boundary_still_extracts(query_analyzer):
+    """Valid low-year Chinese rolling windows should keep their constraint."""
+    reference_date = datetime(2, 1, 15, 12, 0, 0)
+
+    analysis = query_analyzer.analyze("过去一年做了什么", reference_date)
+
+    assert analysis.temporal_constraint is not None
+    assert analysis.temporal_constraint.start_date.date() == datetime(1, 1, 15).date()
+    assert analysis.temporal_constraint.end_date.date() == datetime(2, 1, 15).date()
+
+
+def test_query_analyzer_chinese_fixed_day_low_safe_boundary_still_extracts(query_analyzer):
+    """Valid low-year Chinese fixed-day shifts should keep their constraint."""
+    reference_date = datetime(2, 1, 15, 12, 0, 0)
+
+    analysis = query_analyzer.analyze("去年今天做了什么", reference_date)
+
+    assert analysis.temporal_constraint is not None
+    assert analysis.temporal_constraint.start_date.date() == datetime(1, 1, 15).date()
+    assert analysis.temporal_constraint.end_date.date() == datetime(1, 1, 15).date()
+
+
+def test_query_analyzer_period_valueerror_still_surfaces(query_analyzer, monkeypatch):
+    """Only impossible Chinese date shifts degrade to no constraint."""
+    from hindsight_api.engine import query_analyzer as query_analyzer_module
+
+    def fail_extract_period(query, reference_date):
+        raise ValueError("synthetic extraction bug")
+
+    monkeypatch.setattr(query_analyzer_module, "extract_period", fail_extract_period)
+
+    with pytest.raises(ValueError, match="synthetic extraction bug"):
+        query_analyzer.analyze("past week", datetime(2025, 1, 15, 12, 0, 0))
+
+
 @pytest.mark.parametrize("query", ["三两天前提到的菜是什么"])
 def test_query_analyzer_chinese_exact_relative_boundaries(query_analyzer, query):
     """Test malformed Chinese numerals are not truncated into exact relative rules."""
@@ -760,3 +827,239 @@ def test_query_analyzer_dateparser_crash_returns_no_constraint(query_analyzer, m
         "dateparser failures should be treated as no temporal constraint, not propagated"
     )
     assert any("dateparser" in rec.message for rec in caplog.records), "Should log a warning when dateparser fails"
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for issue #2768: query_analyzer must pick the strongest
+# dateparser match, not the leftmost one, and reject bare weekday/month
+# abbreviations ("we"/"me"/"did") that carry no real date signal.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["we", "me", "did", "do", "wed", "sat", "will", "can"],
+)
+def test_date_match_score_rejects_bare_false_positives(text):
+    """Bare words that dateparser resolves to weekday abbreviations carry no
+    real date signal and must score zero (so they are rejected)."""
+    from hindsight_api.engine.query_analyzer import _date_match_score
+
+    assert _date_match_score(text) == 0
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["in May", "March 2024", "2026-06-10", "yesterday", "last week", "on Wednesday"],
+)
+def test_date_match_score_keeps_real_signals(text):
+    """Spans carrying an explicit date signal (digit, month, relative word,
+    weekday name, period word) must score above zero."""
+    from hindsight_api.engine.query_analyzer import _date_match_score
+
+    assert _date_match_score(text) > 0
+
+
+def test_date_match_score_prefers_digit_over_weak_word():
+    """An explicit date (digit) must outscore a weekday/month word so ranking
+    picks it even when it appears later in the query."""
+    from hindsight_api.engine.query_analyzer import _date_match_score
+
+    assert _date_match_score("2026-06-10") > _date_match_score("on Wednesday")
+
+
+def test_query_analyzer_rejects_bare_word_false_positive(query_analyzer):
+    """#2768 rejection: a query whose only dateparser match is a bare word
+    ("we"/"did" depending on version) must yield no temporal constraint rather
+    than a plausible-but-wrong date. Reference date is a Friday, which is when
+    these weekday abbreviations resolve."""
+    reference_date = datetime(2026, 7, 17, 12, 0, 0)  # Friday
+
+    analysis = query_analyzer.analyze("what did we discuss", reference_date)
+
+    assert analysis.temporal_constraint is None, "A bare false-positive word must not produce a temporal constraint"
+
+
+def test_query_analyzer_prefers_explicit_date_over_leading_weak_word(query_analyzer):
+    """#2768 ranking: an explicit date must win over an earlier weak word
+    ("me"/"we") regardless of position in the query."""
+    reference_date = datetime(2026, 7, 17, 12, 0, 0)  # Friday
+
+    analysis = query_analyzer.analyze("tell me what we decided on 2026-06-10", reference_date)
+
+    assert analysis.temporal_constraint is not None, "Should extract the explicit date"
+    assert analysis.temporal_constraint.start_date.year == 2026
+    assert analysis.temporal_constraint.start_date.month == 6
+    assert analysis.temporal_constraint.start_date.day == 10
+
+
+def test_query_analyzer_keeps_real_month_with_leading_weak_word(query_analyzer):
+    """#2768: the real month must survive even when a weak word precedes it in
+    the query."""
+    reference_date = datetime(2026, 7, 17, 12, 0, 0)  # Friday
+
+    analysis = query_analyzer.analyze("what did we discuss in May", reference_date)
+
+    assert analysis.temporal_constraint is not None, "Should extract the real month"
+    assert analysis.temporal_constraint.start_date.year == 2026
+    assert analysis.temporal_constraint.start_date.month == 5
+
+
+@pytest.mark.parametrize(
+    ("query", "start", "end"),
+    [
+        # Relative days.
+        ("что было вчера", datetime(2025, 1, 14), datetime(2025, 1, 14)),
+        ("что было позавчера", datetime(2025, 1, 13), datetime(2025, 1, 13)),
+        ("что сегодня делали", datetime(2025, 1, 15), datetime(2025, 1, 15)),
+        # Relative periods. Reference date is a Wednesday.
+        ("что обсуждали на прошлой неделе", datetime(2025, 1, 6), datetime(2025, 1, 12)),
+        ("что обсуждали прошлой неделе", datetime(2025, 1, 6), datetime(2025, 1, 12)),
+        ("что было в прошлом месяце", datetime(2024, 12, 1), datetime(2024, 12, 31)),
+        ("что было в прошлом году", datetime(2024, 1, 1), datetime(2024, 12, 31)),
+        ("что делали на прошлых выходных", datetime(2025, 1, 11), datetime(2025, 1, 12)),
+        # Fuzzy spans, mirroring the English "couple/few ... ago" rules.
+        ("что обсуждали пару дней назад", datetime(2025, 1, 12), datetime(2025, 1, 14)),
+        ("что было несколько дней назад", datetime(2025, 1, 10), datetime(2025, 1, 13)),
+        ("что обсуждали пару недель назад", datetime(2024, 12, 25), datetime(2025, 1, 8)),
+        ("что было несколько месяцев назад", datetime(2024, 8, 18), datetime(2024, 11, 16)),
+        # Month + year. Russian months inflect: dateparser only resolves the nominative
+        # ("май"), but the prepositional ("в мае") is the only correct form after "в",
+        # and the genitive ("мая") is what appears in explicit dates.
+        ("что обсуждали в мае 2024", datetime(2024, 5, 1), datetime(2024, 5, 31)),
+        ("что было в июне 2024 года", datetime(2024, 6, 1), datetime(2024, 6, 30)),
+        ("события января 2024", datetime(2024, 1, 1), datetime(2024, 1, 31)),
+        ("декабрь 2023", datetime(2023, 12, 1), datetime(2023, 12, 31)),
+    ],
+)
+def test_query_analyzer_russian_periods(query_analyzer, query, start, end):
+    """Test deterministic Russian period extraction."""
+    reference_date = datetime(2025, 1, 15, 12, 0, 0)
+
+    analysis = query_analyzer.analyze(query, reference_date)
+
+    assert analysis.temporal_constraint is not None
+    assert analysis.temporal_constraint.start_date.date() == start.date()
+    assert analysis.temporal_constraint.end_date.date() == end.date()
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "вчерашние новости не нужны",
+        "расскажи про майонез",
+        "мартовские тезисы",
+    ],
+)
+def test_query_analyzer_russian_no_false_positives(query_analyzer, query):
+    """Russian month/day stems inside longer words must not match."""
+    reference_date = datetime(2025, 1, 15, 12, 0, 0)
+
+    analysis = query_analyzer.analyze(query, reference_date)
+
+    assert analysis.temporal_constraint is None
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        # A day number before the month means an exact date, not the whole month.
+        # The period table runs before dateparser, so without the day-number guard
+        # these collapsed to a month range. Affects every language in the table.
+        ("что обсуждали 13 июля 2024", datetime(2024, 7, 13)),
+        ("встреча 3 июня 2024", datetime(2024, 6, 3)),
+        ("meeting on 13 July 2024", datetime(2024, 7, 13)),
+    ],
+)
+def test_query_analyzer_day_month_year_stays_exact(query_analyzer, query, expected):
+    """An explicit day+month+year must not be widened to the whole month."""
+    reference_date = datetime(2025, 1, 15, 12, 0, 0)
+
+    analysis = query_analyzer.analyze(query, reference_date)
+
+    assert analysis.temporal_constraint is not None
+    assert analysis.temporal_constraint.start_date.date() == expected.date()
+    assert analysis.temporal_constraint.end_date.date() == expected.date()
+
+
+def test_query_analyzer_default_keeps_auto_detection(monkeypatch):
+    """Default (languages=None) must not pass `languages` to dateparser.
+
+    Auto-detection is the pre-existing behavior; the new option is opt-in only.
+    """
+    analyzer = DateparserQueryAnalyzer()
+    analyzer.load()
+
+    captured = {}
+
+    def fake_search_dates(query, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(analyzer, "_search_dates", fake_search_dates)
+
+    # Query that no period regex matches, so the dateparser call is reached.
+    analyzer.analyze("tell me what happened recently with the project", datetime(2025, 1, 15, 12, 0, 0))
+
+    assert "languages" not in captured, "default must leave dateparser's auto-detection untouched"
+
+
+def test_query_analyzer_languages_passed_through(monkeypatch):
+    """An explicit language list must reach search_dates unchanged."""
+    analyzer = DateparserQueryAnalyzer(languages=["en", "zh"])
+    analyzer.load()
+
+    captured = {}
+
+    def fake_search_dates(query, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(analyzer, "_search_dates", fake_search_dates)
+
+    analyzer.analyze("tell me what happened recently with the project", datetime(2025, 1, 15, 12, 0, 0))
+
+    assert captured.get("languages") == ["en", "zh"]
+
+
+def test_query_analyzer_warmup_uses_same_languages(monkeypatch):
+    """load()'s warm-up call must use the same locale set as analyze().
+
+    Warming up under auto-detection while querying restricted (or vice versa)
+    would leave part of dateparser's lazy-load cost on the first real query.
+    """
+    calls = []
+
+    def fake_search_dates(query, **kwargs):
+        calls.append((query, kwargs))
+        return None
+
+    import hindsight_api.engine.query_analyzer as qa_module
+
+    monkeypatch.setattr(qa_module, "search_dates", fake_search_dates, raising=False)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "dateparser.search",
+        type("M", (), {"search_dates": staticmethod(fake_search_dates)}),
+    )
+
+    analyzer = DateparserQueryAnalyzer(languages=["en"])
+    analyzer.load()
+
+    assert calls, "load() should fire a warm-up call"
+    assert calls[0][1].get("languages") == ["en"], "warm-up must use the configured locale set"
+
+
+def test_query_analyzer_explicit_date_with_restricted_language(query_analyzer):
+    """Restricting to English keeps explicit English dates exact.
+
+    Guards the reported failure where auto-detection matched only a fragment
+    ('on 31') and filled the missing month/year from RELATIVE_BASE.
+    """
+    analyzer = DateparserQueryAnalyzer(languages=["en"])
+    reference_date = datetime(2026, 7, 31, 12, 0, 0)
+
+    analysis = analyzer.analyze("Where did they decide to live together on 31 October, 2022?", reference_date)
+
+    assert analysis.temporal_constraint is not None
+    assert analysis.temporal_constraint.start_date.date() == datetime(2022, 10, 31).date()

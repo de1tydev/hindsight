@@ -17,17 +17,44 @@ import json
 import logging
 import os
 import time
-from typing import Any
+from contextlib import AbstractAsyncContextManager, nullcontext
+from typing import Any, Callable
 
 from litellm.exceptions import Timeout as LiteLLMTimeout
 
 from hindsight_api.config import DEFAULT_LLM_TIMEOUT, ENV_LLM_TIMEOUT
-from hindsight_api.engine.llm_interface import LLMInterface, OutputTooLongError
+from hindsight_api.engine.llm_interface import (
+    LLM_TOOL_CHOICE_AUTO,
+    LLMInterface,
+    LLMToolChoice,
+    LLMToolChoiceMode,
+    OutputTooLongError,
+)
+from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
+from hindsight_api.engine.llm_wrapper import parse_llm_json
+from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from hindsight_api.engine.structured_output import strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
 
 logger = logging.getLogger(__name__)
+
+
+def _usage_from_litellm_response(response: Any) -> LLMResponseUsage:
+    """Extract prompt/completion/cached token counts from a LiteLLM (OpenAI-shaped) usage block."""
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return LLMResponseUsage()
+    cached_tokens = 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details:
+        cached_tokens = getattr(details, "cached_tokens", 0) or 0
+    return LLMResponseUsage(
+        input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+        output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+        cached_tokens=cached_tokens,
+    )
 
 
 class LiteLLMLLM(LLMInterface):
@@ -54,6 +81,7 @@ class LiteLLMLLM(LLMInterface):
         timeout: float | None = None,
         extra_body: dict[str, Any] | None = None,
         bedrock_service_tier: str | None = None,
+        default_headers: dict[str, Any] | None = None,
         **kwargs: Any,
     ):
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
@@ -67,6 +95,13 @@ class LiteLLMLLM(LLMInterface):
         # drops any the target model rejects (litellm.drop_params=True below).
         # Sourced from llm_extra_body (env: HINDSIGHT_API_LLM_EXTRA_BODY).
         self._extra_body: dict[str, Any] = extra_body or {}
+        # Operator-configured default headers forwarded to litellm.acompletion as
+        # ``extra_headers`` (used by deployments routing through proxies / request-
+        # tracing middleware). Mirrors the Anthropic provider's default_headers
+        # wiring. Sourced from llm_default_headers (env: HINDSIGHT_API_LLM_DEFAULT_HEADERS).
+        # Copied so a caller-owned dict can't be mutated through us, and a fresh
+        # copy is handed to each call below to avoid cross-request contamination.
+        self._default_headers: dict[str, Any] = dict(default_headers or {})
         self.bedrock_service_tier = bedrock_service_tier
 
         try:
@@ -83,12 +118,14 @@ class LiteLLMLLM(LLMInterface):
             raise RuntimeError("LiteLLM SDK not installed. Run: uv add litellm or pip install litellm") from e
 
     async def verify_connection(self) -> None:
+        from ...config import get_config
+
         try:
             test_messages = [{"role": "user", "content": "test"}]
             await self.call(
                 messages=test_messages,
                 max_completion_tokens=50,
-                temperature=0.0,
+                temperature=get_config().llm_temperature_verification,
                 scope="verification",
                 max_retries=0,
             )
@@ -126,6 +163,13 @@ class LiteLLMLLM(LLMInterface):
         # so explicit per-call params (model, messages, temperature, …) always win.
         for key, value in self._extra_body.items():
             kwargs.setdefault(key, value)
+
+        # Forward operator-configured default headers as ``extra_headers`` so they
+        # reach the provider behind LiteLLM (proxies / request-tracing middleware).
+        # ``setdefault`` keeps any explicit per-call ``extra_headers`` authoritative;
+        # a per-call copy prevents LiteLLM/downstream from mutating the stored dict.
+        if self._default_headers:
+            kwargs.setdefault("extra_headers", dict(self._default_headers))
 
         # Bedrock service tier: flex (50% cheaper), priority, or reserved
         if self.model.startswith("bedrock/") and self.bedrock_service_tier is not None:
@@ -192,6 +236,7 @@ class LiteLLMLLM(LLMInterface):
         skip_validation: bool = False,
         strict_schema: bool = False,
         return_usage: bool = False,
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> Any:
         start_time = time.time()
 
@@ -199,7 +244,7 @@ class LiteLLMLLM(LLMInterface):
 
         # Add JSON schema response format if provided
         if response_format is not None and hasattr(response_format, "model_json_schema"):
-            schema = response_format.model_json_schema()
+            schema = strict_json_schema(response_format) if strict_schema else response_format.model_json_schema()
             call_kwargs["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
@@ -212,13 +257,17 @@ class LiteLLMLLM(LLMInterface):
         last_exception = None
 
         for attempt in range(max_retries + 1):
-            if attempt > 0:
-                set_stage(f"llm.{self._stage_label}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
             try:
-                response = await asyncio.wait_for(
-                    self._acompletion(**call_kwargs),
-                    timeout=self.timeout,
-                )
+                async with attempt_context() if attempt_context is not None else nullcontext():
+                    set_stage(f"llm.{self._stage_label}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
+                    response = await asyncio.wait_for(
+                        self._acompletion(**call_kwargs),
+                        timeout=self.timeout,
+                    )
+                # Stash usage before the length check and parse/validate below,
+                # which may raise locally even though the provider charged for
+                # these tokens (#2387).
+                stash_response_usage(_usage_from_litellm_response(response))
 
                 content = response.choices[0].message.content or ""
                 finish_reason = response.choices[0].finish_reason
@@ -239,7 +288,17 @@ class LiteLLMLLM(LLMInterface):
                     try:
                         json_data = json.loads(clean_content)
                     except json.JSONDecodeError:
-                        json_data = json.loads(content)
+                        try:
+                            json_data = json.loads(content)
+                        except json.JSONDecodeError:
+                            if attempt < max_retries:
+                                # Prefer a clean re-roll first — a fresh generation
+                                # usually beats repairing a malformed one.
+                                raise
+                            # Retry budget spent: structural repair as a last
+                            # resort (#2547/#2544). Raises again if unrecoverable,
+                            # which the outer handler surfaces loudly.
+                            json_data = parse_llm_json(content)
 
                     if skip_validation:
                         result = json_data
@@ -249,8 +308,9 @@ class LiteLLMLLM(LLMInterface):
                     result = content
 
                 # Extract usage
-                input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
-                output_tokens = getattr(response.usage, "completion_tokens", 0) or 0
+                response_usage = _usage_from_litellm_response(response)
+                input_tokens = response_usage.input_tokens
+                output_tokens = response_usage.output_tokens
                 total_tokens = input_tokens + output_tokens
 
                 # Record metrics
@@ -339,6 +399,9 @@ class LiteLLMLLM(LLMInterface):
                     logger.error(f"LiteLLM auth error, not retrying: {e}")
                     raise
 
+                # Diagnostic dump (opt-in) of the exact request behind any 4xx.
+                dump_request_on_4xx(scope=scope, provider=self.provider, model=self.model, err=e, request=call_kwargs)
+
                 last_exception = e
                 if attempt < max_retries:
                     # Retry on rate limits, connection errors, server errors
@@ -369,23 +432,39 @@ class LiteLLMLLM(LLMInterface):
         max_retries: int = 5,
         initial_backoff: float = 1.0,
         max_backoff: float = 30.0,
-        tool_choice: str | dict[str, Any] = "auto",
+        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMToolCallResult:
         start_time = time.time()
 
         call_kwargs = self._build_common_kwargs(messages, max_completion_tokens, temperature)
         call_kwargs["tools"] = tools
-        call_kwargs["tool_choice"] = tool_choice
+        call_kwargs["tool_choice"] = (
+            {
+                "type": "function",
+                "function": {"name": tool_choice.selected_function_name},
+            }
+            if tool_choice.mode is LLMToolChoiceMode.NAMED
+            else tool_choice.mode.value
+        )
 
         last_exception = None
         for attempt in range(max_retries + 1):
-            if attempt > 0:
-                set_stage(f"llm.{self._stage_label}.tools.attempt={attempt + 1}/{max_retries + 1}")
             try:
-                response = await asyncio.wait_for(
-                    self._acompletion(**call_kwargs),
-                    timeout=self.timeout,
-                )
+                async with attempt_context() if attempt_context is not None else nullcontext():
+                    set_stage(f"llm.{self._stage_label}.tools.attempt={attempt + 1}/{max_retries + 1}")
+                    response = await asyncio.wait_for(
+                        self._acompletion(**call_kwargs),
+                        timeout=self.timeout,
+                    )
+                # Stash usage before the tool-call argument parse below, which
+                # can raise json.JSONDecodeError locally even though the provider
+                # already billed for these tokens; without this the error trace
+                # records 0/0 tokens (#2387). Mirrors call() and the anthropic/
+                # gemini call_with_tools paths so the litellm tool path (and the
+                # LiteLLMRouterLLM subclass that inherits this method) completes
+                # the #2396 usage-on-error coverage.
+                stash_response_usage(_usage_from_litellm_response(response))
 
                 message = response.choices[0].message
                 content = message.content
@@ -477,6 +556,9 @@ class LiteLLMLLM(LLMInterface):
                 if "401" in error_str or "403" in error_str or "unauthorized" in error_str:
                     raise
 
+                # Diagnostic dump (opt-in) of the exact request behind any 4xx.
+                dump_request_on_4xx(scope=scope, provider=self.provider, model=self.model, err=e, request=call_kwargs)
+
                 last_exception = e
                 if attempt < max_retries:
                     is_retryable = any(
@@ -497,3 +579,6 @@ class LiteLLMLLM(LLMInterface):
     async def cleanup(self) -> None:
         """Clean up resources."""
         pass
+
+    def supports_attempt_scoped_concurrency(self) -> bool:
+        return True

@@ -1,23 +1,18 @@
-import { afterEach, describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { createRequire } from "module";
-import { mkdtempSync, rmSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
 import {
-  default as hindsightOpenclawPlugin,
   stripMemoryTags,
   extractRecallQuery,
   formatCurrentTimeForRecall,
   formatMemories,
   prepareRetentionTranscript,
-  countUserTurns,
-  getRetentionTurnIndex,
   sliceLastTurnsByUserBoundary,
   composeRecallQuery,
-  composeRecallQueryLatestFirst,
   truncateRecallQuery,
   buildRetainRequest,
   meetsMinimumVersion,
+  parseHindsightApiCapabilities,
+  supportsAppendFromCapabilities,
   parseSessionKey,
   extractTelegramDirectSenderId,
   resolveSessionIdentity,
@@ -25,6 +20,7 @@ import {
   getIdentitySkipReason,
   isEphemeralOperationalText,
   deriveBankId,
+  resolveBankIdForKnowledgeTools,
   normalizeRetainTags,
   extractInlineRetainTags,
   stripInlineRetainTags,
@@ -32,23 +28,9 @@ import {
   stripRuntimeEnvelope,
   getPluginConfig,
   formatHookPerf,
-  buildSessionSummaryIdentity,
-  extractHookSessionIdentity,
-  getSessionSummaryBudgetFromConfig,
-  isSessionSummaryLifecycleActive,
   DEFAULT_RETAIN_CONTEXT,
-  makeSessionSummaryGenerator,
 } from "./index.js";
-import {
-  FakeSessionSummaryGenerator,
-  HindsightApiSessionSummaryGenerator,
-} from "./session-summary-generator.js";
-import type {
-  PluginConfig,
-  MemoryResult,
-  MoltbotPluginAPI,
-  PluginHookAgentContext,
-} from "./types.js";
+import type { PluginConfig, MemoryResult, MoltbotPluginAPI } from "./types.js";
 
 const require = createRequire(import.meta.url);
 const openclawManifest = require("../openclaw.plugin.json") as {
@@ -339,35 +321,6 @@ describe("formatCurrentTimeForRecall", () => {
 // ---------------------------------------------------------------------------
 // retention helpers
 // ---------------------------------------------------------------------------
-
-describe("countUserTurns", () => {
-  it("counts user messages across a resumed conversation history", () => {
-    expect(
-      countUserTurns([
-        { role: "user", content: "turn 1" },
-        { role: "assistant", content: "reply 1" },
-        { role: "system", content: "meta" },
-        { role: "user", content: "turn 2" },
-        { role: "assistant", content: "reply 2" },
-        { role: "user", content: "turn 3" },
-      ])
-    ).toBe(3);
-  });
-});
-
-describe("getRetentionTurnIndex", () => {
-  it("uses the full conversation turn count for per-turn retention", () => {
-    expect(getRetentionTurnIndex(7, 1)).toBe(7);
-  });
-
-  it("derives a stable window sequence for chunked retention", () => {
-    expect(getRetentionTurnIndex(6, 3)).toBe(2);
-  });
-
-  it("returns null when a chunk boundary has not been reached", () => {
-    expect(getRetentionTurnIndex(5, 3)).toBeNull();
-  });
-});
 
 describe("normalizeRetainTags", () => {
   it("trims, deduplicates, and preserves order for string arrays", () => {
@@ -994,68 +947,30 @@ describe("prepareRetentionTranscript", () => {
     expect(result?.messageCount).toBe(2);
   });
 
-  it("does not prepend session context as retained JSON content", () => {
+  it("does not wrap retained JSON content in a context header", () => {
     const config: PluginConfig = { ...baseConfig, retainToolCalls: false };
     const messages = [{ role: "user", content: "What's MIN-123 status?" }];
-    const result = prepareRetentionTranscript(messages, config, false, {
-      senderId: "ou_cb923a19782fe748cd9fff99454eee31",
-      channelId: "oc_abcdef123456",
-      provider: "feishu",
-    });
+    const result = prepareRetentionTranscript(messages, config);
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!.transcript);
     expect(parsed).toEqual([{ role: "user", content: "What's MIN-123 status?" }]);
     expect(result!.transcript).not.toContain("[context]");
-    expect(result!.transcript).not.toContain("sender: ou_");
+    expect(result!.transcript).not.toContain("sender:");
     expect(result!.transcript).not.toContain("channel:");
     expect(result!.transcript).not.toContain("provider:");
     expect(result?.messageCount).toBe(1);
   });
 
-  it("does not prepend session context as retained text content", () => {
+  it("does not wrap retained text content in a context header", () => {
     const config: PluginConfig = { ...baseConfig, retainFormat: "text" };
     const messages = [{ role: "user", content: "ping" }];
-    const result = prepareRetentionTranscript(messages, config, false, {
-      senderId: "ou_cb923a19782fe748cd9fff99454eee31",
-      channelId: "oc_abcdef123456",
-      provider: "feishu",
-    });
+    const result = prepareRetentionTranscript(messages, config);
     expect(result).not.toBeNull();
     expect(result!.transcript).not.toContain("[context]");
-    expect(result!.transcript).not.toContain("sender: ou_");
+    expect(result!.transcript).not.toContain("sender:");
     expect(result!.transcript).not.toContain("channel:");
     expect(result!.transcript).not.toContain("provider:");
     expect(result!.transcript).toContain("[role: user]\nping\n[user:end]");
-  });
-
-  it("does not prepend the context header when includeSenderContext is explicitly enabled", () => {
-    const config: PluginConfig = {
-      ...baseConfig,
-      retainFormat: "text",
-      includeSenderContext: true,
-    };
-    const messages = [{ role: "user", content: "ping" }];
-    const result = prepareRetentionTranscript(messages, config, false, {
-      senderId: "ou_cb923a19782fe748cd9fff99454eee31",
-    });
-    expect(result).not.toBeNull();
-    expect(result!.transcript).not.toContain("[context]");
-    expect(result!.transcript.startsWith("[role: user]")).toBe(true);
-  });
-
-  it("omits the context header when sessionContext has no usable fields", () => {
-    const config: PluginConfig = { ...baseConfig, retainFormat: "text" };
-    const messages = [{ role: "user", content: "ping" }];
-    const result = prepareRetentionTranscript(messages, config, false, {});
-    expect(result).not.toBeNull();
-    expect(result!.transcript).not.toContain("[context]");
-  });
-
-  it("falls back gracefully when sessionContext is omitted", () => {
-    const messages = [{ role: "user", content: "ping" }];
-    const result = prepareRetentionTranscript(messages, baseConfig);
-    expect(result).not.toBeNull();
-    expect(result!.transcript).not.toContain("[context]");
   });
 });
 
@@ -1097,6 +1012,45 @@ describe("sliceLastTurnsByUserBoundary", () => {
   it("returns empty list for invalid turn counts", () => {
     const messages = [{ role: "user", content: "Hello" }];
     expect(sliceLastTurnsByUserBoundary(messages, 0)).toEqual([]);
+  });
+
+  it("skips synthetic user messages that contain only tool_result blocks", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "Real user input 1" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 1" }] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", content: "Tool output for call 1" }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", content: "Tool output for call 2" }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "Assistant after tools" }] },
+      { role: "user", content: [{ type: "text", text: "Real user input 2" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 2" }] },
+    ];
+    // 3 user turns requested, but only 2 have real text content.
+    // Should fall back to returning all messages.
+    const result = sliceLastTurnsByUserBoundary(messages, 3);
+    expect(result).toEqual(messages);
+  });
+
+  it("uses real user turns when tool_result synthetic messages are present", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "Real user input 1" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 1" }] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", content: "Tool output 1" }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "Assistant after tool 1" }] },
+      { role: "user", content: [{ type: "text", text: "Real user input 2" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 2" }] },
+    ];
+    // 2 real user turns. Should start at message 0 (first real user).
+    const result = sliceLastTurnsByUserBoundary(messages, 2);
+    expect(result).toEqual(messages);
   });
 });
 
@@ -1164,21 +1118,6 @@ describe("composeRecallQuery", () => {
     const messages = [{ role: "tool", content: "binary blob" }];
     const query = composeRecallQuery("Summarize my preference", messages, 3);
     expect(query).toBe("Summarize my preference");
-  });
-});
-
-describe("composeRecallQueryLatestFirst", () => {
-  it("puts the latest query before prior context for summary-enriched recall", () => {
-    const messages = [
-      { role: "user", content: "I work on project zephyr." },
-      { role: "assistant", content: "Noted." },
-      { role: "user", content: "What project am I working on?" },
-    ];
-
-    const query = composeRecallQueryLatestFirst("What project am I working on?", messages, 2);
-    expect(query.startsWith("What project am I working on?")).toBe(true);
-    expect(query).toContain("Prior context:");
-    expect(query).toContain("user: I work on project zephyr.");
   });
 });
 
@@ -1252,6 +1191,20 @@ describe("session identity helpers", () => {
       messageProvider: "telegram",
       channelId: "direct:12345",
       senderId: "12345",
+    });
+  });
+
+  it("resolves msteams direct identity from session key when senderId is missing", () => {
+    const resolved = resolveSessionIdentity({
+      agentId: "nemoclaw",
+      sessionKey: "agent:nemoclaw:msteams:direct:user-teams-42",
+    });
+
+    expect(resolved).toMatchObject({
+      agentId: "nemoclaw",
+      messageProvider: "msteams",
+      channelId: "direct:user-teams-42",
+      senderId: "user-teams-42",
     });
   });
 
@@ -1555,6 +1508,58 @@ describe("meetsMinimumVersion", () => {
   });
 });
 
+describe("append capability helpers", () => {
+  it("supports append for legacy version payloads without a features block", () => {
+    const capabilities = parseHindsightApiCapabilities({ api_version: "0.8.4" });
+
+    expect(capabilities).toEqual({ version: "0.8.4", storeDocumentText: true });
+    expect(supportsAppendFromCapabilities(capabilities)).toBe(true);
+  });
+
+  it("supports append when the version is new enough and document text storage is enabled", () => {
+    const capabilities = parseHindsightApiCapabilities({
+      api_version: "0.8.4",
+      features: { store_document_text: true },
+    });
+
+    expect(capabilities).toEqual({ version: "0.8.4", storeDocumentText: true });
+    expect(supportsAppendFromCapabilities(capabilities)).toBe(true);
+  });
+
+  it("rejects append when features are present but document text storage is not enabled", () => {
+    expect(
+      supportsAppendFromCapabilities(
+        parseHindsightApiCapabilities({
+          api_version: "0.8.4",
+          features: { store_document_text: false },
+        })
+      )
+    ).toBe(false);
+    expect(
+      supportsAppendFromCapabilities(
+        parseHindsightApiCapabilities({
+          api_version: "0.8.4",
+          features: {},
+        })
+      )
+    ).toBe(false);
+  });
+
+  it("rejects append for old API versions even when document text storage is enabled", () => {
+    const capabilities = parseHindsightApiCapabilities({
+      api_version: "0.4.99",
+      features: { store_document_text: true },
+    });
+
+    expect(supportsAppendFromCapabilities(capabilities)).toBe(false);
+  });
+
+  it("returns null for malformed version payloads", () => {
+    expect(parseHindsightApiCapabilities({ features: { store_document_text: true } })).toBeNull();
+    expect(parseHindsightApiCapabilities(null)).toBeNull();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // getPluginConfig — whitelist normalisation
 // ---------------------------------------------------------------------------
@@ -1567,906 +1572,6 @@ function makeApi(rawConfig: Record<string, unknown>): MoltbotPluginAPI {
     logger: { info: () => undefined, warn: () => undefined, error: () => undefined },
   } as unknown as MoltbotPluginAPI;
 }
-
-const tempDirs: string[] = [];
-
-afterEach(() => {
-  while (tempDirs.length > 0) {
-    const dir = tempDirs.pop();
-    if (dir) rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-function makeHookApi(rawConfig: Record<string, unknown>): {
-  api: MoltbotPluginAPI;
-  trigger(eventName: string, event: unknown, ctx?: PluginHookAgentContext): Promise<unknown>;
-  stop(): Promise<void>;
-} {
-  const handlers = new Map<
-    string,
-    Array<(event: unknown, ctx?: PluginHookAgentContext) => unknown>
-  >();
-  const services: Array<{ stop(): Promise<void> }> = [];
-  const api = {
-    config: { plugins: { entries: { "hindsight-openclaw": { config: rawConfig } } } },
-    registerService: (svc: { stop(): Promise<void> }) => services.push(svc),
-    on: (eventName: string, handler: (event: unknown, ctx?: PluginHookAgentContext) => unknown) => {
-      const current = handlers.get(eventName) ?? [];
-      current.push(handler);
-      handlers.set(eventName, current);
-    },
-    logger: { info: () => undefined, warn: () => undefined, error: () => undefined },
-  } as unknown as MoltbotPluginAPI;
-  return {
-    api,
-    async trigger(eventName, event, ctx) {
-      let result: unknown;
-      for (const handler of handlers.get(eventName) ?? []) {
-        result = await handler(event, ctx);
-      }
-      return result;
-    },
-    async stop() {
-      for (const service of services) {
-        await service.stop().catch(() => undefined);
-      }
-    },
-  };
-}
-
-function stubRecallClient(results: MemoryResult[] = []): { recall: ReturnType<typeof vi.fn> } {
-  const recall = vi.fn().mockResolvedValue({ results });
-  const client = { recall };
-  vi.stubGlobal("__hindsightClient", {
-    waitForReady: vi.fn().mockResolvedValue(undefined),
-    getClientForContext: vi.fn().mockResolvedValue(client),
-    getClient: vi.fn(() => client),
-  });
-  return { recall };
-}
-
-describe("getPluginConfig — session summary generator", () => {
-  it("defaults summary cadence and budgets without enabling lifecycle behavior", () => {
-    const cfg = getPluginConfig(makeApi({ retainEveryNTurns: 1 }));
-
-    expect(cfg.retainEveryNTurns).toBe(1);
-    expect(cfg.retainOverlapTurns).toBe(0);
-    expect(cfg.recallContextTurns).toBe(1);
-    expect(cfg.sessionSummaryEnabled).toBe(false);
-    expect(cfg.sessionSummaryStorePath).toBeUndefined();
-    expect(cfg.sessionSummaryEnrichRecallQuery).toBe(false);
-    expect(cfg.sessionSummaryUpdateEveryNTurns).toBeUndefined();
-    expect(cfg.sessionSummaryMinUpdateEveryNTurns).toBe(2);
-    expect(cfg.sessionSummaryTimeoutMs).toBe(20_000);
-    expect(cfg.sessionSummaryMaxInputChars).toBe(16_000);
-    expect(cfg.sessionSummaryMaxOutputChars).toBe(2_000);
-    expect(cfg.sessionSummaryMaxRecallQueryChars).toBe(800);
-    expect(cfg.sessionSummaryRecallQueryBudgetRatio).toBe(0.25);
-    expect(cfg.sessionSummaryMinLatestQueryReserveChars).toBe(400);
-    expect(cfg.sessionSummaryDropCompletedTodosAfterTurns).toBe(20);
-  });
-
-  it("normalizes explicit summary model, cadence, and budget fields", () => {
-    const cfg = getPluginConfig(
-      makeApi({
-        llmProvider: "openai",
-        llmModel: "base-model",
-        llmBaseUrl: "http://base.example/v1",
-        retainEveryNTurns: 4,
-        retainOverlapTurns: 2,
-        recallContextTurns: 3,
-        sessionSummaryEnabled: true,
-        sessionSummaryStorePath: "/tmp/hindsight-summary.sqlite",
-        sessionSummaryEnrichRecallQuery: true,
-        sessionSummaryGeneratorProvider: "openai-compatible",
-        sessionSummaryGeneratorModel: "summary-model",
-        sessionSummaryGeneratorBaseUrl: "http://summary.example/v1",
-        sessionSummaryGeneratorApiKeyEnv: "SUMMARY_API_KEY",
-        sessionSummaryReuseHindsightLlmConfig: false,
-        sessionSummaryUpdateEveryNTurns: 7,
-        sessionSummaryMinUpdateEveryNTurns: 3,
-        sessionSummaryTimeoutMs: 9_000,
-        sessionSummaryMaxInputChars: 1234,
-        sessionSummaryMaxOutputChars: 432,
-        sessionSummaryMaxRecallQueryChars: 321,
-        sessionSummaryRecallQueryBudgetRatio: 2,
-        sessionSummaryMinLatestQueryReserveChars: 111,
-        sessionSummaryDropCompletedTodosAfterTurns: 5,
-      })
-    );
-
-    expect(cfg.retainEveryNTurns).toBe(4);
-    expect(cfg.retainOverlapTurns).toBe(2);
-    expect(cfg.recallContextTurns).toBe(3);
-    expect(cfg.sessionSummaryEnabled).toBe(true);
-    expect(cfg.sessionSummaryStorePath).toBe("/tmp/hindsight-summary.sqlite");
-    expect(cfg.sessionSummaryEnrichRecallQuery).toBe(true);
-    expect(cfg.sessionSummaryGeneratorProvider).toBe("openai-compatible");
-    expect(cfg.sessionSummaryGeneratorModel).toBe("summary-model");
-    expect(cfg.sessionSummaryGeneratorBaseUrl).toBe("http://summary.example/v1");
-    expect(cfg.sessionSummaryGeneratorApiKeyEnv).toBe("SUMMARY_API_KEY");
-    expect(cfg.sessionSummaryReuseHindsightLlmConfig).toBe(false);
-    expect(cfg.sessionSummaryUpdateEveryNTurns).toBe(7);
-    expect(cfg.sessionSummaryMinUpdateEveryNTurns).toBe(3);
-    expect(cfg.sessionSummaryTimeoutMs).toBe(9_000);
-    expect(cfg.sessionSummaryMaxInputChars).toBe(1234);
-    expect(cfg.sessionSummaryMaxOutputChars).toBe(432);
-    expect(cfg.sessionSummaryMaxRecallQueryChars).toBe(321);
-    expect(cfg.sessionSummaryRecallQueryBudgetRatio).toBe(1);
-    expect(cfg.sessionSummaryMinLatestQueryReserveChars).toBe(111);
-    expect(cfg.sessionSummaryDropCompletedTodosAfterTurns).toBe(5);
-  });
-
-  it("can reuse existing Hindsight LLM config when summary fields are absent", () => {
-    const cfg = getPluginConfig(
-      makeApi({
-        llmProvider: "openai",
-        llmModel: "base-model",
-        llmBaseUrl: "http://base.example/v1",
-      })
-    );
-
-    expect(cfg.sessionSummaryReuseHindsightLlmConfig).toBe(true);
-    expect(cfg.sessionSummaryGeneratorProvider).toBe("openai");
-    expect(cfg.sessionSummaryGeneratorModel).toBe("base-model");
-    expect(cfg.sessionSummaryGeneratorBaseUrl).toBe("http://base.example/v1");
-  });
-});
-
-describe("session summary lifecycle helpers", () => {
-  it("is inactive unless enabled and recall enrichment or update cadence is set", () => {
-    expect(isSessionSummaryLifecycleActive({ sessionSummaryEnabled: true })).toBe(false);
-    expect(
-      isSessionSummaryLifecycleActive({
-        sessionSummaryEnabled: true,
-        sessionSummaryEnrichRecallQuery: true,
-      })
-    ).toBe(true);
-    expect(
-      isSessionSummaryLifecycleActive({
-        sessionSummaryEnabled: true,
-        sessionSummaryUpdateEveryNTurns: 4,
-      })
-    ).toBe(true);
-  });
-
-  it("extracts hook session identity from nested event.context when ctx lacks sessionId", () => {
-    expect(
-      extractHookSessionIdentity(
-        {
-          context: {
-            sessionId: "ctx-session-id",
-            sessionKey: "agent:main:feishu:direct:ou_nested",
-          },
-        },
-        {
-          agentId: "main",
-          messageProvider: "feishu",
-          senderId: "ou_nested",
-          sessionKey: "agent:main:feishu:direct:ou_ctx",
-        }
-      )
-    ).toEqual({
-      sessionId: "ctx-session-id",
-      sessionKey: "agent:main:feishu:direct:ou_ctx",
-    });
-  });
-
-  it("derives a stable summary key from bank identity and real session id", () => {
-    const identity = buildSessionSummaryIdentity(
-      {
-        agentId: "main",
-        messageProvider: "telegram",
-        channelId: "direct:U123",
-        senderId: "U123",
-        sessionId: "openclaw-real-session-1",
-        sessionKey: "agent:main:telegram:direct:U123",
-      },
-      { dynamicBankId: true }
-    );
-
-    expect(identity.identityScope).toBe("main::direct%3AU123::U123");
-    expect(identity.summaryKey).toContain("openclaw:");
-    expect(identity.summaryKey).toContain(":session-id:openclaw-real-session-1");
-    expect(identity.summaryKey).not.toContain(":session-key:");
-    expect(identity.summaryKey).not.toContain("agent:main:telegram:direct:U123");
-  });
-
-  it("uses sessionId over sessionKey for summary identity", () => {
-    const identity = buildSessionSummaryIdentity(
-      {
-        agentId: "main",
-        messageProvider: "telegram",
-        channelId: "direct:U123",
-        senderId: "U123",
-        sessionId: "sid-preferred",
-        sessionKey: "agent:main:telegram:direct:U123",
-      },
-      { dynamicBankId: true }
-    );
-
-    expect(identity.summaryKey).toContain(":session-id:sid-preferred");
-    expect(identity.summaryKey).not.toContain(":session-key:");
-  });
-
-  it("keeps same sessionKey and different sessionIds in different summary keys", () => {
-    const baseCtx: PluginHookAgentContext = {
-      agentId: "main",
-      messageProvider: "telegram",
-      channelId: "direct:U123",
-      senderId: "U123",
-      sessionKey: "agent:main:telegram:direct:U123",
-    };
-
-    const first = buildSessionSummaryIdentity(
-      { ...baseCtx, sessionId: "real-session-a" },
-      { dynamicBankId: true }
-    );
-    const second = buildSessionSummaryIdentity(
-      { ...baseCtx, sessionId: "real-session-b" },
-      { dynamicBankId: true }
-    );
-
-    expect(first.identityScope).toBe(second.identityScope);
-    expect(first.summaryKey).not.toBe(second.summaryKey);
-    expect(first.summaryKey).toContain(":session-id:real-session-a");
-    expect(second.summaryKey).toContain(":session-id:real-session-b");
-  });
-
-  it("falls back to sessionKey for legacy contexts without sessionId", () => {
-    const identity = buildSessionSummaryIdentity(
-      {
-        agentId: "main",
-        messageProvider: "telegram",
-        channelId: "direct:U123",
-        senderId: "U123",
-        sessionKey: "agent:main:telegram:direct:U123",
-      },
-      { dynamicBankId: true }
-    );
-
-    expect(identity.summaryKey).toContain(":session-key:agent:main:telegram:direct:U123");
-  });
-
-  it("maps plugin summary budget config to generator budget", () => {
-    const budget = getSessionSummaryBudgetFromConfig({
-      sessionSummaryMaxInputChars: 500,
-      sessionSummaryMaxRecallQueryChars: 100,
-      sessionSummaryRecallQueryBudgetRatio: 0.2,
-    });
-
-    expect(budget.maxInputChars).toBe(500);
-    expect(budget.maxRecallQueryChars).toBe(100);
-    expect(budget.recallQueryBudgetRatio).toBe(0.2);
-  });
-});
-
-describe("session summary hook lifecycle", () => {
-  it("updates rolling summary via API on agent_end and uses it for the next recall query", async () => {
-    // Stub global fetch so the HindsightApiSessionSummaryGenerator has a real transport
-    // without hitting a real server. The summary content is fixed by the stub.
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        status: "ready",
-        schema_version: 2,
-        summary_text: "project zephyr 继续采用 TypeScript。",
-        model_info: { provider: "mock", model: "mock-model" },
-      }),
-    });
-    vi.stubGlobal("fetch", mockFetch);
-
-    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-"));
-    tempDirs.push(dir);
-    const handle = makeHookApi({
-      autoRecall: true,
-      autoRetain: false,
-      dynamicBankId: true,
-      sessionSummaryEnabled: true,
-      sessionSummaryEnrichRecallQuery: true,
-      sessionSummaryStorePath: join(dir, "summary.sqlite"),
-      hindsightApiUrl: "http://hindsight-test:9077",
-    });
-    hindsightOpenclawPlugin(handle.api);
-
-    const ctx: PluginHookAgentContext = {
-      agentId: "main",
-      messageProvider: "telegram",
-      channelId: "direct:U777",
-      senderId: "U777",
-      sessionId: "real-session-U777-a",
-      sessionKey: "agent:main:telegram:direct:U777",
-    };
-    const { recall } = stubRecallClient();
-    await handle.trigger(
-      "agent_end",
-      {
-        success: true,
-        messages: [
-          { role: "user", content: "I work on project zephyr." },
-          { role: "assistant", content: "Noted." },
-          { role: "user", content: "We decided to use TypeScript for project zephyr." },
-        ],
-      },
-      ctx
-    );
-
-    const [, fetchOptions] = mockFetch.mock.calls[0] as [unknown, { body: string }];
-    const summaryRequestBody = JSON.parse(String(fetchOptions.body));
-    expect(summaryRequestBody.session_id).toContain(":session-id:real-session-U777-a");
-    expect(summaryRequestBody.metadata).toMatchObject({
-      sessionId: "real-session-U777-a",
-      sessionKey: "agent:main:telegram:direct:U777",
-    });
-
-    const result = await handle.trigger(
-      "before_prompt_build",
-      { rawMessage: "What did we decide?", prompt: "What did we decide?", messages: [] },
-      ctx
-    );
-
-    expect(result).toBeUndefined();
-    expect(recall).toHaveBeenCalledTimes(1);
-    const [recallRequest] = recall.mock.calls[0] as [{ query: string }];
-    expect(recallRequest.query).toContain("What did we decide?");
-    expect(recallRequest.query).toContain("Rolling session summary:");
-    expect(recallRequest.query).toContain("project zephyr");
-    expect(recallRequest.query).not.toContain("<hindsight_session_summary>");
-
-    await handle.stop();
-    vi.unstubAllGlobals();
-  });
-
-  it("uses rolling summary as recall fallback when the latest message is too short", async () => {
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        status: "ready",
-        schema_version: 2,
-        summary_text: "当前在修 OpenClaw recall query fallback。",
-        model_info: { provider: "mock", model: "mock-model" },
-      }),
-    });
-    vi.stubGlobal("fetch", mockFetch);
-
-    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-short-"));
-    tempDirs.push(dir);
-    const handle = makeHookApi({
-      autoRecall: true,
-      autoRetain: false,
-      dynamicBankId: true,
-      sessionSummaryEnabled: true,
-      sessionSummaryEnrichRecallQuery: true,
-      sessionSummaryStorePath: join(dir, "summary.sqlite"),
-      hindsightApiUrl: "http://hindsight-test:9077",
-    });
-    hindsightOpenclawPlugin(handle.api);
-
-    const ctx: PluginHookAgentContext = {
-      agentId: "main",
-      messageProvider: "telegram",
-      channelId: "direct:U888",
-      senderId: "U888",
-      sessionId: "real-session-U888-a",
-      sessionKey: "agent:main:telegram:direct:U888",
-    };
-    const { recall } = stubRecallClient();
-    await handle.trigger(
-      "agent_end",
-      {
-        success: true,
-        messages: [
-          { role: "user", content: "We are investigating OpenClaw memory recall." },
-          { role: "assistant", content: "Got it." },
-          { role: "user", content: "We are fixing OpenClaw recall query fallback." },
-          { role: "assistant", content: "Noted." },
-        ],
-      },
-      ctx
-    );
-
-    await handle.trigger(
-      "before_prompt_build",
-      { rawMessage: "？", prompt: "？", messages: [] },
-      ctx
-    );
-
-    expect(recall).toHaveBeenCalledTimes(1);
-    const [recallRequest] = recall.mock.calls[0] as [{ query: string }];
-    expect(recallRequest.query).toContain("Rolling session summary:");
-    expect(recallRequest.query).toContain("OpenClaw recall query fallback");
-    expect(recallRequest.query).not.toContain("？");
-
-    await handle.stop();
-    vi.unstubAllGlobals();
-  });
-
-  it("does not reuse a summary across different sessionIds with the same sessionKey", async () => {
-    const mockFetch = vi
-      .fn()
-      .mockImplementation(async (_url: string, options: { body: string }) => {
-        const requestBody = JSON.parse(String(options.body));
-        const sessionId = requestBody.metadata?.sessionId;
-        const project = sessionId === "real-session-alpha" ? "topic-alpha" : "topic-beta";
-        return {
-          ok: true,
-          json: async () => ({
-            status: "ready",
-            schema_version: 2,
-            summary_text: `继续讨论 ${project}。`,
-            model_info: { provider: "mock", model: "mock-model" },
-          }),
-        };
-      });
-    vi.stubGlobal("fetch", mockFetch);
-
-    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-session-id-scope-"));
-    tempDirs.push(dir);
-    const handle = makeHookApi({
-      autoRecall: true,
-      autoRetain: false,
-      dynamicBankId: true,
-      sessionSummaryEnabled: true,
-      sessionSummaryEnrichRecallQuery: true,
-      sessionSummaryStorePath: join(dir, "summary.sqlite"),
-      hindsightApiUrl: "http://hindsight-test:9077",
-    });
-    hindsightOpenclawPlugin(handle.api);
-    const { recall } = stubRecallClient();
-
-    const commonCtx = {
-      agentId: "main",
-      messageProvider: "telegram",
-      channelId: "direct:U4242",
-      senderId: "U4242",
-      sessionKey: "agent:main:telegram:direct:U4242",
-    } satisfies PluginHookAgentContext;
-    const alphaCtx: PluginHookAgentContext = {
-      ...commonCtx,
-      sessionId: "real-session-alpha",
-    };
-    const betaCtx: PluginHookAgentContext = {
-      ...commonCtx,
-      sessionId: "real-session-beta",
-    };
-
-    await handle.trigger(
-      "agent_end",
-      {
-        success: true,
-        messages: [
-          { role: "user", content: "I am working on topic-alpha." },
-          { role: "assistant", content: "Noted." },
-          { role: "user", content: "topic-alpha uses session A." },
-        ],
-      },
-      alphaCtx
-    );
-
-    await handle.trigger(
-      "before_prompt_build",
-      { rawMessage: "What is active?", prompt: "What is active?", messages: [] },
-      betaCtx
-    );
-    let [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
-    expect(recallRequest.query).not.toContain("topic-alpha");
-
-    await handle.trigger(
-      "agent_end",
-      {
-        success: true,
-        messages: [
-          { role: "user", content: "I am working on topic-beta." },
-          { role: "assistant", content: "Noted." },
-          { role: "user", content: "topic-beta uses session B." },
-        ],
-      },
-      betaCtx
-    );
-
-    await handle.trigger(
-      "before_prompt_build",
-      { rawMessage: "What is active?", prompt: "What is active?", messages: [] },
-      betaCtx
-    );
-    [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
-    expect(recallRequest.query).toContain("topic-beta");
-    expect(recallRequest.query).not.toContain("topic-alpha");
-
-    await handle.trigger(
-      "before_prompt_build",
-      { rawMessage: "What is active?", prompt: "What is active?", messages: [] },
-      alphaCtx
-    );
-    [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
-    expect(recallRequest.query).toContain("topic-alpha");
-    expect(recallRequest.query).not.toContain("topic-beta");
-
-    await handle.stop();
-    vi.unstubAllGlobals();
-  });
-
-  it("uses event.context.sessionId for Feishu direct summary isolation when hook ctx lacks sessionId", async () => {
-    const mockFetch = vi
-      .fn()
-      .mockImplementation(async (_url: string, options: { body: string }) => {
-        const requestBody = JSON.parse(String(options.body));
-        const sessionId = requestBody.metadata?.sessionId;
-        const project = sessionId === "feishu-session-a" ? "feishu-alpha" : "feishu-beta";
-        return {
-          ok: true,
-          json: async () => ({
-            status: "ready",
-            schema_version: 2,
-            summary_text: `继续讨论 ${project}。`,
-            model_info: { provider: "mock", model: "mock-model" },
-          }),
-        };
-      });
-    vi.stubGlobal("fetch", mockFetch);
-
-    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-feishu-session-id-"));
-    tempDirs.push(dir);
-    const handle = makeHookApi({
-      autoRecall: true,
-      autoRetain: false,
-      dynamicBankId: true,
-      sessionSummaryEnabled: true,
-      sessionSummaryEnrichRecallQuery: true,
-      sessionSummaryStorePath: join(dir, "summary.sqlite"),
-      hindsightApiUrl: "http://hindsight-test:9077",
-    });
-    hindsightOpenclawPlugin(handle.api);
-    const { recall } = stubRecallClient();
-
-    const ctx: PluginHookAgentContext = {
-      agentId: "saber-cn",
-      messageProvider: "feishu",
-      channelId: "direct:ou_728e937f684386f2d622a123c4a456c2",
-      senderId: "ou_728e937f684386f2d622a123c4a456c2",
-      sessionKey: "agent:saber-cn:feishu:saber-cn:direct:ou_728e937f684386f2d622a123c4a456c2",
-    };
-
-    await handle.trigger(
-      "agent_end",
-      {
-        success: true,
-        context: {
-          sessionId: "feishu-session-a",
-          sessionKey: ctx.sessionKey,
-        },
-        messages: [
-          { role: "user", content: "I am working on feishu-alpha." },
-          { role: "assistant", content: "Noted." },
-          { role: "user", content: "feishu-alpha belongs to session A." },
-        ],
-      },
-      ctx
-    );
-
-    const [, fetchOptions] = mockFetch.mock.calls[0] as [unknown, { body: string }];
-    const summaryRequestBody = JSON.parse(String(fetchOptions.body));
-    expect(summaryRequestBody.session_id).toContain(":session-id:feishu-session-a");
-    expect(summaryRequestBody.session_id).not.toContain(":session-key:");
-    expect(summaryRequestBody.metadata).toMatchObject({
-      sessionId: "feishu-session-a",
-      sessionKey: ctx.sessionKey,
-      provider: "feishu",
-    });
-
-    await handle.trigger(
-      "before_prompt_build",
-      {
-        rawMessage: "What is active?",
-        prompt: "What is active?",
-        context: {
-          sessionId: "feishu-session-b",
-          sessionKey: ctx.sessionKey,
-        },
-        messages: [],
-      },
-      ctx
-    );
-    let [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
-    expect(recallRequest.query).not.toContain("feishu-alpha");
-
-    await handle.trigger(
-      "agent_end",
-      {
-        success: true,
-        context: {
-          sessionId: "feishu-session-b",
-          sessionKey: ctx.sessionKey,
-        },
-        messages: [
-          { role: "user", content: "I am working on feishu-beta." },
-          { role: "assistant", content: "Noted." },
-          { role: "user", content: "feishu-beta belongs to session B." },
-        ],
-      },
-      ctx
-    );
-
-    await handle.trigger(
-      "before_prompt_build",
-      {
-        rawMessage: "What is active?",
-        prompt: "What is active?",
-        context: {
-          sessionId: "feishu-session-b",
-          sessionKey: ctx.sessionKey,
-        },
-        messages: [],
-      },
-      ctx
-    );
-    [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
-    expect(recallRequest.query).toContain("feishu-beta");
-    expect(recallRequest.query).not.toContain("feishu-alpha");
-
-    await handle.stop();
-    vi.unstubAllGlobals();
-  });
-
-  it("keeps existing ready summary when API fails on subsequent update (no-op on transient error)", async () => {
-    let callCount = 0;
-    const mockFetch = vi.fn().mockImplementation(() => {
-      callCount++;
-      if (callCount === 1) {
-        return Promise.resolve({
-          ok: true,
-          json: async () => ({
-            status: "ready",
-            schema_version: 2,
-            summary_text: "继续讨论 stable-project。",
-            model_info: { provider: "mock", model: "m" },
-          }),
-        });
-      }
-      // Subsequent calls: server error
-      return Promise.resolve({
-        ok: false,
-        status: 503,
-        text: async () => "Service Unavailable",
-      });
-    });
-    vi.stubGlobal("fetch", mockFetch);
-
-    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-retain-ready-"));
-    tempDirs.push(dir);
-    const handle = makeHookApi({
-      autoRecall: true,
-      autoRetain: false,
-      dynamicBankId: true,
-      sessionSummaryEnabled: true,
-      sessionSummaryEnrichRecallQuery: true,
-      sessionSummaryStorePath: join(dir, "summary.sqlite"),
-      hindsightApiUrl: "http://hindsight-test:9077",
-    });
-    hindsightOpenclawPlugin(handle.api);
-    const { recall } = stubRecallClient();
-
-    const ctx: PluginHookAgentContext = {
-      agentId: "main",
-      messageProvider: "telegram",
-      channelId: "direct:U999",
-      senderId: "U999",
-      sessionKey: "agent:main:telegram:direct:U999",
-    };
-
-    // First agent_end (2 user turns) → API succeeds → "ready" record created
-    await handle.trigger(
-      "agent_end",
-      {
-        success: true,
-        messages: [
-          { role: "user", content: "Working on stable-project." },
-          { role: "assistant", content: "Noted." },
-          { role: "user", content: "All tests pass." },
-          { role: "assistant", content: "Great." },
-        ],
-      },
-      ctx
-    );
-
-    // Second agent_end (4 user turns) → API fails → should NOT overwrite ready record
-    await handle.trigger(
-      "agent_end",
-      {
-        success: true,
-        messages: [
-          { role: "user", content: "Working on stable-project." },
-          { role: "assistant", content: "Noted." },
-          { role: "user", content: "All tests pass." },
-          { role: "assistant", content: "Great." },
-          { role: "user", content: "Deploying now." },
-          { role: "assistant", content: "Ok." },
-          { role: "user", content: "Deploy done." },
-          { role: "assistant", content: "Awesome." },
-        ],
-      },
-      ctx
-    );
-
-    // Summary should still enrich recall with "stable-project" from the original ready record.
-    const result = await handle.trigger(
-      "before_prompt_build",
-      { rawMessage: "Status?", prompt: "Status?", messages: [] },
-      ctx
-    );
-
-    expect(result).toBeUndefined();
-    const [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
-    expect(recallRequest.query).toContain("stable-project");
-
-    await handle.stop();
-    vi.unstubAllGlobals();
-  });
-
-  it("reopens the summary store before writing when config reload closes the in-flight store", async () => {
-    let resolveFetch: ((value: unknown) => void) | undefined;
-    const mockFetch = vi.fn().mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolveFetch = resolve;
-        })
-    );
-    vi.stubGlobal("fetch", mockFetch);
-
-    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-reload-"));
-    tempDirs.push(dir);
-    const handle = makeHookApi({
-      autoRecall: true,
-      autoRetain: false,
-      dynamicBankId: true,
-      sessionSummaryEnabled: true,
-      sessionSummaryEnrichRecallQuery: true,
-      sessionSummaryStorePath: join(dir, "summary.sqlite"),
-      hindsightApiUrl: "http://hindsight-test:9077",
-    });
-    hindsightOpenclawPlugin(handle.api);
-    const { recall } = stubRecallClient();
-
-    const ctx: PluginHookAgentContext = {
-      agentId: "main",
-      messageProvider: "telegram",
-      channelId: "direct:U888",
-      senderId: "U888",
-      sessionKey: "agent:main:telegram:direct:U888",
-    };
-
-    const update = handle.trigger(
-      "agent_end",
-      {
-        success: true,
-        messages: [
-          { role: "user", content: "Working on reload-race-project." },
-          { role: "assistant", content: "Noted." },
-          { role: "user", content: "Reload can happen while summary generation awaits." },
-        ],
-      },
-      ctx
-    );
-
-    await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
-
-    // Simulate config hot reload closing the global SQLite store while the
-    // summary API request is still in flight. The in-flight update must not
-    // call upsert on that closed handle when generation returns.
-    await handle.stop();
-    resolveFetch?.({
-      ok: true,
-      json: async () => ({
-        status: "ready",
-        schema_version: 2,
-        summary_text: "继续讨论 reload-race-project。",
-        model_info: { provider: "mock", model: "m" },
-      }),
-    });
-    await update;
-
-    const result = await handle.trigger(
-      "before_prompt_build",
-      { rawMessage: "Status?", prompt: "Status?", messages: [] },
-      ctx
-    );
-
-    expect(result).toBeUndefined();
-    const [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
-    expect(recallRequest.query).toContain("reload-race-project");
-    vi.unstubAllGlobals();
-  });
-
-  it("does not let a stale in-flight update replace a post-reload store with a different path", async () => {
-    let resolveFetch: ((value: unknown) => void) | undefined;
-    const mockFetch = vi.fn().mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolveFetch = resolve;
-        })
-    );
-    vi.stubGlobal("fetch", mockFetch);
-
-    const dir = mkdtempSync(join(tmpdir(), "hindsight-openclaw-summary-path-reload-"));
-    tempDirs.push(dir);
-    const oldStorePath = join(dir, "old-summary.sqlite");
-    const newStorePath = join(dir, "new-summary.sqlite");
-
-    const oldHandle = makeHookApi({
-      autoRecall: true,
-      autoRetain: false,
-      dynamicBankId: true,
-      sessionSummaryEnabled: true,
-      sessionSummaryEnrichRecallQuery: true,
-      sessionSummaryStorePath: oldStorePath,
-      hindsightApiUrl: "http://hindsight-test:9077",
-    });
-    hindsightOpenclawPlugin(oldHandle.api);
-    const { recall } = stubRecallClient();
-
-    const ctx: PluginHookAgentContext = {
-      agentId: "main",
-      messageProvider: "telegram",
-      channelId: "direct:U889",
-      senderId: "U889",
-      sessionKey: "agent:main:telegram:direct:U889",
-    };
-
-    const staleUpdate = oldHandle.trigger(
-      "agent_end",
-      {
-        success: true,
-        messages: [
-          { role: "user", content: "Working on stale-path-project." },
-          { role: "assistant", content: "Noted." },
-          { role: "user", content: "Reload changes the summary store path." },
-        ],
-      },
-      ctx
-    );
-    await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
-
-    await oldHandle.stop();
-    const newHandle = makeHookApi({
-      autoRecall: false,
-      autoRetain: false,
-      dynamicBankId: true,
-      sessionSummaryEnabled: true,
-      sessionSummaryEnrichRecallQuery: true,
-      sessionSummaryStorePath: newStorePath,
-      hindsightApiUrl: "http://hindsight-test:9077",
-    });
-    hindsightOpenclawPlugin(newHandle.api);
-    await newHandle.trigger(
-      "before_prompt_build",
-      { rawMessage: "Open new store", prompt: "Open new store", messages: [] },
-      ctx
-    );
-
-    resolveFetch?.({
-      ok: true,
-      json: async () => ({
-        status: "ready",
-        schema_version: 2,
-        summary_text: "继续讨论 stale-path-project。",
-        model_info: { provider: "mock", model: "m" },
-      }),
-    });
-    await staleUpdate;
-
-    const staleResult = await oldHandle.trigger(
-      "before_prompt_build",
-      { rawMessage: "Status?", prompt: "Status?", messages: [] },
-      ctx
-    );
-    expect(staleResult).toBeUndefined();
-    const [recallRequest] = recall.mock.calls.at(-1) as [{ query: string }];
-    expect(recallRequest.query).not.toContain("stale-path-project");
-
-    await newHandle.stop();
-    vi.unstubAllGlobals();
-  });
-});
 
 describe("getPluginConfig — retainQueue whitelist (#1443)", () => {
   it("passes retainQueuePath through when set to a non-empty string", () => {
@@ -2531,6 +1636,19 @@ describe("getPluginConfig — enableKnowledgeTools whitelist", () => {
   });
 });
 
+describe("getPluginConfig — preferObservations (#2977)", () => {
+  it("passes preferObservations=true through when set", () => {
+    expect(getPluginConfig(makeApi({ preferObservations: true })).preferObservations).toBe(true);
+  });
+
+  it("defaults to false when not set or set to a non-boolean truthy value", () => {
+    expect(getPluginConfig(makeApi({})).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: false })).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: "true" })).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: 1 })).preferObservations).toBe(false);
+  });
+});
+
 describe("formatHookPerf (#1406)", () => {
   it("emits the hook name, total ms, and field key=value pairs", () => {
     const line = formatHookPerf("before_prompt_build", 4200, {
@@ -2578,6 +1696,21 @@ describe("getPluginConfig — debugPerfTiming flag (#1406)", () => {
   });
 });
 
+describe("getPluginConfig — recall injection position", () => {
+  it("defaults missing or invalid values to user context", () => {
+    expect(getPluginConfig(makeApi({})).recallInjectionPosition).toBe("user");
+    expect(
+      getPluginConfig(makeApi({ recallInjectionPosition: "invalid" })).recallInjectionPosition
+    ).toBe("user");
+  });
+
+  it.each(["prepend", "append", "user"] as const)("preserves an explicit %s value", (position) => {
+    expect(
+      getPluginConfig(makeApi({ recallInjectionPosition: position })).recallInjectionPosition
+    ).toBe(position);
+  });
+});
+
 describe("getPluginConfig — mission semantics (#1270, #1353)", () => {
   it("does not substitute a default mission when bankMission is unset", () => {
     const cfg = getPluginConfig(makeApi({}));
@@ -2609,6 +1742,48 @@ describe("getPluginConfig — mission semantics (#1270, #1353)", () => {
     const cfg = getPluginConfig(makeApi({ retainMission: "", observationsMission: "" }));
     expect(cfg.retainMission).toBeUndefined();
     expect(cfg.observationsMission).toBeUndefined();
+  });
+});
+
+describe("getPluginConfig — dynamic bank defaults", () => {
+  it("leaves bank default fields unset when not configured", () => {
+    const cfg = getPluginConfig(makeApi({}));
+    expect(cfg.retainExtractionMode).toBeUndefined();
+    expect(cfg.enableObservations).toBeUndefined();
+    expect(cfg.enableAutoConsolidation).toBeUndefined();
+    expect(cfg.dispositionSkepticism).toBeUndefined();
+    expect(cfg.entityLabels).toBeUndefined();
+  });
+
+  it("normalizes configured bank default fields", () => {
+    const labels = [{ name: "person", description: "Human" }];
+    const cfg = getPluginConfig(
+      makeApi({
+        retainExtractionMode: "VERBOSE",
+        enableObservations: true,
+        enableAutoConsolidation: false,
+        dispositionSkepticism: 4,
+        dispositionLiteralism: 2,
+        dispositionEmpathy: 5,
+        entityLabels: labels,
+      })
+    );
+    expect(cfg.retainExtractionMode).toBe("verbose");
+    expect(cfg.enableObservations).toBe(true);
+    expect(cfg.enableAutoConsolidation).toBe(false);
+    expect(cfg.dispositionSkepticism).toBe(4);
+    expect(cfg.entityLabels).toEqual(labels);
+  });
+
+  it("rejects invalid retainExtractionMode and disposition values", () => {
+    const cfg = getPluginConfig(
+      makeApi({
+        retainExtractionMode: "not-a-mode",
+        dispositionSkepticism: 9,
+      })
+    );
+    expect(cfg.retainExtractionMode).toBeUndefined();
+    expect(cfg.dispositionSkepticism).toBeUndefined();
   });
 });
 
@@ -2645,92 +1820,54 @@ describe("getPluginConfig — retainContext", () => {
 });
 
 // ---------------------------------------------------------------------------
-// makeSessionSummaryGenerator — production routing
+// resolveBankIdForKnowledgeTools — dynamic user-scoped banking (#2441)
 // ---------------------------------------------------------------------------
 
-describe("makeSessionSummaryGenerator", () => {
-  it("returns HindsightApiSessionSummaryGenerator when hindsightApiUrl is configured", () => {
-    const config = getPluginConfig(
-      makeApi({
-        sessionSummaryEnabled: true,
-        sessionSummaryEnrichRecallQuery: true,
-        hindsightApiUrl: "http://hindsight:9077",
-      })
+describe("resolveBankIdForKnowledgeTools", () => {
+  const userScopedConfig: PluginConfig = {
+    dynamicBankGranularity: ["user"],
+    bankIdPrefix: "nemoclaw_intel",
+  };
+
+  it("routes msteams direct sessions to the per-user bank, not shared defaults", () => {
+    const userId = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const resolution = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "nemoclaw",
+        sessionKey: `agent:nemoclaw:msteams:direct:${userId}`,
+      },
+      userScopedConfig
     );
-    const gen = makeSessionSummaryGenerator(config);
-    expect(gen).toBeInstanceOf(HindsightApiSessionSummaryGenerator);
-    expect(gen).not.toBeInstanceOf(FakeSessionSummaryGenerator);
+
+    expect(resolution.identityError).toBeUndefined();
+    expect(resolution.bankId).toBe(`nemoclaw_intel-${userId}`);
+    expect(resolution.bankId).not.toBe("openclaw");
+    expect(resolution.bankId).not.toBe("nemoclaw_intel-openclaw");
+    expect(resolution.bankId).not.toBe("nemoclaw_intel-anonymous");
   });
 
-  it("returns null when session summary lifecycle is not active", () => {
-    const config = getPluginConfig(makeApi({ sessionSummaryEnabled: false }));
-    const gen = makeSessionSummaryGenerator(config);
-    expect(gen).toBeNull();
+  it("does not silently fall back to shared/default bank when user identity is missing", () => {
+    const resolution = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "nemoclaw",
+        sessionKey: "agent:nemoclaw:msteams:group:19:general@thread.tacv2",
+      },
+      userScopedConfig
+    );
+
+    expect(resolution.identityError).toMatch(/missing stable sender identity/);
+    expect(resolution.bankId).not.toBe("openclaw");
+    expect(resolution.bankId).not.toBe("nemoclaw_intel-openclaw");
+    expect(resolution.bankId).toBe("nemoclaw_intel-anonymous");
   });
 
-  it("returns null (fail-closed) when lifecycle is active but no API URL configured", () => {
-    // Without hindsightApiUrl there's no real generator available.
-    // Production path must not silently fall back to Fake.
-    const config = getPluginConfig(
-      makeApi({
-        sessionSummaryEnabled: true,
-        sessionSummaryEnrichRecallQuery: true,
-        // No hindsightApiUrl
-      })
+  it("uses static bankId when dynamicBankId is false", () => {
+    const resolution = resolveBankIdForKnowledgeTools(
+      { sessionKey: "agent:nemoclaw:main" },
+      { dynamicBankId: false, bankId: "shared-team-memory" }
     );
-    const gen = makeSessionSummaryGenerator(config);
-    expect(gen).toBeNull();
-  });
 
-  it("sends Bearer auth header when apiToken is provided", async () => {
-    const fetchSpy = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        status: "ready",
-        schema_version: 2,
-        summary_text: "",
-        model_info: { provider: "mock", model: "m" },
-      }),
-    });
-
-    const config = getPluginConfig(
-      makeApi({
-        sessionSummaryEnabled: true,
-        sessionSummaryEnrichRecallQuery: true,
-        hindsightApiUrl: "http://hindsight:9077",
-        hindsightApiToken: "test-bearer-token",
-      })
-    );
-    const gen = makeSessionSummaryGenerator(config, { fetchFn: fetchSpy });
-    expect(gen).toBeInstanceOf(HindsightApiSessionSummaryGenerator);
-    await gen!.generate({
-      sessionId: "s1",
-      identityScope: "b1",
-      messages: [{ role: "user", content: "hi" }],
-    });
-    const [, opts] = fetchSpy.mock.calls[0];
-    expect((opts.headers as Record<string, string>)["Authorization"]).toBe(
-      "Bearer test-bearer-token"
-    );
-  });
-
-  it("token not leaked when API call fails", async () => {
-    const fetchSpy = vi.fn().mockRejectedValue(new Error("connection refused"));
-    const config = getPluginConfig(
-      makeApi({
-        sessionSummaryEnabled: true,
-        sessionSummaryEnrichRecallQuery: true,
-        hindsightApiUrl: "http://hindsight:9077",
-        hindsightApiToken: "super-secret-token-abc",
-      })
-    );
-    const gen = makeSessionSummaryGenerator(config, { fetchFn: fetchSpy });
-    const result = await gen!.generate({
-      sessionId: "s1",
-      identityScope: "b1",
-      messages: [],
-    });
-    expect(result.status).toBe("error");
-    expect(result.error ?? "").not.toContain("super-secret-token-abc");
+    expect(resolution.identityError).toBeUndefined();
+    expect(resolution.bankId).toBe("shared-team-memory");
   });
 });

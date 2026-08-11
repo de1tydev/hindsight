@@ -242,6 +242,62 @@ async def test_file_retain_validation_errors(memory_no_llm_verify):
         assert response.status_code == 400
         assert "files_metadata count" in response.json()["detail"]
 
+        # Per-file fields at the request root used to be silently discarded,
+        # leaving the uploaded document with a generated ID and empty metadata.
+        request_data = {
+            "document_id": "stable-id",
+            "metadata": {"source": "page-1"},
+            "tags": ["report"],
+            "update_mode": "replace",
+            "async": True,
+        }
+        data = {"request": json.dumps(request_data)}
+
+        response = await client.post(
+            "/v1/default/banks/test-validation-bank/files/retain",
+            files=files,
+            data=data,
+        )
+
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert "document_id, metadata, tags" in detail
+        assert "'files_metadata' entry" in detail
+        assert "'update_mode' is not supported" in detail
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("context", "quarterly report"),
+        ("document_id", "report-2026-q2"),
+        ("metadata", {"page": 1}),
+        ("strategy", "default"),
+        ("tags", ["quarterly"]),
+        ("timestamp", "2026-07-27T00:00:00Z"),
+    ],
+)
+def test_file_retain_rejects_per_file_fields_only_at_request_root(field, value):
+    from hindsight_api.api.http import FileRetainRequest
+
+    with pytest.raises(ValueError, match="'files_metadata' entry"):
+        FileRetainRequest.model_validate({field: value})
+
+    request = FileRetainRequest.model_validate({"files_metadata": [{field: value}]})
+    assert request.files_metadata is not None
+    assert getattr(request.files_metadata[0], field) == value
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["context", "document_id", "metadata", "strategy", "tags", "timestamp", "update_mode"],
+)
+def test_file_retain_tolerates_null_legacy_root_fields(field):
+    from hindsight_api.api.http import FileRetainRequest
+
+    request = FileRetainRequest.model_validate({field: None})
+    assert request.files_metadata is None
+
 
 @pytest.mark.asyncio
 async def test_file_retain_no_files(memory_no_llm_verify):
@@ -422,9 +478,49 @@ def test_markitdown_converter_can_enable_ocr(monkeypatch):
             "base_url": "https://vision.example/v1",
         }
     ]
+    assert "default_headers" not in openai_calls[0]
     assert markitdown_calls[0]["llm_client"].__class__ is FakeOpenAI
     assert markitdown_calls[0]["llm_model"] == "vision-model"
     assert markitdown_calls[0]["llm_prompt"] == DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT
+
+
+def test_markitdown_converter_passes_default_headers_when_configured(monkeypatch):
+    """Custom OCR headers should be forwarded to the OpenAI client only when set."""
+    import markitdown
+    import openai
+
+    from hindsight_api.engine.parsers import MarkitdownParser
+
+    openai_calls = []
+
+    class FakeMarkItDown:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            openai_calls.append(kwargs)
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(markitdown, "MarkItDown", FakeMarkItDown)
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+
+    headers = {"X-Component-Id": "hindsight-ocr", "X-Request-Source": "markitdown"}
+    MarkitdownParser(
+        ocr_enabled=True,
+        ocr_api_key="parser-key",
+        ocr_base_url="https://vision.example/v1",
+        ocr_model="vision-model",
+        ocr_default_headers=headers,
+    )
+
+    assert openai_calls == [
+        {
+            "api_key": "parser-key",
+            "base_url": "https://vision.example/v1",
+            "default_headers": headers,
+        }
+    ]
 
 
 def test_markitdown_converter_requires_model_when_ocr_enabled(monkeypatch):
@@ -615,6 +711,59 @@ async def test_file_conversion_creates_separate_retain_operation(memory_no_llm_v
     assert doc["file_content_type"] == "text/plain"
     assert doc["original_text"] is not None
     assert len(doc["original_text"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_list_operations_surfaces_file_document_id_and_filename(memory_no_llm_verify, sample_txt_content):
+    """list_operations must expose document_id + filename for file_convert_retain ops.
+
+    The control plane derives its pending-upload rows from these fields (it
+    matches an in-flight operation to the real document via document_id and
+    labels the row with the original filename), so both must round-trip from
+    the operation's result_metadata into the list response.
+    """
+    from hindsight_api.models import RequestContext
+
+    bank_id = "test_file_op_fields_bank"
+    context = RequestContext(internal=True)
+    await memory_no_llm_verify.get_bank_profile(bank_id, request_context=context)
+
+    class MockFile:
+        def __init__(self, content, filename, content_type):
+            self.content = content
+            self.filename = filename
+            self.content_type = content_type
+
+        async def read(self):
+            return self.content
+
+    file_items = [
+        {
+            "file": MockFile(sample_txt_content, "report.txt", "text/plain"),
+            "document_id": "doc_op_fields",
+            "context": None,
+            "metadata": {},
+            "tags": [],
+            "timestamp": None,
+            "parser": ["markitdown"],
+        }
+    ]
+
+    await memory_no_llm_verify.submit_async_file_retain(
+        bank_id=bank_id,
+        file_items=file_items,
+        document_tags=None,
+        request_context=context,
+    )
+
+    result = await memory_no_llm_verify.list_operations(
+        bank_id, task_type="file_convert_retain", request_context=context
+    )
+
+    file_ops = [op for op in result["operations"] if op["task_type"] == "file_convert_retain"]
+    assert len(file_ops) == 1
+    assert file_ops[0]["document_id"] == "doc_op_fields"
+    assert file_ops[0]["filename"] == "report.txt"
 
 
 @pytest.mark.asyncio

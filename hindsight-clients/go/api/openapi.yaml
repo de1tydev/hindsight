@@ -7,7 +7,7 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   title: Hindsight HTTP API
-  version: 0.8.3
+  version: 0.9.0
 servers:
 - url: /
 paths:
@@ -80,6 +80,7 @@ paths:
         required: false
         schema:
           default: 1000
+          minimum: 0
           title: Limit
           type: integer
         style: form
@@ -154,8 +155,8 @@ paths:
   /v1/default/banks/{bank_id}/memories/list:
     get:
       description: "List memory units with pagination and optional full-text search.\
-        \ Supports filtering by type. Results are sorted by most recent first (mentioned_at\
-        \ DESC, then created_at DESC)."
+        \ Supports filtering by type, source document, and linked entity ID. Results\
+        \ are sorted by most recent first (mentioned_at DESC, then created_at DESC)."
       operationId: list_memories
       parameters:
       - explode: false
@@ -208,10 +209,44 @@ paths:
         style: form
       - explode: true
         in: query
+        name: entity_id
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - explode: true
+        in: query
+        name: tags
+        required: false
+        schema:
+          items:
+            type: string
+          nullable: true
+          type: array
+        style: form
+      - explode: true
+        in: query
+        name: tags_match
+        required: false
+        schema:
+          default: any
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          - exact
+          title: Tags Match
+          type: string
+        style: form
+      - explode: true
+        in: query
         name: limit
         required: false
         schema:
           default: 100
+          minimum: 0
           title: Limit
           type: integer
         style: form
@@ -221,6 +256,7 @@ paths:
         required: false
         schema:
           default: 0
+          minimum: 0
           title: Offset
           type: integer
         style: form
@@ -580,6 +616,19 @@ paths:
           title: Bank Id
           type: string
         style: simple
+      - description: "Force a fresh recompute, bypassing the cached value (and refreshing\
+          \ the cache)."
+        explode: true
+        in: query
+        name: refresh
+        required: false
+        schema:
+          default: false
+          description: "Force a fresh recompute, bypassing the cached value (and refreshing\
+            \ the cache)."
+          title: Refresh
+          type: boolean
+        style: form
       - explode: false
         in: header
         name: authorization
@@ -732,6 +781,7 @@ paths:
         schema:
           default: 100
           description: Maximum number of entities to return
+          minimum: 0
           title: Limit
           type: integer
         style: form
@@ -743,6 +793,7 @@ paths:
         schema:
           default: 0
           description: Offset for pagination
+          minimum: 0
           title: Offset
           type: integer
         style: form
@@ -792,6 +843,7 @@ paths:
         schema:
           default: 1000
           description: Maximum number of co-occurrence edges to return
+          minimum: 0
           title: Limit
           type: integer
         style: form
@@ -1315,6 +1367,56 @@ paths:
       summary: Refresh mental model
       tags:
       - Mental Models
+  /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/dry-run-refresh:
+    post:
+      description: |-
+        Preview what a refresh would do to this mental model WITHOUT changing it — no content, structured document, watermark, or last_refreshed_at is written. Returns the mode the refresh ran in and why (delta silently falls back to full when there is no baseline or the source query changed), the resolved tag scope and time window it read, how many facts retrieval returned versus how many the reflect agent actually used, the delta operations it emitted, and a unified diff from the stored content to the content it would write.
+
+        This is the production refresh pipeline with two writes skipped — the content and the watermark — and nothing about it is configurable, so what it reports is what the next refresh will do. Because nothing is persisted, a delta dry run reads exactly the window the next real refresh would, and repeating it reads that same window again.
+
+        It costs the same LLM tokens as a refresh and is validated the same way.
+      operationId: dry_run_refresh_mental_model
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: mental_model_id
+        required: true
+        schema:
+          title: Mental Model Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MentalModelDryRunRefreshResult'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: "Dry-run mental model refresh (preview, no persistence)"
+      tags:
+      - Mental Models
   /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/clear:
     post:
       description: "Clear a mental model's content so the next refresh performs a\
@@ -1363,6 +1465,375 @@ paths:
       summary: Clear mental model content
       tags:
       - Mental Models
+  /v1/default/banks/{bank_id}/knowledge-base/tree:
+    get:
+      description: Return the knowledge base as a nested tree of folders and pages.
+      operationId: get_knowledge_base_tree
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeTreeResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get the knowledge-base tree
+      tags:
+      - Knowledge Base
+  /v1/default/banks/{bank_id}/knowledge-base/folders:
+    post:
+      description: "Create a folder, optionally nested under a parent folder."
+      operationId: create_knowledge_folder
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateFolderRequest'
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeNode'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Create a knowledge-base folder
+      tags:
+      - Knowledge Base
+  /v1/default/banks/{bank_id}/knowledge-base/pages:
+    post:
+      description: Create a page (a mental model + tree node). Content is generated
+        asynchronously; use the returned operation_id to track completion.
+      operationId: create_knowledge_page
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePageRequest'
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateKnowledgePageResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Create a knowledge-base page
+      tags:
+      - Knowledge Base
+  /v1/default/banks/{bank_id}/knowledge-base/export:
+    get:
+      description: "Return a portable markdown bundle: a nested index.md, one <id>.md\
+        \ per page, and history logs."
+      operationId: export_knowledge_base
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgePageBundleResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Export the knowledge base as a markdown bundle
+      tags:
+      - Knowledge Base
+  /v1/default/banks/{bank_id}/knowledge-base/search:
+    get:
+      description: "Doc-level hybrid search across a bank's knowledge pages: a full-text\
+        \ (BM25) match and a vector-similarity match, Reciprocal-Rank-Fusion fused.\
+        \ No reranker — tuned for latency."
+      operationId: search_knowledge_base
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - description: Search query
+        explode: true
+        in: query
+        name: q
+        required: true
+        schema:
+          description: Search query
+          minLength: 1
+          title: Q
+          type: string
+        style: form
+      - description: Maximum results to return
+        explode: true
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 10
+          description: Maximum results to return
+          maximum: 50
+          minimum: 1
+          title: Limit
+          type: integer
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgePageSearchResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Hybrid search over knowledge pages (BM25 + vector)
+      tags:
+      - Knowledge Base
+  /v1/default/banks/{bank_id}/knowledge-base/pages/{page_id}:
+    get:
+      description: Return a single page as a markdown document (frontmatter + markdown
+        body).
+      operationId: get_knowledge_page
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: page_id
+        required: true
+        schema:
+          title: Page Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgePageResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get a knowledge-base page
+      tags:
+      - Knowledge Base
+  /v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}:
+    delete:
+      description: Delete a folder or page and its whole subtree (pages' mental models
+        are removed too).
+      operationId: delete_knowledge_node
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: node_id
+        required: true
+        schema:
+          title: Node Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Delete a knowledge-base node
+      tags:
+      - Knowledge Base
+    patch:
+      description: "Rename a node (set `name`), move it under another folder (set\
+        \ `parent_id`, null for the root), and/or update a page's options (`source_query`,\
+        \ `tags`, `max_tokens`). Changing `source_query` schedules an async refresh\
+        \ so the page rebuilds against the new question."
+      operationId: update_knowledge_node
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: node_id
+        required: true
+        schema:
+          title: Node Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateNodeRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeNode'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Rename/move a knowledge-base node or update a page's options
+      tags:
+      - Knowledge Base
   /v1/default/banks/{bank_id}/directives:
     get:
       description: List hard rules that are injected into prompts.
@@ -1640,8 +2111,9 @@ paths:
       - Directives
   /v1/default/banks/{bank_id}/documents:
     get:
-      description: List documents with pagination and optional search. Documents are
-        the source content from which memory units are extracted.
+      description: "List documents with pagination and optional search, most recently\
+        \ written first (`updated_at` descending). Documents are the source content\
+        \ from which memory units are extracted."
       operationId: list_documents
       parameters:
       - explode: false
@@ -1690,6 +2162,7 @@ paths:
         required: false
         schema:
           default: 100
+          minimum: 0
           title: Limit
           type: integer
         style: form
@@ -1699,6 +2172,7 @@ paths:
         required: false
         schema:
           default: 0
+          minimum: 0
           title: Offset
           type: integer
         style: form
@@ -2046,6 +2520,7 @@ paths:
         schema:
           default: 100
           description: Maximum number of tags to return
+          minimum: 0
           title: Limit
           type: integer
         style: form
@@ -2057,6 +2532,7 @@ paths:
         schema:
           default: 0
           description: Offset for pagination
+          minimum: 0
           title: Offset
           type: integer
         style: form
@@ -2263,8 +2739,9 @@ paths:
       - Operations
     get:
       description: "Get the status of a specific async operation. Returns 'pending',\
-        \ 'completed', or 'failed'. Completed operations are removed from storage,\
-        \ so 'completed' means the operation finished successfully."
+        \ 'processing', 'completed', 'failed', or 'cancelled'. Completed operations\
+        \ remain queryable with their payload for the configured retention window\
+        \ and are pruned afterward."
       operationId: get_operation_status
       parameters:
       - explode: false
@@ -2363,6 +2840,52 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       summary: Retry a failed async operation
+      tags:
+      - Operations
+  /v1/default/banks/{bank_id}/operations/{operation_id}/delete:
+    delete:
+      description: "Permanently remove a failed, cancelled, or completed async operation\
+        \ record"
+      operationId: delete_operation
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: operation_id
+        required: true
+        schema:
+          title: Operation Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteOperationResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Delete a terminal async operation
       tags:
       - Operations
   /v1/default/banks/{bank_id}/profile:
@@ -4282,6 +4805,9 @@ components:
         last_document_at:
           nullable: true
           type: string
+        last_write_at:
+          nullable: true
+          type: string
       required:
       - bank_id
       - disposition
@@ -4298,6 +4824,7 @@ components:
             skepticism: 3
           fact_count: 156
           last_document_at: 2024-01-16T14:20:00Z
+          last_write_at: 2024-01-17T09:05:00Z
           mission: I am a software engineer helping my team ship quality code
           name: Alice
           updated_at: 2024-01-16T14:20:00Z
@@ -4384,6 +4911,7 @@ components:
         failed_consolidation: 0
         failed_operations: 0
         last_consolidated_at: 2024-01-15T10:30:00Z
+        last_memory_write_at: 2024-01-15T11:05:00Z
         links_breakdown:
           fact:
             entity: 40
@@ -4452,6 +4980,9 @@ components:
         last_consolidated_at:
           nullable: true
           type: string
+        last_memory_write_at:
+          nullable: true
+          type: string
         pending_consolidation:
           default: 0
           description: Number of memories not yet processed into observations
@@ -4511,6 +5042,15 @@ components:
         observations_mission:
           nullable: true
           type: string
+        enable_temporal_retrieval:
+          nullable: true
+          type: boolean
+        enable_graph_retrieval:
+          nullable: true
+          type: boolean
+        enable_reranking:
+          nullable: true
+          type: boolean
         disposition_skepticism:
           maximum: 5.0
           minimum: 1.0
@@ -4528,7 +5068,7 @@ components:
           type: integer
         entity_labels:
           items:
-            additionalProperties: {}
+            $ref: '#/components/schemas/LabelGroup-Output'
           nullable: true
           type: array
         entities_allow_free_form:
@@ -4599,6 +5139,12 @@ components:
         recall_budget_max:
           nullable: true
           type: integer
+        audit_log_enabled:
+          nullable: true
+          type: boolean
+        store_document_text:
+          nullable: true
+          type: boolean
       title: BankTemplateConfig
     BankTemplateDirective:
       description: |-
@@ -5032,6 +5578,15 @@ components:
         observations_mission:
           nullable: true
           type: string
+        enable_temporal_retrieval:
+          nullable: true
+          type: boolean
+        enable_graph_retrieval:
+          nullable: true
+          type: boolean
+        enable_reranking:
+          nullable: true
+          type: boolean
       title: CreateBankRequest
     CreateDirectiveRequest:
       description: Request model for creating a directive.
@@ -5072,6 +5627,42 @@ components:
       - content
       - name
       title: CreateDirectiveRequest
+    CreateFolderRequest:
+      description: Create a folder under an optional parent folder.
+      example:
+        parent_id: parent_id
+        name: name
+      properties:
+        name:
+          title: Name
+          type: string
+        parent_id:
+          nullable: true
+          type: string
+      required:
+      - name
+      title: CreateFolderRequest
+    CreateKnowledgePageResponse:
+      description: "Result of creating a page: the node id, its mental model, and\
+        \ the refresh op."
+      example:
+        page_id: page_id
+        operation_id: operation_id
+        mental_model_id: mental_model_id
+      properties:
+        page_id:
+          title: Page Id
+          type: string
+        mental_model_id:
+          title: Mental Model Id
+          type: string
+        operation_id:
+          nullable: true
+          type: string
+      required:
+      - mental_model_id
+      - page_id
+      title: CreateKnowledgePageResponse
     CreateMentalModelRequest:
       description: Request model for creating a mental model.
       example:
@@ -5130,6 +5721,68 @@ components:
       required:
       - operation_id
       title: CreateMentalModelResponse
+    CreatePageRequest:
+      description: Create a page (a mental model + tree node) under an optional parent
+        folder.
+      example:
+        source_query: source_query
+        max_tokens: 0
+        parent_id: parent_id
+        name: name
+        trigger:
+          recall_chunks_max_tokens: 1
+          refresh_cron: refresh_cron
+          tag_groups:
+          - match: any_strict
+            tags:
+            - tags
+            - tags
+          - match: any_strict
+            tags:
+            - tags
+            - tags
+          exclude_mental_models: false
+          mode: full
+          refresh_after_consolidation: false
+          fact_types:
+          - world
+          - world
+          response_schema:
+            key: ""
+          exclude_mental_model_ids:
+          - exclude_mental_model_ids
+          - exclude_mental_model_ids
+          include_chunks: true
+          tags_match: any
+          keep_trace: false
+          recall_max_tokens: 6
+        tags:
+        - tags
+        - tags
+      properties:
+        name:
+          title: Name
+          type: string
+        source_query:
+          title: Source Query
+          type: string
+        parent_id:
+          nullable: true
+          type: string
+        tags:
+          items:
+            type: string
+          nullable: true
+          type: array
+        max_tokens:
+          nullable: true
+          type: integer
+        trigger:
+          $ref: '#/components/schemas/MentalModelTrigger-Input'
+      required:
+      - name
+      - source_query
+      title: CreatePageRequest
     CreateWebhookRequest:
       description: Request model for registering a webhook.
       example:
@@ -5198,6 +5851,27 @@ components:
       - message
       - success
       title: DeleteDocumentResponse
+    DeleteOperationResponse:
+      description: Response model for delete operation endpoint.
+      example:
+        message: Operation 550e8400-e29b-41d4-a716-446655440000 deleted
+        operation_id: 550e8400-e29b-41d4-a716-446655440000
+        success: true
+      properties:
+        success:
+          title: Success
+          type: boolean
+        message:
+          title: Message
+          type: string
+        operation_id:
+          title: Operation Id
+          type: string
+      required:
+      - message
+      - operation_id
+      - success
+      title: DeleteOperationResponse
     DeleteResponse:
       description: Response model for delete operations.
       example:
@@ -5438,8 +6112,48 @@ components:
         llm_output_language: llm_output_language
         retain_extract_causal_links: true
         entity_labels:
-        - ""
-        - ""
+        - values:
+          - description: ""
+            value: value
+          - description: ""
+            value: value
+          description: ""
+          optional: true
+          tag: false
+          type: value
+          fields:
+            key:
+              values:
+              - description: ""
+                value: value
+              - description: ""
+                value: value
+              description: ""
+              type: text
+              fields:
+                key: null
+          key: key
+        - values:
+          - description: ""
+            value: value
+          - description: ""
+            value: value
+          description: ""
+          optional: true
+          tag: false
+          type: value
+          fields:
+            key:
+              values:
+              - description: ""
+                value: value
+              - description: ""
+                value: value
+              description: ""
+              type: text
+              fields:
+                key: null
+          key: key
         retain_custom_instructions: retain_custom_instructions
         content: content
         entities_allow_free_form: true
@@ -5477,7 +6191,8 @@ components:
           nullable: true
           type: integer
         entity_labels:
-          items: {}
+          items:
+            $ref: '#/components/schemas/LabelGroup-Input'
           nullable: true
           type: array
         entities_allow_free_form:
@@ -5809,7 +6524,8 @@ components:
           title: Document Import Api
           type: boolean
         audit_log:
-          description: Whether audit logging is enabled
+          description: Whether audit logging is enabled by default (overridable per
+            bank)
           title: Audit Log
           type: boolean
         llm_trace:
@@ -5933,6 +6649,279 @@ components:
         source_facts:
           $ref: '#/components/schemas/SourceFactsIncludeOptions'
       title: IncludeOptions
+    KnowledgeNode:
+      description: |-
+        A node in the knowledge-base tree — a folder or a page.
+
+        Pages carry ``description``/``tags`` from their backing mental model. The
+        knowledge base is client-managed (CRUD); ``managed`` lets a client tag a node
+        as system-owned vs. hand-authored.
+      example:
+        children:
+        - null
+        - null
+        kind: folder
+        parent_id: parent_id
+        managed: false
+        name: name
+        description: description
+        id: id
+        is_stale: true
+        mental_model_id: mental_model_id
+        tags:
+        - tags
+        - tags
+        timestamp: timestamp
+      properties:
+        id:
+          title: Id
+          type: string
+        kind:
+          enum:
+          - folder
+          - page
+          title: Kind
+          type: string
+        name:
+          title: Name
+          type: string
+        parent_id:
+          nullable: true
+          type: string
+        mental_model_id:
+          nullable: true
+          type: string
+        managed:
+          default: false
+          description: "Client-set flag: true = system-owned, false = hand-authored."
+          title: Managed
+          type: boolean
+        description:
+          nullable: true
+          type: string
+        tags:
+          default: []
+          items:
+            type: string
+          type: array
+        timestamp:
+          nullable: true
+          type: string
+        is_stale:
+          nullable: true
+          type: boolean
+        children:
+          default: []
+          items:
+            $ref: '#/components/schemas/KnowledgeNode'
+          type: array
+      required:
+      - id
+      - kind
+      - name
+      title: KnowledgeNode
+    KnowledgePageBundleFile:
+      description: One file in a portable markdown bundle.
+      example:
+        path: path
+        content: content
+      properties:
+        path:
+          title: Path
+          type: string
+        content:
+          title: Content
+          type: string
+      required:
+      - content
+      - path
+      title: KnowledgePageBundleFile
+    KnowledgePageBundleResponse:
+      description: A portable markdown bundle — a flat set of markdown files (index
+        + pages + logs).
+      example:
+        files:
+        - path: path
+          content: content
+        - path: path
+          content: content
+      properties:
+        files:
+          items:
+            $ref: '#/components/schemas/KnowledgePageBundleFile'
+          type: array
+      required:
+      - files
+      title: KnowledgePageBundleResponse
+    KnowledgePageResponse:
+      description: A knowledge page rendered as a markdown document.
+      example:
+        name: name
+        markdown: markdown
+        description: description
+        id: id
+        type: type
+        body: body
+        tags:
+        - tags
+        - tags
+        timestamp: timestamp
+      properties:
+        id:
+          title: Id
+          type: string
+        name:
+          title: Name
+          type: string
+        type:
+          description: "Page type — from a `type:<x>` tag, else 'knowledge-page'."
+          title: Type
+          type: string
+        description:
+          nullable: true
+          type: string
+        tags:
+          default: []
+          items:
+            type: string
+          type: array
+        timestamp:
+          nullable: true
+          type: string
+        body:
+          nullable: true
+          type: string
+        markdown:
+          description: "The full markdown document: YAML frontmatter + markdown body."
+          title: Markdown
+          type: string
+      required:
+      - id
+      - markdown
+      - name
+      - type
+      title: KnowledgePageResponse
+    KnowledgePageSearchResponse:
+      description: "Ranked knowledge-page search results (BM25 + vector, RRF-fused)."
+      example:
+        total: 6
+        results:
+        - snippet: snippet
+          score: 0.8008281904610115
+          updated_at: updated_at
+          name: name
+          id: id
+          mental_model_id: mental_model_id
+        - snippet: snippet
+          score: 0.8008281904610115
+          updated_at: updated_at
+          name: name
+          id: id
+          mental_model_id: mental_model_id
+      properties:
+        results:
+          items:
+            $ref: '#/components/schemas/KnowledgePageSearchResult'
+          type: array
+        total:
+          title: Total
+          type: integer
+      required:
+      - results
+      - total
+      title: KnowledgePageSearchResponse
+    KnowledgePageSearchResult:
+      description: "One hybrid-search hit: a knowledge page and its fused relevance\
+        \ score."
+      example:
+        snippet: snippet
+        score: 0.8008281904610115
+        updated_at: updated_at
+        name: name
+        id: id
+        mental_model_id: mental_model_id
+      properties:
+        id:
+          title: Id
+          type: string
+        name:
+          title: Name
+          type: string
+        mental_model_id:
+          nullable: true
+          type: string
+        snippet:
+          title: Snippet
+          type: string
+        score:
+          title: Score
+          type: number
+        updated_at:
+          nullable: true
+          type: string
+      required:
+      - id
+      - name
+      - score
+      - snippet
+      title: KnowledgePageSearchResult
+    KnowledgeTreeResponse:
+      description: The knowledge base as a nested folder/page tree.
+      example:
+        roots:
+        - children:
+          - null
+          - null
+          kind: folder
+          parent_id: parent_id
+          managed: false
+          name: name
+          description: description
+          id: id
+          is_stale: true
+          mental_model_id: mental_model_id
+          tags:
+          - tags
+          - tags
+          timestamp: timestamp
+        - children:
+          - null
+          - null
+          kind: folder
+          parent_id: parent_id
+          managed: false
+          name: name
+          description: description
+          id: id
+          is_stale: true
+          mental_model_id: mental_model_id
+          tags:
+          - tags
+          - tags
+          timestamp: timestamp
+      properties:
+        roots:
+          items:
+            $ref: '#/components/schemas/KnowledgeNode'
+          type: array
+      required:
+      - roots
+      title: KnowledgeTreeResponse
+    LLMCallTrace:
+      description: A single LLM call made during reflect.
+      properties:
+        scope:
+          description: "Call scope: agent_1, agent_2, final, etc."
+          title: Scope
+          type: string
+        duration_ms:
+          description: Execution time in milliseconds
+          title: Duration Ms
+          type: integer
+      required:
+      - duration_ms
+      - scope
+      title: LLMCallTrace
     LLMRequestEntry:
       description: "A single LLM request trace row, as returned by the read API."
       example:
@@ -6232,6 +7221,124 @@ components:
       - output
       - total
       title: LLMRequestTokenSums
+    LabelGroup-Input:
+      description: A label group (dimension) with its type and allowed values.
+      example:
+        values:
+        - description: ""
+          value: value
+        - description: ""
+          value: value
+        description: ""
+        optional: true
+        tag: false
+        type: value
+        fields:
+          key:
+            values:
+            - description: ""
+              value: value
+            - description: ""
+              value: value
+            description: ""
+            type: text
+            fields:
+              key: null
+        key: key
+      properties:
+        key:
+          title: Key
+          type: string
+        description:
+          default: ""
+          title: Description
+          type: string
+        type:
+          default: value
+          enum:
+          - value
+          - multi-values
+          - text
+          - map
+          title: Type
+          type: string
+        optional:
+          default: true
+          title: Optional
+          type: boolean
+        tag:
+          default: false
+          title: Tag
+          type: boolean
+        values:
+          default: []
+          items:
+            $ref: '#/components/schemas/LabelValue'
+          type: array
+        fields:
+          additionalProperties:
+            $ref: '#/components/schemas/MapField-Input'
+          default: {}
+          title: Fields
+      required:
+      - key
+      title: LabelGroup
+    LabelGroup-Output:
+      description: A label group (dimension) with its type and allowed values.
+      properties:
+        key:
+          title: Key
+          type: string
+        description:
+          default: ""
+          title: Description
+          type: string
+        type:
+          default: value
+          enum:
+          - value
+          - multi-values
+          - text
+          - map
+          title: Type
+          type: string
+        optional:
+          default: true
+          title: Optional
+          type: boolean
+        tag:
+          default: false
+          title: Tag
+          type: boolean
+        values:
+          default: []
+          items:
+            $ref: '#/components/schemas/LabelValue'
+          type: array
+        fields:
+          additionalProperties:
+            $ref: '#/components/schemas/MapField-Output'
+          default: {}
+          title: Fields
+      required:
+      - key
+      title: LabelGroup
+    LabelValue:
+      description: A single allowed value for a label group.
+      example:
+        description: ""
+        value: value
+      properties:
+        value:
+          title: Value
+          type: string
+        description:
+          default: ""
+          title: Description
+          type: string
+      required:
+      - value
+      title: LabelValue
     ListChunksResponse:
       description: Response model for listing chunks of a document.
       example:
@@ -6316,6 +7423,9 @@ components:
           date: 2024-01-15T10:30:00Z
           entities: "Alice (PERSON), Google (ORGANIZATION)"
           id: 550e8400-e29b-41d4-a716-446655440000
+          metadata:
+            channel: engineering
+            source: slack
           text: Alice works at Google on the AI team
           type: world
         limit: 100
@@ -6411,6 +7521,72 @@ components:
       - operation
       - status
       title: LlmOperationHealth
+    MapField-Input:
+      description: A field within a map-type entity label group. Supports recursion
+        via type='map'.
+      example:
+        values:
+        - description: ""
+          value: value
+        - description: ""
+          value: value
+        description: ""
+        type: text
+        fields:
+          key: null
+      properties:
+        type:
+          default: text
+          enum:
+          - text
+          - value
+          - multi-values
+          - map
+          title: Type
+          type: string
+        description:
+          default: ""
+          title: Description
+          type: string
+        values:
+          default: []
+          items:
+            $ref: '#/components/schemas/LabelValue'
+          type: array
+        fields:
+          additionalProperties:
+            $ref: '#/components/schemas/MapField-Input'
+          default: {}
+          title: Fields
+      title: MapField
+    MapField-Output:
+      description: A field within a map-type entity label group. Supports recursion
+        via type='map'.
+      properties:
+        type:
+          default: text
+          enum:
+          - text
+          - value
+          - multi-values
+          - map
+          title: Type
+          type: string
+        description:
+          default: ""
+          title: Description
+          type: string
+        values:
+          default: []
+          items:
+            $ref: '#/components/schemas/LabelValue'
+          type: array
+        fields:
+          additionalProperties:
+            $ref: '#/components/schemas/MapField-Output'
+          default: {}
+          title: Fields
+      title: MapField
     MemoriesTimeseriesResponse:
       description: Time-series of memory ingestion bucketed by time and fact type.
       example:
@@ -6544,6 +7720,174 @@ components:
       required:
       - time
       title: MemoryTimeseriesBucket
+    MentalModelDeltaOperations:
+      description: Structured operations a delta refresh emitted against the existing
+        document.
+      properties:
+        applied:
+          description: "Operations applied to the document, in order."
+          items:
+            additionalProperties: {}
+          type: array
+        skipped:
+          description: "Operations dropped as invalid, each with a reason."
+          items:
+            additionalProperties: {}
+          type: array
+      title: MentalModelDeltaOperations
+    MentalModelDryRunRefreshResult:
+      description: |-
+        Preview of what a mental model refresh would do, having changed nothing.
+
+        Runs the real pipeline — same scope resolution, same reflect call, same
+        delta operations — then reports the result instead of persisting it. The
+        model's content, structured content, watermark, and last_refreshed_at are
+        all left untouched, so a delta dry run is repeatable: it reads the same
+        window the next real refresh would.
+      example:
+        effective_mode: full
+        facts:
+          retrieved:
+            observation: 12
+          used:
+            observation: 4
+        mental_model_id: coding-style
+        mode_fallback_reason: source_query_changed
+        name: Coding Style
+        outcome: content_written
+        requested_mode: delta
+        warnings: []
+        would_persist: true
+      properties:
+        mental_model_id:
+          description: The mental model previewed.
+          title: Mental Model Id
+          type: string
+        name:
+          description: Display name of the mental model.
+          title: Name
+          type: string
+        requested_mode:
+          description: "The mode asked for (from the model's trigger, or overridden)."
+          enum:
+          - full
+          - delta
+          title: Requested Mode
+          type: string
+        effective_mode:
+          description: The mode the refresh actually ran in.
+          enum:
+          - full
+          - delta
+          title: Effective Mode
+          type: string
+        mode_fallback_reason:
+          enum:
+          - no_baseline_content
+          - source_query_changed
+          - structured_doc_unreadable
+          - delta_ops_failed
+          - delta_ops_all_skipped
+          nullable: true
+          type: string
+        outcome:
+          description: What a real refresh would do with the document.
+          enum:
+          - content_written
+          - content_preserved_no_new_facts
+          - refresh_failed_empty_candidate
+          - refresh_failed_delta_not_applied
+          title: Outcome
+          type: string
+        would_persist:
+          description: Whether a real refresh would write new content.
+          title: Would Persist
+          type: boolean
+        scope:
+          $ref: '#/components/schemas/MentalModelRefreshScope'
+        window:
+          $ref: '#/components/schemas/MentalModelRefreshWindow'
+        facts:
+          $ref: '#/components/schemas/MentalModelFactCounts'
+        based_on:
+          additionalProperties:
+            items:
+              additionalProperties: {}
+          description: "The evidence this run would ground the document on, keyed\
+            \ by fact type — the same shape a refresh persists under reflect_response.based_on.\
+            \ Returned so a preview can show its sources without having to write them\
+            \ anywhere."
+          title: Based On
+        current_content:
+          description: The model's content as it stands now.
+          title: Current Content
+          type: string
+        candidate_content:
+          description: "Raw reflect synthesis, before any delta operations."
+          title: Candidate Content
+          type: string
+        preview_content:
+          description: "The content a real refresh would store: the delta-edited document,\
+            \ or the candidate in full mode."
+          title: Preview Content
+          type: string
+        diff:
+          description: Unified diff from current_content to preview_content. Empty
+            when identical.
+          title: Diff
+          type: string
+        delta_operations:
+          $ref: '#/components/schemas/MentalModelDeltaOperations'
+        trace:
+          $ref: '#/components/schemas/MentalModelRefreshTrace'
+        usage:
+          $ref: '#/components/schemas/TokenUsage'
+        duration_ms:
+          default: 0
+          description: Wall-clock duration of the run.
+          title: Duration Ms
+          type: integer
+        warnings:
+          description: "Conditions worth a human's attention, in plain language."
+          items:
+            type: string
+          type: array
+      required:
+      - candidate_content
+      - current_content
+      - diff
+      - effective_mode
+      - facts
+      - mental_model_id
+      - name
+      - outcome
+      - preview_content
+      - requested_mode
+      - scope
+      - trace
+      - window
+      - would_persist
+      title: MentalModelDryRunRefreshResult
+    MentalModelFactCounts:
+      description: |-
+        Facts the refresh saw, keyed by fact type.
+
+        ``retrieved`` and ``used`` diverging is the single most common cause of a
+        disappointing refresh: recall found plenty, but the reflect agent declared
+        none of it relevant to the topic, so none of it reached the document.
+      properties:
+        retrieved:
+          additionalProperties:
+            type: integer
+          description: "Facts the reflect agent's tool calls returned, by fact type."
+          title: Retrieved
+        used:
+          additionalProperties:
+            type: integer
+          description: "Facts the agent declared it actually based the answer on,\
+            \ by fact type."
+          title: Used
+      title: MentalModelFactCounts
     MentalModelListResponse:
       description: Response model for listing mental models.
       example:
@@ -6557,9 +7901,8 @@ components:
           created_at: created_at
           id: id
           trigger:
-            mode: full
-            refresh_after_consolidation: false
             recall_chunks_max_tokens: 1
+            refresh_cron: refresh_cron
             tag_groups:
             - match: any_strict
               tags:
@@ -6569,15 +7912,20 @@ components:
               tags:
               - tags
               - tags
+            exclude_mental_models: false
+            mode: full
+            refresh_after_consolidation: false
             fact_types:
             - world
             - world
+            response_schema:
+              key: ""
             exclude_mental_model_ids:
             - exclude_mental_model_ids
             - exclude_mental_model_ids
             include_chunks: true
             tags_match: any
-            exclude_mental_models: false
+            keep_trace: false
             recall_max_tokens: 6
           last_refreshed_at: last_refreshed_at
           is_stale: true
@@ -6594,9 +7942,8 @@ components:
           created_at: created_at
           id: id
           trigger:
-            mode: full
-            refresh_after_consolidation: false
             recall_chunks_max_tokens: 1
+            refresh_cron: refresh_cron
             tag_groups:
             - match: any_strict
               tags:
@@ -6606,15 +7953,20 @@ components:
               tags:
               - tags
               - tags
+            exclude_mental_models: false
+            mode: full
+            refresh_after_consolidation: false
             fact_types:
             - world
             - world
+            response_schema:
+              key: ""
             exclude_mental_model_ids:
             - exclude_mental_model_ids
             - exclude_mental_model_ids
             include_chunks: true
             tags_match: any
-            exclude_mental_models: false
+            keep_trace: false
             recall_max_tokens: 6
           last_refreshed_at: last_refreshed_at
           is_stale: true
@@ -6630,6 +7982,142 @@ components:
       required:
       - items
       title: MentalModelListResponse
+    MentalModelRefreshScope:
+      description: |-
+        The memory scope a refresh actually resolved to.
+
+        A model's stored ``tags`` are not what filters memories — ``tags_match``
+        defaults to ``all_strict`` when tags are present, and ``tag_groups``
+        override flat tags entirely. This reports the resolved result.
+      properties:
+        tags:
+          items:
+            type: string
+          nullable: true
+          type: array
+        tags_match:
+          description: Resolved tag match mode.
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          - exact
+          title: Tags Match
+          type: string
+        tag_groups:
+          items:
+            $ref: '#/components/schemas/MentalModelRefreshScope_tag_groups_inner'
+          nullable: true
+          type: array
+        fact_types:
+          items:
+            type: string
+          nullable: true
+          type: array
+        exclude_mental_models:
+          description: Whether other mental models were excluded from the reflect
+            loop.
+          title: Exclude Mental Models
+          type: boolean
+        exclude_mental_model_ids:
+          description: Mental models excluded by ID (always includes the model being
+            refreshed).
+          items:
+            type: string
+          type: array
+      required:
+      - exclude_mental_models
+      - tags_match
+      title: MentalModelRefreshScope
+    MentalModelRefreshTrace:
+      description: |-
+        Execution trace of a mental model refresh, recorded when trigger.keep_trace is on.
+
+        Deliberately shaped like reflect's trace — the calls the agent made, plus the
+        refresh-specific decision — and nothing more. This is persisted on the mental
+        model row and re-read on every fetch, so anything derivable from elsewhere is
+        left out: the evidence lives in ``reflect_response.based_on``, and the
+        resolved scope and snapshot window are reported by the dry run.
+      properties:
+        recorded_at:
+          format: date-time
+          nullable: true
+          type: string
+        effective_mode:
+          description: Whether the refresh ran as full or delta.
+          enum:
+          - full
+          - delta
+          title: Effective Mode
+          type: string
+        mode_fallback_reason:
+          enum:
+          - no_baseline_content
+          - source_query_changed
+          - structured_doc_unreadable
+          - delta_ops_failed
+          - delta_ops_all_skipped
+          nullable: true
+          type: string
+        outcome:
+          description: What the refresh did with the document.
+          enum:
+          - content_written
+          - content_preserved_no_new_facts
+          - refresh_failed_empty_candidate
+          - refresh_failed_delta_not_applied
+          title: Outcome
+          type: string
+        tool_calls:
+          description: Reflect tool calls made during the refresh.
+          items:
+            $ref: '#/components/schemas/MentalModelTraceToolCall'
+          type: array
+        llm_calls:
+          description: LLM calls made during the refresh.
+          items:
+            $ref: '#/components/schemas/LLMCallTrace'
+          type: array
+        delta_operations:
+          $ref: '#/components/schemas/MentalModelDeltaOperations'
+        usage:
+          $ref: '#/components/schemas/TokenUsage'
+        duration_ms:
+          default: 0
+          description: Wall-clock duration of the refresh.
+          title: Duration Ms
+          type: integer
+        warnings:
+          description: "Conditions worth a human's attention, in plain language."
+          items:
+            type: string
+          type: array
+      required:
+      - effective_mode
+      - outcome
+      title: MentalModelRefreshTrace
+    MentalModelRefreshWindow:
+      description: The time window a refresh read memories from.
+      properties:
+        created_after:
+          format: date-time
+          nullable: true
+          type: string
+        created_before:
+          description: "Database-time snapshot bounding the refresh. Memories committed\
+            \ after this are not read, so they stay newer than the persisted watermark\
+            \ and are caught by the next refresh."
+          format: date-time
+          title: Created Before
+          type: string
+        watermark:
+          format: date-time
+          nullable: true
+          type: string
+      required:
+      - created_before
+      title: MentalModelRefreshWindow
     MentalModelResponse:
       description: Response model for a mental model (stored reflect response).
       example:
@@ -6642,9 +8130,8 @@ components:
         created_at: created_at
         id: id
         trigger:
-          mode: full
-          refresh_after_consolidation: false
           recall_chunks_max_tokens: 1
+          refresh_cron: refresh_cron
           tag_groups:
           - match: any_strict
             tags:
@@ -6654,15 +8141,20 @@ components:
             tags:
             - tags
             - tags
+          exclude_mental_models: false
+          mode: full
+          refresh_after_consolidation: false
           fact_types:
           - world
           - world
+          response_schema:
+            key: ""
           exclude_mental_model_ids:
           - exclude_mental_model_ids
           - exclude_mental_model_ids
           include_chunks: true
           tags_match: any
-          exclude_mental_models: false
+          keep_trace: false
           recall_max_tokens: 6
         last_refreshed_at: last_refreshed_at
         is_stale: true
@@ -6713,8 +8205,80 @@ components:
       - id
       - name
       title: MentalModelResponse
+    MentalModelTraceToolCall:
+      description: |-
+        One reflect tool call made during a refresh.
+
+        ``output`` is carried only by the dry run, which persists nothing. The trace
+        stored on the model row keeps ``result_count`` instead: it is re-read on every
+        fetch, so embedding full recall payloads there would bloat the row without
+        bound. Raw prompts and responses are available separately via LLM request
+        tracing.
+      properties:
+        tool:
+          description: "Tool name: recall, search_observations, get_mental_model,\
+            \ expand, …"
+          title: Tool
+          type: string
+        reason:
+          nullable: true
+          type: string
+        input:
+          additionalProperties: {}
+          description: Tool input parameters.
+          title: Input
+        output:
+          additionalProperties: {}
+          nullable: true
+        updated_at:
+          format: date-time
+          nullable: true
+          type: string
+        result_count:
+          nullable: true
+          type: integer
+        duration_ms:
+          description: Execution time in milliseconds.
+          title: Duration Ms
+          type: integer
+        iteration:
+          default: 0
+          description: Agent loop iteration (1-based) this call belongs to.
+          title: Iteration
+          type: integer
+      required:
+      - duration_ms
+      - tool
+      title: MentalModelTraceToolCall
     MentalModelTrigger-Input:
       description: Trigger settings for a mental model.
+      example:
+        recall_chunks_max_tokens: 1
+        refresh_cron: refresh_cron
+        tag_groups:
+        - match: any_strict
+          tags:
+          - tags
+          - tags
+        - match: any_strict
+          tags:
+          - tags
+          - tags
+        exclude_mental_models: false
+        mode: full
+        refresh_after_consolidation: false
+        fact_types:
+        - world
+        - world
+        response_schema:
+          key: ""
+        exclude_mental_model_ids:
+        - exclude_mental_model_ids
+        - exclude_mental_model_ids
+        include_chunks: true
+        tags_match: any
+        keep_trace: false
+        recall_max_tokens: 6
       properties:
         mode:
           default: full
@@ -6735,6 +8299,9 @@ components:
             \ (real-time mode)"
           title: Refresh After Consolidation
           type: boolean
+        refresh_cron:
+          nullable: true
+          type: string
         fact_types:
           items:
             enum:
@@ -6778,13 +8345,28 @@ components:
         recall_chunks_max_tokens:
           nullable: true
           type: integer
+        response_schema:
+          additionalProperties: {}
+          nullable: true
+        keep_trace:
+          default: false
+          description: "If true, every refresh of this mental model records how it\
+            \ reached its result under reflect_response.trace: the mode it ran in\
+            \ and why, the resolved scope and time window, how many facts retrieval\
+            \ returned versus how many the agent used, the tool and LLM calls, and\
+            \ any delta operations. Only the latest refresh's trace is kept. This\
+            \ is the only way to diagnose a cron- or consolidation-driven refresh\
+            \ after the fact, since no human sees those run. Tool outputs are reduced\
+            \ to result counts to keep the stored trace bounded; use LLM request tracing\
+            \ for raw prompts and responses."
+          title: Keep Trace
+          type: boolean
       title: MentalModelTrigger
     MentalModelTrigger-Output:
       description: Trigger settings for a mental model.
       example:
-        mode: full
-        refresh_after_consolidation: false
         recall_chunks_max_tokens: 1
+        refresh_cron: refresh_cron
         tag_groups:
         - match: any_strict
           tags:
@@ -6794,15 +8376,20 @@ components:
           tags:
           - tags
           - tags
+        exclude_mental_models: false
+        mode: full
+        refresh_after_consolidation: false
         fact_types:
         - world
         - world
+        response_schema:
+          key: ""
         exclude_mental_model_ids:
         - exclude_mental_model_ids
         - exclude_mental_model_ids
         include_chunks: true
         tags_match: any
-        exclude_mental_models: false
+        keep_trace: false
         recall_max_tokens: 6
       properties:
         mode:
@@ -6824,6 +8411,9 @@ components:
             \ (real-time mode)"
           title: Refresh After Consolidation
           type: boolean
+        refresh_cron:
+          nullable: true
+          type: string
         fact_types:
           items:
             enum:
@@ -6855,7 +8445,7 @@ components:
           type: string
         tag_groups:
           items:
-            $ref: '#/components/schemas/MentalModelTrigger_Output_tag_groups_inner'
+            $ref: '#/components/schemas/MentalModelRefreshScope_tag_groups_inner'
           nullable: true
           type: array
         include_chunks:
@@ -6867,7 +8457,47 @@ components:
         recall_chunks_max_tokens:
           nullable: true
           type: integer
+        response_schema:
+          additionalProperties: {}
+          nullable: true
+        keep_trace:
+          default: false
+          description: "If true, every refresh of this mental model records how it\
+            \ reached its result under reflect_response.trace: the mode it ran in\
+            \ and why, the resolved scope and time window, how many facts retrieval\
+            \ returned versus how many the agent used, the tool and LLM calls, and\
+            \ any delta operations. Only the latest refresh's trace is kept. This\
+            \ is the only way to diagnose a cron- or consolidation-driven refresh\
+            \ after the fact, since no human sees those run. Tool outputs are reduced\
+            \ to result counts to keep the stored trace bounded; use LLM request tracing\
+            \ for raw prompts and responses."
+          title: Keep Trace
+          type: boolean
       title: MentalModelTrigger
+    MinScores:
+      description: |-
+        Optional per-stage score floors for recall (all inclusive, AND-ed).
+
+        ``semantic`` and ``keyword`` are **retrieval-level** cutoffs pushed into the SQL
+        arms (overriding the global ``semantic_min_similarity`` / ``bm25_min_score``
+        config for this request), so they prune weak matches before fusion. ``reranker``
+        and ``final`` are **post-query** filters applied to the scored results after
+        reranking. Any field left None imposes no floor; all-None (the default) means
+        no score filtering.
+      properties:
+        semantic:
+          nullable: true
+          type: number
+        keyword:
+          nullable: true
+          type: number
+        reranker:
+          nullable: true
+          type: number
+        final:
+          nullable: true
+          type: number
+      title: MinScores
     ObservationScope:
       description: "A distinct observation scope: an exact tag set plus its observation\
         \ count."
@@ -6960,6 +8590,9 @@ components:
           title: Items Count
           type: integer
         document_id:
+          nullable: true
+          type: string
+        filename:
           nullable: true
           type: string
         created_at:
@@ -7113,6 +8746,17 @@ components:
             type: string
           nullable: true
           type: array
+        prefer_observations:
+          default: false
+          description: "When recalling raw facts ('world'/'experience') together with\
+            \ 'observation', drop any raw fact that an observation in the results\
+            \ was consolidated from, so the observation supersedes it and you don't\
+            \ get duplicate content. The freed slots are backfilled with the next\
+            \ results, keeping the result count at the requested budget. Disabled\
+            \ by default; set to true to enable. No effect unless 'observation' and\
+            \ at least one raw type are both requested."
+          title: Prefer Observations
+          type: boolean
         budget:
           $ref: '#/components/schemas/Budget'
         max_tokens:
@@ -7137,7 +8781,9 @@ components:
           default: any
           description: "How to match tags: 'any' (OR, includes untagged), 'all' (AND,\
             \ includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict'\
-            \ (AND, excludes untagged)."
+            \ (AND, excludes untagged), 'exact' (set-equality on the full scope, excludes\
+            \ untagged). With 'exact' and no tags (or []), the empty global scope\
+            \ is selected and only untagged memories match."
           enum:
           - any
           - all
@@ -7151,6 +8797,8 @@ components:
             $ref: '#/components/schemas/MentalModelTrigger_Input_tag_groups_inner'
           nullable: true
           type: array
+        min_scores:
+          $ref: '#/components/schemas/MinScores'
       required:
       - query
       title: RecallRequest
@@ -7274,10 +8922,39 @@ components:
             type: string
           nullable: true
           type: array
+        scores:
+          $ref: '#/components/schemas/RecallScores'
       required:
       - id
       - text
       title: RecallResult
+    RecallScores:
+      description: |-
+        Per-result recall scores from different stages of the pipeline.
+
+        ``final`` is the value results are ranked by. The others are diagnostic and
+        can be filtered on via the recall ``min_scores`` request parameter. ``semantic``
+        and ``keyword`` are the raw per-strategy retrieval scores (``None`` when that
+        strategy did not surface this result); ``reranker`` is the cross-encoder's
+        normalized relevance.
+      properties:
+        final:
+          description: Final ranking score (combined reranker + recency/temporal/proof
+            boosts)
+          title: Final
+          type: number
+        reranker:
+          nullable: true
+          type: number
+        semantic:
+          nullable: true
+          type: number
+        keyword:
+          nullable: true
+          type: number
+      required:
+      - final
+      title: RecallScores
     RecoverConsolidationResponse:
       description: Response model for recovering failed consolidation.
       example:
@@ -7474,6 +9151,14 @@ components:
             $ref: '#/components/schemas/MentalModelTrigger_Input_tag_groups_inner'
           nullable: true
           type: array
+        apply_all_directives:
+          default: false
+          description: "Apply every active directive regardless of tags. By default\
+            \ directives are scoped like memories: untagged directives always apply,\
+            \ and tagged directives apply only when the request's tags match them.\
+            \ Set true to apply all active directives, ignoring tag scope."
+          title: Apply All Directives
+          type: boolean
         fact_types:
           items:
             enum:
@@ -7649,6 +9334,9 @@ components:
             type: string
           nullable: true
           type: array
+        operation_id:
+          nullable: true
+          type: string
       required:
       - items
       title: RetainRequest
@@ -7744,7 +9432,7 @@ components:
       properties:
         and:
           items:
-            $ref: '#/components/schemas/MentalModelTrigger_Output_tag_groups_inner'
+            $ref: '#/components/schemas/MentalModelRefreshScope_tag_groups_inner'
           type: array
       required:
       - and
@@ -7805,7 +9493,7 @@ components:
       properties:
         or:
           items:
-            $ref: '#/components/schemas/MentalModelTrigger_Output_tag_groups_inner'
+            $ref: '#/components/schemas/MentalModelRefreshScope_tag_groups_inner'
           type: array
       required:
       - or
@@ -7843,18 +9531,26 @@ components:
           type: integer
         output_tokens:
           default: 0
-          description: Number of output/completion tokens generated
+          description: Number of visible output/completion tokens generated (excludes
+            reasoning/thoughts)
           title: Output Tokens
           type: integer
         total_tokens:
           default: 0
-          description: Total tokens (input + output)
+          description: "Total tokens (input + output, excludes thoughts)"
           title: Total Tokens
           type: integer
         cached_tokens:
           default: 0
           description: "Cached/cache-read prompt tokens, when reported by the provider"
           title: Cached Tokens
+          type: integer
+        thoughts_tokens:
+          default: 0
+          description: Reasoning/thinking tokens generated by the model. Billed at
+            the output rate by some providers (e.g. Gemini 2.5+ family) but not surfaced
+            in the visible response.
+          title: Thoughts Tokens
           type: integer
       title: TokenUsage
     ToolCallsIncludeOptions:
@@ -8002,6 +9698,37 @@ components:
         trigger:
           $ref: '#/components/schemas/MentalModelTrigger-Input'
       title: UpdateMentalModelRequest
+    UpdateNodeRequest:
+      description: |-
+        Rename/move a node and/or update a page's options. Each field applies only
+        when present in the request body.
+      example:
+        source_query: source_query
+        max_tokens: 0
+        parent_id: parent_id
+        name: name
+        tags:
+        - tags
+        - tags
+      properties:
+        name:
+          nullable: true
+          type: string
+        parent_id:
+          nullable: true
+          type: string
+        source_query:
+          nullable: true
+          type: string
+        tags:
+          items:
+            type: string
+          nullable: true
+          type: array
+        max_tokens:
+          nullable: true
+          type: integer
+      title: UpdateNodeRequest
     UpdateWebhookRequest:
       description: Request model for updating a webhook. Only provided fields are
         updated.
@@ -8375,18 +10102,18 @@ components:
         \ list, giving full control over which combinations to use."
       nullable: true
       title: ObservationScopes
+    MentalModelRefreshScope_tag_groups_inner:
+      anyOf:
+      - $ref: '#/components/schemas/TagGroupLeaf'
+      - $ref: '#/components/schemas/TagGroupAnd-Output'
+      - $ref: '#/components/schemas/TagGroupOr-Output'
+      - $ref: '#/components/schemas/TagGroupNot-Output'
     MentalModelTrigger_Input_tag_groups_inner:
       anyOf:
       - $ref: '#/components/schemas/TagGroupLeaf'
       - $ref: '#/components/schemas/TagGroupAnd-Input'
       - $ref: '#/components/schemas/TagGroupOr-Input'
       - $ref: '#/components/schemas/TagGroupNot-Input'
-    MentalModelTrigger_Output_tag_groups_inner:
-      anyOf:
-      - $ref: '#/components/schemas/TagGroupLeaf'
-      - $ref: '#/components/schemas/TagGroupAnd-Output'
-      - $ref: '#/components/schemas/TagGroupOr-Output'
-      - $ref: '#/components/schemas/TagGroupNot-Output'
     Not:
       anyOf:
       - $ref: '#/components/schemas/TagGroupLeaf'

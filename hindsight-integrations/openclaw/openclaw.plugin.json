@@ -54,6 +54,40 @@
         "type": "string",
         "description": "Mission stamped onto the bank's observations_mission column on first use. Controls what gets synthesised into observations during consolidation."
       },
+      "retainExtractionMode": {
+        "type": "string",
+        "description": "Fact extraction mode stamped onto each bank on first use (dynamic or static). Options: concise, verbose, custom, verbatim, chunks. Leave unset to keep the Hindsight server default for new banks.",
+        "enum": ["concise", "verbose", "custom", "verbatim", "chunks"]
+      },
+      "enableObservations": {
+        "type": "boolean",
+        "description": "When set, stamped onto each bank on first use to toggle observation consolidation after retain."
+      },
+      "enableAutoConsolidation": {
+        "type": "boolean",
+        "description": "When set, stamped onto each bank on first use via PATCH /banks/{id}/config to toggle automatic consolidation scheduling."
+      },
+      "dispositionSkepticism": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 5,
+        "description": "Reflect skepticism trait (1=trusting, 5=skeptical) stamped on first bank use."
+      },
+      "dispositionLiteralism": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 5,
+        "description": "Reflect literalism trait (1=flexible, 5=literal) stamped on first bank use."
+      },
+      "dispositionEmpathy": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 5,
+        "description": "Reflect empathy trait (1=detached, 5=empathetic) stamped on first bank use."
+      },
+      "entityLabels": {
+        "description": "Controlled vocabulary for entity labels. Either a list of attribute defs (e.g. [{\"name\":\"person\",\"description\":\"Human user\"}]) or a { \"attributes\": [...] } object, passed through to PATCH /banks/{id}/config as entity_labels on first bank use. Other shapes are ignored."
+      },
       "embedVersion": {
         "type": "string",
         "description": "hindsight-embed version to use (e.g. 'latest', '0.4.2', or empty for latest)",
@@ -170,11 +204,6 @@
         "description": "When true (default) and retainFormat is 'json', each message's content is an Anthropic-shaped array of typed blocks including tool_use (agent tool calls) and tool_result (truncated at 2000 chars). Operational MCP tools — Hindsight's own recall/retain/search — are filtered out to avoid feedback loops. Set to false to retain text-only content, one string per message.",
         "default": true
       },
-      "includeSenderContext": {
-        "type": "boolean",
-        "description": "Deprecated compatibility option. Sender/channel/provider stay in retain metadata/context and are not prepended to retained transcript content.",
-        "default": true
-      },
       "retainEveryNTurns": {
         "type": "integer",
         "description": "Retain every Nth turn instead of every turn. 1 = every turn (default). Values > 1 enable chunked retention with a sliding window.",
@@ -186,12 +215,6 @@
         "description": "Extra prior turns to include when chunked retention fires. Window = retainEveryNTurns + retainOverlapTurns. Only applies when retainEveryNTurns > 1.",
         "minimum": 0,
         "default": 0
-      },
-      "retainDocumentScope": {
-        "type": "string",
-        "description": "Granularity of the retained document_id. 'session' (default) groups all retains under a single document per OpenClaw session. 'turn' produces a new document per retain.",
-        "enum": ["session", "turn"],
-        "default": "session"
       },
       "recallBudget": {
         "type": "string",
@@ -213,6 +236,11 @@
         },
         "description": "Memory types to recall. Defaults to ['observation'] — surfaces only the consolidated, deduplicated view; raw world/experience facts can drive the same answer multiple times when many memories say the same thing.",
         "default": ["observation"]
+      },
+      "preferObservations": {
+        "type": "boolean",
+        "description": "When true, recall drops raw facts already consolidated into an observation while keeping unconsolidated ones. Pair with recallTypes including raw types (e.g. ['observation', 'world', 'experience']) to surface just-retained facts before consolidation, without duplicating already-consolidated content. Default: false.",
+        "default": false
       },
       "recallRoles": {
         "type": "array",
@@ -254,98 +282,8 @@
       "recallInjectionPosition": {
         "type": "string",
         "enum": ["prepend", "append", "user"],
-        "description": "Where to inject recalled memories. 'prepend' = start of system prompt (default), 'append' = end of system prompt (preserves prompt cache), 'user' = before user message.",
-        "default": "prepend"
-      },
-      "sessionSummaryEnabled": {
-        "type": "boolean",
-        "description": "Enable rolling session summary lifecycle for configured update cadence and recall-query enrichment.",
-        "default": false
-      },
-      "sessionSummaryStorePath": {
-        "type": "string",
-        "description": "Optional SQLite path for rolling session summaries. Defaults to ~/.openclaw/data/hindsight-session-summaries.sqlite."
-      },
-      "sessionSummaryEnrichRecallQuery": {
-        "type": "boolean",
-        "description": "Add rolling summary context after the latest recall query while preserving recallMaxQueryChars.",
-        "default": false
-      },
-      "sessionSummaryGeneratorProvider": {
-        "type": "string",
-        "description": "Optional summary generator provider hint. OpenClaw delegates generation to the configured Hindsight API; server-side routing decides the final LLM."
-      },
-      "sessionSummaryGeneratorModel": {
-        "type": "string",
-        "description": "Optional summary generator model hint. OpenClaw delegates generation to the configured Hindsight API; server-side routing decides the final LLM."
-      },
-      "sessionSummaryGeneratorBaseUrl": {
-        "type": "string",
-        "description": "Optional summary generator base URL hint. OpenClaw delegates generation to the configured Hindsight API; server-side routing decides the final LLM."
-      },
-      "sessionSummaryGeneratorApiKeyEnv": {
-        "type": "string",
-        "description": "Environment variable name for the summary generator API key.",
-        "default": "HINDSIGHT_LLM_API_KEY"
-      },
-      "sessionSummaryReuseHindsightLlmConfig": {
-        "type": "boolean",
-        "description": "Reuse llmProvider, llmModel, and llmBaseUrl when summary-specific fields are unset.",
-        "default": true
-      },
-      "sessionSummaryUpdateEveryNTurns": {
-        "type": "integer",
-        "minimum": 1,
-        "description": "Optional summary refresh cadence independent from retainEveryNTurns."
-      },
-      "sessionSummaryMinUpdateEveryNTurns": {
-        "type": "integer",
-        "minimum": 2,
-        "description": "Minimum summary refresh cadence; prevents per-turn summary LLM calls by default.",
-        "default": 2
-      },
-      "sessionSummaryTimeoutMs": {
-        "type": "integer",
-        "minimum": 1,
-        "description": "Timeout for bounded summary generation/update work.",
-        "default": 20000
-      },
-      "sessionSummaryMaxInputChars": {
-        "type": "integer",
-        "minimum": 1,
-        "description": "Maximum characters considered by summary generation.",
-        "default": 16000
-      },
-      "sessionSummaryMaxOutputChars": {
-        "type": "integer",
-        "minimum": 1,
-        "description": "Maximum rendered summary characters.",
-        "default": 2000
-      },
-      "sessionSummaryMaxRecallQueryChars": {
-        "type": "integer",
-        "minimum": 1,
-        "description": "Budget for summary-derived recall query text.",
-        "default": 800
-      },
-      "sessionSummaryRecallQueryBudgetRatio": {
-        "type": "number",
-        "minimum": 0,
-        "maximum": 1,
-        "description": "Maximum fraction of the summary input budget usable for recall query text.",
-        "default": 0.25
-      },
-      "sessionSummaryMinLatestQueryReserveChars": {
-        "type": "integer",
-        "minimum": 0,
-        "description": "Latest-query reserve when trimming summary inputs.",
-        "default": 400
-      },
-      "sessionSummaryDropCompletedTodosAfterTurns": {
-        "type": "integer",
-        "minimum": 0,
-        "description": "Age after which completed todos may be dropped from summaries.",
-        "default": 20
+        "description": "Where to inject recalled memories. 'user' = before the user message (default, preserves system prompt cache), 'prepend' = start of system prompt, 'append' = end of system prompt.",
+        "default": "user"
       },
       "debug": {
         "type": "boolean",
@@ -429,6 +367,34 @@
     "observationsMission": {
       "label": "Observations Mission",
       "placeholder": "Controls what gets synthesised into observations..."
+    },
+    "retainExtractionMode": {
+      "label": "Retain Extraction Mode",
+      "placeholder": "verbose, concise, custom, verbatim, or chunks"
+    },
+    "enableObservations": {
+      "label": "Enable Observations",
+      "placeholder": "true or false — stamped on first bank use"
+    },
+    "enableAutoConsolidation": {
+      "label": "Enable Auto Consolidation",
+      "placeholder": "true or false — stamped on first bank use"
+    },
+    "dispositionSkepticism": {
+      "label": "Disposition Skepticism",
+      "placeholder": "1–5"
+    },
+    "dispositionLiteralism": {
+      "label": "Disposition Literalism",
+      "placeholder": "1–5"
+    },
+    "dispositionEmpathy": {
+      "label": "Disposition Empathy",
+      "placeholder": "1–5"
+    },
+    "entityLabels": {
+      "label": "Entity Labels",
+      "placeholder": "e.g. [{\"name\":\"person\",\"description\":\"Human user\"}]"
     },
     "embedVersion": {
       "label": "Hindsight Embed Version",
@@ -520,10 +486,6 @@
       "label": "Retain Tool Calls",
       "placeholder": "true (default) — include tool_use / tool_result blocks in retained JSON"
     },
-    "includeSenderContext": {
-      "label": "Include Sender Context",
-      "placeholder": "deprecated; routing metadata is retained outside content"
-    },
     "retainEveryNTurns": {
       "label": "Retain Every N Turns",
       "placeholder": "1 (every turn, default)"
@@ -531,10 +493,6 @@
     "retainOverlapTurns": {
       "label": "Retain Overlap Turns",
       "placeholder": "0 (no overlap, default)"
-    },
-    "retainDocumentScope": {
-      "label": "Retain Document Scope",
-      "placeholder": "session (default) or turn"
     },
     "recallBudget": {
       "label": "Recall Budget",
@@ -547,6 +505,10 @@
     "recallTypes": {
       "label": "Recall Types",
       "placeholder": "['observation'] (default)"
+    },
+    "preferObservations": {
+      "label": "Prefer Observations",
+      "placeholder": "false (default)"
     },
     "recallRoles": {
       "label": "Recall Roles",
@@ -575,74 +537,6 @@
     "recallInjectionPosition": {
       "label": "Recall Injection Position",
       "placeholder": "prepend, append, or user"
-    },
-    "sessionSummaryEnabled": {
-      "label": "Session Summary Enabled",
-      "placeholder": "false (enable rolling summary updates and recall enrichment)"
-    },
-    "sessionSummaryStorePath": {
-      "label": "Session Summary Store Path",
-      "placeholder": "~/.openclaw/data/hindsight-session-summaries.sqlite"
-    },
-    "sessionSummaryEnrichRecallQuery": {
-      "label": "Summary Recall Enrichment",
-      "placeholder": "false (append rolling summary to recall query)"
-    },
-    "sessionSummaryGeneratorProvider": {
-      "label": "Summary Generator Provider",
-      "placeholder": "Optional; routed by Hindsight API"
-    },
-    "sessionSummaryGeneratorModel": {
-      "label": "Summary Generator Model",
-      "placeholder": "Optional; routed by Hindsight API"
-    },
-    "sessionSummaryGeneratorBaseUrl": {
-      "label": "Summary Generator Base URL",
-      "placeholder": "Optional OpenAI-compatible base URL"
-    },
-    "sessionSummaryGeneratorApiKeyEnv": {
-      "label": "Summary Generator API Key Env",
-      "placeholder": "HINDSIGHT_LLM_API_KEY"
-    },
-    "sessionSummaryReuseHindsightLlmConfig": {
-      "label": "Reuse Hindsight LLM Config",
-      "placeholder": "true (default)"
-    },
-    "sessionSummaryUpdateEveryNTurns": {
-      "label": "Summary Update Every N Turns",
-      "placeholder": "Optional; independent from retain cadence"
-    },
-    "sessionSummaryMinUpdateEveryNTurns": {
-      "label": "Summary Minimum Update Cadence",
-      "placeholder": "2"
-    },
-    "sessionSummaryTimeoutMs": {
-      "label": "Summary Timeout (ms)",
-      "placeholder": "20000"
-    },
-    "sessionSummaryMaxInputChars": {
-      "label": "Summary Max Input Chars",
-      "placeholder": "16000"
-    },
-    "sessionSummaryMaxOutputChars": {
-      "label": "Summary Max Output Chars",
-      "placeholder": "2000"
-    },
-    "sessionSummaryMaxRecallQueryChars": {
-      "label": "Summary Recall Query Budget",
-      "placeholder": "800"
-    },
-    "sessionSummaryRecallQueryBudgetRatio": {
-      "label": "Summary Recall Query Ratio",
-      "placeholder": "0.25"
-    },
-    "sessionSummaryMinLatestQueryReserveChars": {
-      "label": "Summary Latest Query Reserve",
-      "placeholder": "400"
-    },
-    "sessionSummaryDropCompletedTodosAfterTurns": {
-      "label": "Summary Completed Todo Horizon",
-      "placeholder": "20"
     },
     "debug": {
       "label": "Debug"

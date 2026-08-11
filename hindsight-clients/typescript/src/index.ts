@@ -51,14 +51,22 @@ import type {
   TagGroupAndInput,
   TagGroupOrInput,
   TagGroupNotInput,
+  MinScores,
   AsyncOperationSubmitResponse,
+  CreateKnowledgePageResponse,
   CreateMentalModelResponse,
   DirectiveListResponse,
   DirectiveResponse,
   DocumentResponse,
+  KnowledgeNode,
+  KnowledgePageBundleResponse,
+  KnowledgePageResponse,
+  KnowledgePageSearchResponse,
+  KnowledgeTreeResponse,
   ListDocumentsResponse,
   MentalModelListResponse,
   MentalModelResponse,
+  MentalModelDryRunRefreshResult,
   UpdateDocumentResponse,
   VersionResponse,
 } from "../generated/types.gen";
@@ -84,6 +92,8 @@ export interface HindsightClientOptions {
    * Deno runtimes. Defaults to `hindsight-client-typescript/<version>`.
    */
   userAgent?: string;
+  /** Optional headers sent with every request. */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -120,11 +130,30 @@ export interface MemoryItemInput {
   update_mode?: "replace" | "append";
 }
 
+/**
+ * Warn when a caller-supplied operationId will be silently ignored.
+ *
+ * operationId only enables idempotent retries for asynchronous retain; on a
+ * synchronous request it is dropped before reaching the API, so surface the
+ * likely mistake instead of failing silently.
+ */
+function warnIfOperationIdDropped(
+  async: boolean | undefined,
+  operationId: string | null | undefined
+): void {
+  if (operationId != null && async !== true) {
+    console.warn(
+      "operationId is ignored for synchronous retain; pass async: true to enable idempotent retries."
+    );
+  }
+}
+
 export class HindsightClient {
   private client: Client;
 
   constructor(options: HindsightClientOptions) {
     const headers: Record<string, string> = {
+      ...options.headers,
       "User-Agent": options.userAgent ?? DEFAULT_USER_AGENT,
     };
     if (options.apiKey) {
@@ -188,6 +217,8 @@ export class HindsightClient {
       metadata?: Record<string, string>;
       documentId?: string;
       async?: boolean;
+      /** Optional caller-supplied UUID for idempotent async retries */
+      operationId?: string;
       entities?: EntityInput[];
       /** Optional list of tags for this memory */
       tags?: string[];
@@ -200,6 +231,7 @@ export class HindsightClient {
       signal?: AbortSignal;
     }
   ): Promise<RetainResponse> {
+    warnIfOperationIdDropped(options?.async, options?.operationId);
     return this.retainBatch(
       bankId,
       [
@@ -216,7 +248,13 @@ export class HindsightClient {
           strategy: options?.strategy,
         },
       ],
-      { async: options?.async, signal: options?.signal }
+      {
+        async: options?.async,
+        signal: options?.signal,
+        ...(options?.async === true && options.operationId != null
+          ? { operationId: options.operationId }
+          : {}),
+      }
     );
   }
 
@@ -230,9 +268,12 @@ export class HindsightClient {
       documentId?: string;
       documentTags?: string[];
       async?: boolean;
+      /** Optional caller-supplied UUID for idempotent async retries */
+      operationId?: string;
       signal?: AbortSignal;
     }
   ): Promise<RetainResponse> {
+    warnIfOperationIdDropped(options?.async, options?.operationId);
     const processedItems = items.map((item) => ({
       content: item.content,
       context: item.context,
@@ -259,6 +300,9 @@ export class HindsightClient {
         items: itemsWithDocId,
         document_tags: options?.documentTags,
         async: options?.async,
+        ...(options?.async === true && options.operationId != null
+          ? { operation_id: options.operationId }
+          : {}),
       },
       signal: options?.signal,
     });
@@ -317,6 +361,8 @@ export class HindsightClient {
     query: string,
     options?: {
       types?: string[];
+      /** When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact a returned observation was consolidated from, so the observation supersedes it (no duplicate content). Disabled by default; no effect unless 'observation' and at least one raw type are both in types. */
+      preferObservations?: boolean;
       maxTokens?: number;
       budget?: Budget;
       trace?: boolean;
@@ -335,6 +381,8 @@ export class HindsightClient {
       tagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact";
       /** Compound tag filter using boolean groups. Groups are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. Mutually exclusive with tags/tagsMatch. */
       tagGroups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput>;
+      /** Optional per-stage score floors, e.g. {semantic: 0.2, final: 0.5}. 'semantic' and 'keyword' are retrieval-level cutoffs; 'reranker' and 'final' are applied to the scored results after reranking. Any omitted stage imposes no floor. */
+      minScores?: MinScores;
       signal?: AbortSignal;
     }
   ): Promise<RecallResponse> {
@@ -344,6 +392,7 @@ export class HindsightClient {
       body: {
         query,
         types: options?.types,
+        prefer_observations: options?.preferObservations,
         max_tokens: options?.maxTokens,
         budget: options?.budget || "mid",
         trace: options?.trace,
@@ -365,6 +414,7 @@ export class HindsightClient {
         tags: options?.tags,
         tags_match: options?.tagsMatch,
         tag_groups: options?.tagGroups,
+        min_scores: options?.minScores,
       },
       signal: options?.signal,
     });
@@ -448,6 +498,7 @@ export class HindsightClient {
       consolidationState?: "failed" | "pending" | "done";
       state?: "valid" | "invalidated";
       documentId?: string;
+      entityId?: string;
       signal?: AbortSignal;
     }
   ): Promise<ListMemoryUnitsResponse> {
@@ -462,6 +513,7 @@ export class HindsightClient {
         consolidation_state: options?.consolidationState,
         state: options?.state,
         document_id: options?.documentId,
+        entity_id: options?.entityId,
       },
       signal: options?.signal,
     });
@@ -493,7 +545,7 @@ export class HindsightClient {
       dispositionEmpathy?: number;
       /** Steers what gets extracted during retain(). Injected alongside built-in rules. */
       retainMission?: string;
-      /** Fact extraction mode: 'concise' (default), 'verbose', or 'custom'. */
+      /** Fact extraction mode: 'concise' (default), 'verbose', 'custom', 'verbatim', or 'chunks'. */
       retainExtractionMode?: string;
       /** Custom extraction prompt (only active when retainExtractionMode is 'custom'). */
       retainCustomInstructions?: string;
@@ -505,6 +557,12 @@ export class HindsightClient {
       enableObservations?: boolean;
       /** Controls what gets synthesised into observations. Replaces built-in rules. */
       observationsMission?: string;
+      /** Run the temporal retrieval arm during recall, and the date-aware query analysis feeding it. */
+      enableTemporalRetrieval?: boolean;
+      /** Run the entity/link graph traversal arm during recall. */
+      enableGraphRetrieval?: boolean;
+      /** Rerank fused candidates with the cross-encoder. False returns the RRF order. */
+      enableReranking?: boolean;
       signal?: AbortSignal;
     } = {}
   ): Promise<BankProfileResponse> {
@@ -527,6 +585,9 @@ export class HindsightClient {
         retain_structured_chunk_size: options.retainStructuredChunkSize,
         enable_observations: options.enableObservations,
         observations_mission: options.observationsMission,
+        enable_temporal_retrieval: options.enableTemporalRetrieval,
+        enable_graph_retrieval: options.enableGraphRetrieval,
+        enable_reranking: options.enableReranking,
       },
       signal: options.signal,
     });
@@ -599,6 +660,12 @@ export class HindsightClient {
       retainStructuredChunkSize?: number;
       enableObservations?: boolean;
       observationsMission?: string;
+      /** Run the temporal retrieval arm during recall, and the date-aware query analysis feeding it. */
+      enableTemporalRetrieval?: boolean;
+      /** Run the entity/link graph traversal arm during recall. */
+      enableGraphRetrieval?: boolean;
+      /** Rerank fused candidates with the cross-encoder. False returns the RRF order. */
+      enableReranking?: boolean;
       /** How skeptical vs trusting (1=trusting, 5=skeptical). */
       dispositionSkepticism?: number;
       /** How literally to interpret information (1=flexible, 5=literal). */
@@ -622,6 +689,11 @@ export class HindsightClient {
       updates.enable_observations = options.enableObservations;
     if (options.observationsMission !== undefined)
       updates.observations_mission = options.observationsMission;
+    if (options.enableTemporalRetrieval !== undefined)
+      updates.enable_temporal_retrieval = options.enableTemporalRetrieval;
+    if (options.enableGraphRetrieval !== undefined)
+      updates.enable_graph_retrieval = options.enableGraphRetrieval;
+    if (options.enableReranking !== undefined) updates.enable_reranking = options.enableReranking;
     if (options.dispositionSkepticism !== undefined)
       updates.disposition_skepticism = options.dispositionSkepticism;
     if (options.dispositionLiteralism !== undefined)
@@ -799,7 +871,13 @@ export class HindsightClient {
       id?: string;
       tags?: string[];
       maxTokens?: number;
-      trigger?: { refreshAfterConsolidation?: boolean };
+      trigger?: {
+        refreshAfterConsolidation?: boolean;
+        /** How this model's tags filter source memories on refresh. If omitted, a tagged model defaults to 'all_strict' (a memory must carry every one of the model's tags), which silently drops memories that only carry a subset. Set 'any' to match memories carrying any of the tags — the same default recall/reflect use. */
+        tagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+        /** Compound tag filter using boolean groups; overrides the model's flat tags/tagsMatch during refresh. */
+        tagGroups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput>;
+      };
       signal?: AbortSignal;
     }
   ): Promise<CreateMentalModelResponse> {
@@ -813,7 +891,11 @@ export class HindsightClient {
         tags: options?.tags,
         max_tokens: options?.maxTokens,
         trigger: options?.trigger
-          ? { refresh_after_consolidation: options.trigger.refreshAfterConsolidation }
+          ? {
+              refresh_after_consolidation: options.trigger.refreshAfterConsolidation,
+              tags_match: options.trigger.tagsMatch,
+              tag_groups: options.trigger.tagGroups,
+            }
           : undefined,
       },
       signal: options?.signal,
@@ -827,12 +909,26 @@ export class HindsightClient {
    */
   async listMentalModels(
     bankId: string,
-    options?: { tags?: string[]; signal?: AbortSignal }
+    options?: {
+      tags?: string[];
+      tagsMatch?: "any" | "all" | "exact";
+      /** Exclude large provenance chains with "metadata" or "content" when they are not needed. */
+      detail?: "metadata" | "content" | "full";
+      limit?: number;
+      offset?: number;
+      signal?: AbortSignal;
+    }
   ): Promise<MentalModelListResponse> {
     const response = await sdk.listMentalModels({
       client: this.client,
       path: { bank_id: bankId },
-      query: { tags: options?.tags },
+      query: {
+        tags: options?.tags,
+        ...(options?.tagsMatch !== undefined ? { tags_match: options.tagsMatch } : {}),
+        ...(options?.detail !== undefined ? { detail: options.detail } : {}),
+        ...(options?.limit !== undefined ? { limit: options.limit } : {}),
+        ...(options?.offset !== undefined ? { offset: options.offset } : {}),
+      },
       signal: options?.signal,
     });
 
@@ -845,11 +941,16 @@ export class HindsightClient {
   async getMentalModel(
     bankId: string,
     mentalModelId: string,
-    options?: { signal?: AbortSignal }
+    options?: {
+      /** Exclude large provenance chains with "metadata" or "content" when they are not needed. */
+      detail?: "metadata" | "content" | "full";
+      signal?: AbortSignal;
+    }
   ): Promise<MentalModelResponse> {
     const response = await sdk.getMentalModel({
       client: this.client,
       path: { bank_id: bankId, mental_model_id: mentalModelId },
+      ...(options?.detail ? { query: { detail: options.detail } } : {}),
       signal: options?.signal,
     });
 
@@ -871,6 +972,30 @@ export class HindsightClient {
     });
 
     return this.validateResponse(response, "refreshMentalModel");
+  }
+
+  /**
+   * Preview what a refresh would do to a mental model without changing it.
+   *
+   * The production refresh pipeline with two writes skipped — the content and the
+   * watermark — so what it reports is what the next refresh will do. Reports the
+   * mode it ran in and why, the scope and window it read, the evidence it would
+   * ground on, and a diff from the stored content to the content it would write.
+   *
+   * Not configurable, and costs the same LLM tokens as a real refresh.
+   */
+  async dryRunRefreshMentalModel(
+    bankId: string,
+    mentalModelId: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<MentalModelDryRunRefreshResult> {
+    const response = await sdk.dryRunRefreshMentalModel({
+      client: this.client,
+      path: { bank_id: bankId, mental_model_id: mentalModelId },
+      signal: options?.signal,
+    });
+
+    return this.validateResponse(response, "dryRunRefreshMentalModel");
   }
 
   /**
@@ -956,6 +1081,213 @@ export class HindsightClient {
     });
 
     return this.validateResponse(response, "getMentalModelHistory");
+  }
+
+  /**
+   * Get the knowledge base as a nested folder/page tree.
+   *
+   * Page bodies are not included — fetch one with `getKnowledgePage`.
+   */
+  async getKnowledgeBaseTree(
+    bankId: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<KnowledgeTreeResponse> {
+    const response = await sdk.getKnowledgeBaseTree({
+      client: this.client,
+      path: { bank_id: bankId },
+      signal: options?.signal,
+    });
+
+    return this.validateResponse(response, "getKnowledgeBaseTree");
+  }
+
+  /**
+   * Create a knowledge-base folder.
+   */
+  async createKnowledgeFolder(
+    bankId: string,
+    name: string,
+    options?: { parentId?: string | null; signal?: AbortSignal }
+  ): Promise<KnowledgeNode> {
+    const response = await sdk.createKnowledgeFolder({
+      client: this.client,
+      path: { bank_id: bankId },
+      body: { name, parent_id: options?.parentId },
+      signal: options?.signal,
+    });
+
+    return this.validateResponse(response, "createKnowledgeFolder");
+  }
+
+  /**
+   * Create a knowledge-base page. Content is generated asynchronously — poll the
+   * returned `operation_id` to know when the first build has finished.
+   *
+   * Omit `trigger` to use the page defaults (observation-only, delta mode,
+   * refresh after consolidation); a supplied trigger replaces those defaults
+   * rather than merging with them.
+   */
+  async createKnowledgePage(
+    bankId: string,
+    name: string,
+    sourceQuery: string,
+    options?: {
+      parentId?: string | null;
+      /** Scopes which memories the page is built from. A `type:<x>` tag also sets the page's rendered type. */
+      tags?: string[];
+      maxTokens?: number;
+      trigger?: {
+        mode?: "full" | "delta";
+        refreshAfterConsolidation?: boolean;
+        refreshCron?: string | null;
+        factTypes?: Array<"world" | "experience" | "observation">;
+        excludeMentalModels?: boolean;
+        excludeMentalModelIds?: string[];
+        tagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+        tagGroups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput>;
+        includeChunks?: boolean;
+        recallMaxTokens?: number;
+        recallChunksMaxTokens?: number;
+      };
+      signal?: AbortSignal;
+    }
+  ): Promise<CreateKnowledgePageResponse> {
+    const response = await sdk.createKnowledgePage({
+      client: this.client,
+      path: { bank_id: bankId },
+      body: {
+        name,
+        source_query: sourceQuery,
+        parent_id: options?.parentId,
+        tags: options?.tags,
+        max_tokens: options?.maxTokens,
+        trigger: options?.trigger
+          ? {
+              mode: options.trigger.mode,
+              refresh_after_consolidation: options.trigger.refreshAfterConsolidation,
+              refresh_cron: options.trigger.refreshCron,
+              fact_types: options.trigger.factTypes,
+              exclude_mental_models: options.trigger.excludeMentalModels,
+              exclude_mental_model_ids: options.trigger.excludeMentalModelIds,
+              tags_match: options.trigger.tagsMatch,
+              tag_groups: options.trigger.tagGroups,
+              include_chunks: options.trigger.includeChunks,
+              recall_max_tokens: options.trigger.recallMaxTokens,
+              recall_chunks_max_tokens: options.trigger.recallChunksMaxTokens,
+            }
+          : undefined,
+      },
+      signal: options?.signal,
+    });
+
+    return this.validateResponse(response, "createKnowledgePage");
+  }
+
+  /**
+   * Get a knowledge page rendered as a markdown document (frontmatter + body).
+   */
+  async getKnowledgePage(
+    bankId: string,
+    pageId: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<KnowledgePageResponse> {
+    const response = await sdk.getKnowledgePage({
+      client: this.client,
+      path: { bank_id: bankId, page_id: pageId },
+      signal: options?.signal,
+    });
+
+    return this.validateResponse(response, "getKnowledgePage");
+  }
+
+  /**
+   * Hybrid search (full-text + vector) over the bank's knowledge pages.
+   */
+  async searchKnowledgeBase(
+    bankId: string,
+    query: string,
+    options?: { limit?: number; signal?: AbortSignal }
+  ): Promise<KnowledgePageSearchResponse> {
+    const response = await sdk.searchKnowledgeBase({
+      client: this.client,
+      path: { bank_id: bankId },
+      query: {
+        q: query,
+        ...(options?.limit !== undefined ? { limit: options.limit } : {}),
+      },
+      signal: options?.signal,
+    });
+
+    return this.validateResponse(response, "searchKnowledgeBase");
+  }
+
+  /**
+   * Rename/move a knowledge node and/or update a page's options.
+   *
+   * Only the fields present in `options` are sent, so passing `parentId: null`
+   * explicitly moves the node to the root.
+   */
+  async updateKnowledgeNode(
+    bankId: string,
+    nodeId: string,
+    options: {
+      name?: string;
+      parentId?: string | null;
+      /** Pages only — changing it rebuilds the page against the new question. */
+      sourceQuery?: string;
+      /** Pages only — replaces the page's tags (pass [] to clear). */
+      tags?: string[];
+      maxTokens?: number;
+      signal?: AbortSignal;
+    }
+  ): Promise<KnowledgeNode> {
+    const response = await sdk.updateKnowledgeNode({
+      client: this.client,
+      path: { bank_id: bankId, node_id: nodeId },
+      body: {
+        ...(options.name !== undefined ? { name: options.name } : {}),
+        ...("parentId" in options ? { parent_id: options.parentId } : {}),
+        ...(options.sourceQuery !== undefined ? { source_query: options.sourceQuery } : {}),
+        ...(options.tags !== undefined ? { tags: options.tags } : {}),
+        ...(options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {}),
+      },
+      signal: options.signal,
+    });
+
+    return this.validateResponse(response, "updateKnowledgeNode");
+  }
+
+  /**
+   * Delete a knowledge folder or page and its whole subtree.
+   */
+  async deleteKnowledgeNode(
+    bankId: string,
+    nodeId: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<unknown> {
+    const response = await sdk.deleteKnowledgeNode({
+      client: this.client,
+      path: { bank_id: bankId, node_id: nodeId },
+      signal: options?.signal,
+    });
+
+    return this.validateResponse(response, "deleteKnowledgeNode");
+  }
+
+  /**
+   * Export the knowledge base as a portable markdown bundle.
+   */
+  async exportKnowledgeBase(
+    bankId: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<KnowledgePageBundleResponse> {
+    const response = await sdk.exportKnowledgeBase({
+      client: this.client,
+      path: { bank_id: bankId },
+      signal: options?.signal,
+    });
+
+    return this.validateResponse(response, "exportKnowledgeBase");
   }
 
   /**
@@ -1102,14 +1434,22 @@ export type {
   TagGroupAndInput,
   TagGroupOrInput,
   TagGroupNotInput,
+  MinScores,
   AsyncOperationSubmitResponse,
+  CreateKnowledgePageResponse,
   CreateMentalModelResponse,
   DirectiveListResponse,
   DirectiveResponse,
   DocumentResponse,
+  KnowledgeNode,
+  KnowledgePageBundleResponse,
+  KnowledgePageResponse,
+  KnowledgePageSearchResponse,
+  KnowledgeTreeResponse,
   ListDocumentsResponse,
   MentalModelListResponse,
   MentalModelResponse,
+  MentalModelDryRunRefreshResult,
   UpdateDocumentResponse,
   VersionResponse,
 };

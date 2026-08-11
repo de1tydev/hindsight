@@ -70,7 +70,7 @@ docker run -it --pull always --name hindsight --restart unless-stopped -p 8888:8
 >API: http://localhost:8888
 >UI: http://localhost:9999
 
-You can modify the LLM provider by setting `HINDSIGHT_API_LLM_PROVIDER`. Valid options are `openai`, `anthropic`, `gemini`, `groq`, `ollama`, `lmstudio`, and `minimax`. The documentation provides more details on [supported models](https://hindsight.vectorize.io/developer/models).
+You can modify the LLM provider by setting `HINDSIGHT_API_LLM_PROVIDER`. Valid options are `openai`, `anthropic`, `gemini`, `groq`, `ollama`, `lmstudio`, `minimax`, and `atlas` ([Atlas Cloud](https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=hindsight)). The documentation provides more details on [supported models](https://hindsight.vectorize.io/developer/models).
 
 
 
@@ -250,7 +250,7 @@ Recall performs 4 retrieval strategies in parallel:
 - Graph: Entity/temporal/causal links
 - Temporal: Time range filtering
 
-![Retain Operation](hindsight-docs/static/img/recall-operation.webp)
+![Recall Operation](hindsight-docs/static/img/recall-operation.webp)
 
 The individual results from the retrievals are merged, then ordered by relevance using reciprocal rank fusion and a cross-encoder reranking model.
 
@@ -276,7 +276,7 @@ client = Hindsight(base_url="http://localhost:8888")
 client.reflect(bank_id="my-bank", query="What should I know about Alice?")
 ```
 
-![Retain Operation](hindsight-docs/static/img/reflect-operation.webp)
+![Reflect Operation](hindsight-docs/static/img/reflect-operation.webp)
 
 ---
 
@@ -298,7 +298,7 @@ client.reflect(bank_id="my-bank", query="What should I know about Alice?")
 ---
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=vectorize-io/hindsight&type=date&legend=top-left)](https://www.star-history.com/#vectorize-io/hindsight&type=date&legend=top-left)
+[![Star history](https://raw.githubusercontent.com/vectorize-io/hindsight/main/.github/star-history/chart.svg)](https://github.com/vectorize-io/hindsight/stargazers)
 ---
 
 ## Supported Platforms
