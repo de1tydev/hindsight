@@ -84,6 +84,7 @@ SCRIPT_FILES=(
     "scripts/lib/daemon.py"
     "scripts/lib/llm.py"
     "scripts/lib/state.py"
+    "scripts/lib/upgrade_notice.py"
 )
 
 # Parse arguments
