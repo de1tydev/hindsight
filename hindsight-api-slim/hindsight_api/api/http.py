@@ -2282,6 +2282,38 @@ class MentalModelListResponse(BaseModel):
     items: list[MentalModelResponse]
 
 
+class SearchMentalModelsRequest(BaseModel):
+    """Semantic mental-model search request for latency-sensitive consumers."""
+
+    query: str = Field(min_length=1)
+    max_results: int = Field(default=3, ge=1, le=20)
+    max_tokens: int = Field(default=2048, ge=1, le=32768)
+    min_relevance: float | None = Field(default=None, ge=-1.0, le=1.0)
+    tags: list[str] | None = None
+    tags_match: Literal["any", "all", "exact"] = "any"
+
+
+class MentalModelSearchResult(BaseModel):
+    id: str
+    name: str
+    content: str
+    tags: list[str] = FieldWithDefault(list)
+    relevance: float
+    updated_at: str | None = None
+    may_be_stale: bool = Field(
+        description=(
+            "Conservative bank-watermark freshness signal. False is exact; true means "
+            "the bank has newer memories and this model may need an exact refresh check."
+        )
+    )
+    staleness_reason: str | None = None
+    truncated: bool = False
+
+
+class MentalModelSearchResponse(BaseModel):
+    items: list[MentalModelSearchResult]
+
+
 # =========================================================================
 # KNOWLEDGE BASE (folders + pages over mental models, rendered as markdown)
 # =========================================================================
@@ -5087,6 +5119,45 @@ def _register_routes(app: FastAPI):
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in GET /v1/default/banks/{bank_id}/mental-models: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/mental-models/search",
+        response_model=MentalModelSearchResponse,
+        summary="Search mental models",
+        description=(
+            "Semantically search user-curated mental models with a bounded token budget. "
+            "Designed for low-latency agent context injection."
+        ),
+        operation_id="search_mental_models",
+        tags=["Mental Models"],
+    )
+    async def api_search_mental_models(
+        bank_id: str,
+        body: SearchMentalModelsRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        try:
+            matches = await app.state.memory.search_mental_models(
+                bank_id=bank_id,
+                query=body.query,
+                max_results=body.max_results,
+                max_tokens=body.max_tokens,
+                min_relevance=body.min_relevance,
+                tags=body.tags,
+                tags_match=body.tags_match,
+                request_context=request_context,
+            )
+            return MentalModelSearchResponse(items=[MentalModelSearchResult(**m) for m in matches])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in POST /v1/default/banks/{bank_id}/mental-models/search: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get(

@@ -11637,6 +11637,96 @@ class MemoryEngine(MemoryEngineInterface):
 
             return [self._row_to_mental_model(row, detail=detail) for row in rows]
 
+    async def search_mental_models(
+        self,
+        bank_id: str,
+        query: str,
+        *,
+        max_results: int = 3,
+        max_tokens: int = 2048,
+        min_relevance: float | None = None,
+        tags: list[str] | None = None,
+        tags_match: str = "any",
+        request_context: "RequestContext",
+    ) -> list[dict[str, Any]]:
+        """Semantically search mental models for bounded prompt injection.
+
+        This deliberately uses the bank-wide write watermark as a cheap,
+        conservative freshness signal.  Per-model exact staleness checks scan
+        the model's memory scope and are too expensive for every agent turn.
+        """
+        await self._authenticate_tenant(request_context)
+        if self._operation_validator:
+            from hindsight_api.extensions import BankReadContext, BankReadOperation
+
+            ctx = BankReadContext(
+                bank_id=bank_id,
+                operation=BankReadOperation.LIST_MENTAL_MODELS,
+                request_context=request_context,
+            )
+            await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+
+        query = (query or "").strip()
+        if not query:
+            return []
+
+        from .retain import embedding_utils
+        from .token_encoding import truncate_to_tokens
+
+        embeddings = await embedding_utils.generate_embeddings_batch(
+            self.embeddings,
+            [query],
+            input_type="query",
+        )
+        if not embeddings or not embeddings[0]:
+            return []
+
+        backend = await self._get_backend()
+        from .memories import get_memories
+
+        async with acquire_with_retry(backend) as conn:
+            freshness = await get_memories().consolidation_freshness(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+            )
+            result = await tool_search_mental_models(
+                self,
+                conn,
+                bank_id,
+                query,
+                embeddings[0],
+                max_results=max_results,
+                tags=tags,
+                tags_match=tags_match,
+                last_memory_write_at=freshness.get("last_memory_write_at"),
+                exact_staleness=False,
+            )
+
+        remaining_tokens = max_tokens
+        matches: list[dict[str, Any]] = []
+        for model in result["mental_models"]:
+            if min_relevance is not None and model["relevance"] < min_relevance:
+                continue
+            if remaining_tokens <= 0:
+                break
+            content = model.get("content") or ""
+            if not content.strip() or content.strip() == MENTAL_MODEL_PENDING_CONTENT:
+                continue
+            truncated = truncate_to_tokens(content, remaining_tokens)
+            output_tokens = min(truncated.original_tokens, remaining_tokens)
+            matches.append(
+                {
+                    **{key: value for key, value in model.items() if key != "is_stale"},
+                    "content": truncated.text,
+                    "may_be_stale": model["is_stale"],
+                    "truncated": truncated.original_tokens > remaining_tokens,
+                }
+            )
+            remaining_tokens -= output_tokens
+
+        return matches
+
     async def get_mental_model(
         self,
         bank_id: str,

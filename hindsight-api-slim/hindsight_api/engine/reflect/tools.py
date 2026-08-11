@@ -68,6 +68,7 @@ async def tool_search_mental_models(
     tag_groups: "list | None" = None,
     exclude_ids: list[str] | None = None,
     last_memory_write_at: datetime | None = None,
+    exact_staleness: bool = True,
 ) -> dict[str, Any]:
     """
     Search user-curated mental models by semantic similarity.
@@ -147,9 +148,16 @@ async def tool_search_mental_models(
         # LLM turns to save a query. No watermark (absent, or an empty bank) → ask.
         if last_memory_write_at is not None and not _may_need_refresh(last_refreshed_at, last_memory_write_at):
             is_stale = False
+            staleness_reason = None
+        elif not exact_staleness:
+            # Fast, conservative mode for latency-sensitive auto-recall.  A
+            # newer bank write may be outside this model's scope, so True here
+            # means "may be stale"; False remains exact.
+            is_stale = True
+            staleness_reason = "bank has newer memories; this model's scope may still be current"
         else:
             is_stale = await memory_engine.compute_mental_model_is_stale(conn, bank_id, row)
-        staleness_reason = "new in-scope memories ingested since last refresh" if is_stale else None
+            staleness_reason = "new in-scope memories ingested since last refresh" if is_stale else None
 
         mental_models.append(
             {

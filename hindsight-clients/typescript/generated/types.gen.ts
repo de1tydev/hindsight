@@ -3365,6 +3365,60 @@ export type MentalModelResponse = {
 };
 
 /**
+ * MentalModelSearchResponse
+ */
+export type MentalModelSearchResponse = {
+  /**
+   * Items
+   */
+  items: Array<MentalModelSearchResult>;
+};
+
+/**
+ * MentalModelSearchResult
+ */
+export type MentalModelSearchResult = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Name
+   */
+  name: string;
+  /**
+   * Content
+   */
+  content: string;
+  /**
+   * Tags
+   */
+  tags?: Array<string>;
+  /**
+   * Relevance
+   */
+  relevance: number;
+  /**
+   * Updated At
+   */
+  updated_at?: string | null;
+  /**
+   * May Be Stale
+   *
+   * Conservative bank-watermark freshness signal. False is exact; true means the bank has newer memories and this model may need an exact refresh check.
+   */
+  may_be_stale: boolean;
+  /**
+   * Staleness Reason
+   */
+  staleness_reason?: string | null;
+  /**
+   * Truncated
+   */
+  truncated?: boolean;
+};
+
+/**
  * MentalModelTraceToolCall
  *
  * One reflect tool call made during a refresh.
@@ -4550,6 +4604,38 @@ export type RetryOperationResponse = {
    * Operation Id
    */
   operation_id: string;
+};
+
+/**
+ * SearchMentalModelsRequest
+ *
+ * Semantic mental-model search request for latency-sensitive consumers.
+ */
+export type SearchMentalModelsRequest = {
+  /**
+   * Query
+   */
+  query: string;
+  /**
+   * Max Results
+   */
+  max_results?: number;
+  /**
+   * Max Tokens
+   */
+  max_tokens?: number;
+  /**
+   * Min Relevance
+   */
+  min_relevance?: number | null;
+  /**
+   * Tags
+   */
+  tags?: Array<string> | null;
+  /**
+   * Tags Match
+   */
+  tags_match?: "any" | "all" | "exact";
 };
 
 /**
@@ -6032,6 +6118,43 @@ export type CreateMentalModelResponses = {
 
 export type CreateMentalModelResponse2 =
   CreateMentalModelResponses[keyof CreateMentalModelResponses];
+
+export type SearchMentalModelsData = {
+  body: SearchMentalModelsRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/mental-models/search";
+};
+
+export type SearchMentalModelsErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type SearchMentalModelsError = SearchMentalModelsErrors[keyof SearchMentalModelsErrors];
+
+export type SearchMentalModelsResponses = {
+  /**
+   * Successful Response
+   */
+  200: MentalModelSearchResponse;
+};
+
+export type SearchMentalModelsResponse =
+  SearchMentalModelsResponses[keyof SearchMentalModelsResponses];
 
 export type DeleteMentalModelData = {
   body?: never;

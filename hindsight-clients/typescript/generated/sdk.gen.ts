@@ -226,6 +226,9 @@ import type {
   SearchKnowledgeBaseData,
   SearchKnowledgeBaseErrors,
   SearchKnowledgeBaseResponses,
+  SearchMentalModelsData,
+  SearchMentalModelsErrors,
+  SearchMentalModelsResponses,
   TestBankLlmData,
   TestBankLlmErrors,
   TestBankLlmResponses,
@@ -588,6 +591,27 @@ export const createMentalModel = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({
     url: "/v1/default/banks/{bank_id}/mental-models",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Search mental models
+ *
+ * Semantically search user-curated mental models with a bounded token budget. Designed for low-latency agent context injection.
+ */
+export const searchMentalModels = <ThrowOnError extends boolean = false>(
+  options: Options<SearchMentalModelsData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    SearchMentalModelsResponses,
+    SearchMentalModelsErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/search",
     ...options,
     headers: {
       "Content-Type": "application/json",

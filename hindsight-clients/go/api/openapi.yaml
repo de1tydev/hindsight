@@ -1121,6 +1121,50 @@ paths:
       summary: Create mental model
       tags:
       - Mental Models
+  /v1/default/banks/{bank_id}/mental-models/search:
+    post:
+      description: Semantically search user-curated mental models with a bounded token
+        budget. Designed for low-latency agent context injection.
+      operationId: search_mental_models
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchMentalModelsRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MentalModelSearchResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Search mental models
+      tags:
+      - Mental Models
   /v1/default/banks/{bank_id}/mental-models/{mental_model_id}:
     delete:
       description: Delete a mental model.
@@ -8205,6 +8249,93 @@ components:
       - id
       - name
       title: MentalModelResponse
+    MentalModelSearchResponse:
+      example:
+        items:
+        - may_be_stale: true
+          staleness_reason: staleness_reason
+          updated_at: updated_at
+          name: name
+          truncated: false
+          id: id
+          content: content
+          relevance: 0.8008281904610115
+          tags:
+          - tags
+          - tags
+        - may_be_stale: true
+          staleness_reason: staleness_reason
+          updated_at: updated_at
+          name: name
+          truncated: false
+          id: id
+          content: content
+          relevance: 0.8008281904610115
+          tags:
+          - tags
+          - tags
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/MentalModelSearchResult'
+          type: array
+      required:
+      - items
+      title: MentalModelSearchResponse
+    MentalModelSearchResult:
+      example:
+        may_be_stale: true
+        staleness_reason: staleness_reason
+        updated_at: updated_at
+        name: name
+        truncated: false
+        id: id
+        content: content
+        relevance: 0.8008281904610115
+        tags:
+        - tags
+        - tags
+      properties:
+        id:
+          title: Id
+          type: string
+        name:
+          title: Name
+          type: string
+        content:
+          title: Content
+          type: string
+        tags:
+          default: []
+          items:
+            type: string
+          type: array
+        relevance:
+          title: Relevance
+          type: number
+        updated_at:
+          nullable: true
+          type: string
+        may_be_stale:
+          description: Conservative bank-watermark freshness signal. False is exact;
+            true means the bank has newer memories and this model may need an exact
+            refresh check.
+          title: May Be Stale
+          type: boolean
+        staleness_reason:
+          nullable: true
+          type: string
+        truncated:
+          default: false
+          title: Truncated
+          type: boolean
+      required:
+      - content
+      - id
+      - may_be_stale
+      - name
+      - relevance
+      title: MentalModelSearchResult
     MentalModelTraceToolCall:
       description: |-
         One reflect tool call made during a refresh.
@@ -9402,6 +9533,55 @@ components:
       - operation_id
       - success
       title: RetryOperationResponse
+    SearchMentalModelsRequest:
+      description: Semantic mental-model search request for latency-sensitive consumers.
+      example:
+        max_tokens: 19751
+        query: query
+        max_results: 2
+        tags_match: any
+        min_relevance: -0.706837403899411
+        tags:
+        - tags
+        - tags
+      properties:
+        query:
+          minLength: 1
+          title: Query
+          type: string
+        max_results:
+          default: 3
+          maximum: 20.0
+          minimum: 1.0
+          title: Max Results
+          type: integer
+        max_tokens:
+          default: 2048
+          maximum: 32768.0
+          minimum: 1.0
+          title: Max Tokens
+          type: integer
+        min_relevance:
+          maximum: 1.0
+          minimum: -1.0
+          nullable: true
+          type: number
+        tags:
+          items:
+            type: string
+          nullable: true
+          type: array
+        tags_match:
+          default: any
+          enum:
+          - any
+          - all
+          - exact
+          title: Tags Match
+          type: string
+      required:
+      - query
+      title: SearchMentalModelsRequest
     SourceFactsIncludeOptions:
       description: Options for including source facts for observation-type results.
       properties:

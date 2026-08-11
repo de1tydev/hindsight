@@ -2,6 +2,7 @@
 
 import re
 import uuid
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -122,6 +123,44 @@ async def test_tool_search_mental_models_exact_empty_scope_selects_global_models
     assert "(tags IS NULL OR tags = '{}')" in re.sub(r"\s+", " ", query).strip()
     assert args == ["test-global-mental-model-scope", "[0.1, 0.2]", 5]
     assert result["mental_models"] == []
+
+
+@pytest.mark.asyncio
+async def test_tool_search_mental_models_supports_conservative_staleness() -> None:
+    """Auto-recall must not run an exact scoped-memory scan per matched model."""
+    refreshed_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    conn = MagicMock()
+    conn.fetch = AsyncMock(
+        return_value=[
+            {
+                "id": "model-1",
+                "name": "Operating rules",
+                "content": "Prefer runtime evidence.",
+                "tags": [],
+                "created_at": refreshed_at,
+                "last_refreshed_at": refreshed_at,
+                "trigger": {},
+                "relevance": 0.9,
+            }
+        ]
+    )
+    memory = MagicMock()
+    memory.compute_mental_model_is_stale = AsyncMock(side_effect=AssertionError("exact scan must not run"))
+
+    result = await tool_search_mental_models(
+        memory_engine=memory,
+        conn=conn,
+        bank_id="test-bank",
+        query="rules",
+        query_embedding=[0.1, 0.2],
+        last_memory_write_at=refreshed_at.replace(year=2027),
+        exact_staleness=False,
+    )
+
+    match = result["mental_models"][0]
+    assert match["is_stale"] is True
+    assert "may still be current" in match["staleness_reason"]
+    memory.compute_mental_model_is_stale.assert_not_awaited()
 
 
 @pytest.mark.asyncio
