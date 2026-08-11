@@ -22,6 +22,9 @@ class TestCastEnv:
     def test_int_invalid_returns_none(self):
         assert _cast_env("notanint", int) is None
 
+    def test_float_cast(self):
+        assert _cast_env("0.35", float) == 0.35
+
     def test_str_passthrough(self):
         assert _cast_env("hello", str) == "hello"
 
@@ -69,6 +72,18 @@ class TestLoadConfig:
         monkeypatch.setenv("HINDSIGHT_API_PORT", "9999")
         cfg = load_config()
         assert cfg["apiPort"] == 9999
+
+    def test_mental_model_env_overrides(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+        monkeypatch.setenv("HINDSIGHT_AUTO_RECALL_MENTAL_MODELS", "true")
+        monkeypatch.setenv("HINDSIGHT_MENTAL_MODEL_MAX_RESULTS", "2")
+        monkeypatch.setenv("HINDSIGHT_MENTAL_MODEL_MAX_TOKENS", "768")
+        monkeypatch.setenv("HINDSIGHT_MENTAL_MODEL_MIN_RELEVANCE", "0.5")
+        cfg = load_config()
+        assert cfg["autoRecallMentalModels"] is True
+        assert cfg["mentalModelMaxResults"] == 2
+        assert cfg["mentalModelMaxTokens"] == 768
+        assert cfg["mentalModelMinRelevance"] == 0.5
 
     def test_request_timeout_default_none(self, tmp_path, monkeypatch):
         monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))

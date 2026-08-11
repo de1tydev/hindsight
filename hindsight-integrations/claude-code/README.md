@@ -233,6 +233,10 @@ Auto-recall runs on every user prompt. It queries Hindsight for relevant memorie
 | `recallTagGroups` | `HINDSIGHT_RECALL_TAG_GROUPS` | `null` | Optional compound tag filter passed through to the recall API. The env var must be JSON. |
 | `recallAdditionalBankFilters` | `HINDSIGHT_RECALL_ADDITIONAL_BANK_FILTERS` | `{}` | Optional per-bank tag filter overrides for banks listed in `recallAdditionalBanks`, keyed by bank ID. Each value may set `recallTags`, `recallTagsMatch`, and `recallTagGroups`. The env var must be JSON. |
 | `recallPromptPreamble` | — | built-in string | Text placed above the recalled memories in the injected context block. Customize this to change how Claude interprets the memories. |
+| `autoRecallMentalModels` | `HINDSIGHT_AUTO_RECALL_MENTAL_MODELS` | `false` | Search user-curated mental models before ordinary memory recall and inject matches first. |
+| `mentalModelMaxResults` | `HINDSIGHT_MENTAL_MODEL_MAX_RESULTS` | `3` | Maximum number of matched mental models injected for one prompt. |
+| `mentalModelMaxTokens` | `HINDSIGHT_MENTAL_MODEL_MAX_TOKENS` | `1024` | Shared content-token budget across matched mental models. |
+| `mentalModelMinRelevance` | `HINDSIGHT_MENTAL_MODEL_MIN_RELEVANCE` | `0.35` | Minimum vector relevance required for automatic mental-model injection. |
 
 ---
 

@@ -27,6 +27,10 @@ DEFAULTS = {
         "conflicting). Only use memories that are directly useful to continue "
         "this conversation; ignore the rest:"
     ),
+    "autoRecallMentalModels": False,
+    "mentalModelMaxResults": 3,
+    "mentalModelMaxTokens": 1024,
+    "mentalModelMinRelevance": 0.35,
     # Retain
     "autoRetain": True,
     "retainMode": "full-session",
@@ -83,6 +87,10 @@ ENV_OVERRIDES = {
     "HINDSIGHT_RECALL_TAGS_MATCH": ("recallTagsMatch", str),
     "HINDSIGHT_RECALL_TAG_GROUPS": ("recallTagGroups", dict),
     "HINDSIGHT_RECALL_ADDITIONAL_BANK_FILTERS": ("recallAdditionalBankFilters", dict),
+    "HINDSIGHT_AUTO_RECALL_MENTAL_MODELS": ("autoRecallMentalModels", bool),
+    "HINDSIGHT_MENTAL_MODEL_MAX_RESULTS": ("mentalModelMaxResults", int),
+    "HINDSIGHT_MENTAL_MODEL_MAX_TOKENS": ("mentalModelMaxTokens", int),
+    "HINDSIGHT_MENTAL_MODEL_MIN_RELEVANCE": ("mentalModelMinRelevance", float),
     "HINDSIGHT_API_PORT": ("apiPort", int),
     "HINDSIGHT_DAEMON_IDLE_TIMEOUT": ("daemonIdleTimeout", int),
     "HINDSIGHT_REQUEST_TIMEOUT_SECONDS": ("requestTimeoutSeconds", int),
@@ -103,6 +111,8 @@ def _cast_env(value: str, typ):
             return value.lower() in ("true", "1", "yes")
         if typ is int:
             return int(value)
+        if typ is float:
+            return float(value)
         if typ is list:
             parsed = json.loads(value)
             if isinstance(parsed, list):

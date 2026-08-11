@@ -72,6 +72,24 @@ def filter_by_min_scores(results: list[dict], min_scores: dict, config: dict) ->
     return filtered
 
 
+def format_mental_models(models: list[dict]) -> str:
+    """Render matched mental models ahead of lower-level recalled memories."""
+    sections = []
+    for model in models:
+        freshness = (
+            "may be stale; verify against recalled memories and current reality"
+            if model.get("may_be_stale")
+            else "current at the bank write watermark"
+        )
+        truncated = " (truncated to the configured budget)" if model.get("truncated") else ""
+        sections.append(
+            f"### {model.get('name') or 'Mental model'}\n"
+            f"Relevance: {model.get('relevance', 0):.3f}; freshness: {freshness}{truncated}\n\n"
+            f"{model.get('content') or ''}"
+        )
+    return "\n\n".join(sections)
+
+
 def read_transcript_messages(transcript_path: str) -> list:
     """Read messages from a JSONL transcript file for multi-turn context.
 
@@ -182,7 +200,25 @@ def main():
     tags_match = config.get("recallTagsMatch") if recall_tags or tag_groups else None
     additional_bank_filters = config.get("recallAdditionalBankFilters") or {}
 
-    # Call Hindsight recall API
+    mental_models = []
+    if config.get("autoRecallMentalModels"):
+        debug_log(config, f"Searching mental models in bank '{bank_id}'")
+        try:
+            model_response = client.search_mental_models(
+                bank_id=bank_id,
+                query=query,
+                max_results=config.get("mentalModelMaxResults", 3),
+                max_tokens=config.get("mentalModelMaxTokens", 1024),
+                min_relevance=config.get("mentalModelMinRelevance", 0.35),
+                timeout=10,
+            )
+            mental_models = model_response.get("items", [])
+        except Exception as e:
+            print(f"[Hindsight] Mental model search failed: {e}", file=sys.stderr)
+
+    # Call Hindsight recall API. Keep this independent from mental-model search
+    # so either source can still provide useful context when the other fails.
+    response = {"results": []}
     try:
         response = client.recall(
             bank_id=bank_id,
@@ -197,7 +233,6 @@ def main():
         )
     except Exception as e:
         print(f"[Hindsight] Recall failed: {e}", file=sys.stderr)
-        return
 
     results = response.get("results", [])
 
@@ -238,14 +273,23 @@ def main():
 
     results = filter_by_min_scores(results, config.get("recallMinScores") or {}, config)
 
-    if not results:
-        debug_log(config, "No memories found")
+    if not mental_models and not results:
+        debug_log(config, "No mental models or memories found")
         return
 
-    debug_log(config, f"Injecting {len(results)} memories")
+    debug_log(config, f"Injecting {len(mental_models)} mental models and {len(results)} memories")
 
-    # Format context message — exact match of Openclaw's format
-    memories_formatted = format_memories(results)
+    context_parts = []
+    if mental_models:
+        context_parts.append(
+            "Matched user-curated mental models. Use these first. A model marked as possibly stale is "
+            "guidance, not current ground truth; verify it against lower-level memories and live evidence.\n\n"
+            + format_mental_models(mental_models)
+        )
+    if results:
+        context_parts.append(format_memories(results))
+    context_body = "\n\n".join(context_parts)
+
     preamble = config.get("recallPromptPreamble", "")
     current_time = format_current_time()
 
@@ -253,7 +297,7 @@ def main():
         f"<hindsight_memories>\n"
         f"{preamble}\n"
         f"Current time - {current_time}\n\n"
-        f"{memories_formatted}\n"
+        f"{context_body}\n"
         f"</hindsight_memories>"
     )
 
@@ -265,6 +309,7 @@ def main():
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "bank_id": bank_id,
             "result_count": len(results),
+            "mental_model_count": len(mental_models),
         },
     )
 
