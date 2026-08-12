@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "repository": "vectorize-io/hindsight",
+  "repository": "de1tydev/hindsight",
   "backfilledAt": "2026-08-03T10:36:26.721Z",
   "backfill": [
     {
@@ -1000,6 +1000,10 @@
     {
       "date": "2026-08-07",
       "stars": 19183
+    },
+    {
+      "date": "2026-08-12",
+      "stars": 0
     }
   ]
 }
