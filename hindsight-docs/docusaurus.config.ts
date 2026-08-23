@@ -1,63 +1,79 @@
-import {themes as prismThemes} from 'prism-react-renderer';
-import type {Config} from '@docusaurus/types';
-import type * as Preset from '@docusaurus/preset-classic';
+import { themes as prismThemes } from "prism-react-renderer";
+import type { Config } from "@docusaurus/types";
+import type * as Preset from "@docusaurus/preset-classic";
 
 const umamiUrl = process.env.UMAMI_URL;
 const umamiWebsiteId = process.env.UMAMI_WEBSITE_ID;
 
 // Announcement bar - supports HTML for links
 // Set to empty string '' to hide the bar
-const ANNOUNCEMENT_BAR = 'Hindsight is State-of-the-Art on Memory for AI Agents | <a href="https://arxiv.org/abs/2512.12818" target="_blank">Read the paper →</a>';
+const ANNOUNCEMENT_BAR =
+  'Hindsight is State-of-the-Art on Memory for AI Agents | <a href="https://arxiv.org/abs/2512.12818" target="_blank">Read the paper →</a>';
 
 const config: Config = {
-  title: 'Hindsight',
-  tagline: 'Hindsight: Agent Memory That Works Like Human Memory',
-  favicon: 'img/favicon.png',
+  title: "Hindsight",
+  tagline: "Hindsight: Agent Memory That Works Like Human Memory",
+  favicon: "img/favicon.png",
 
   future: {
     v4: true,
+    // Docusaurus Faster, opted in one flag at a time. The full `true` preset
+    // does not work here: both the SWC JS minifier and the SSG worker threads
+    // crash while rendering /api-reference (Redoc needs a `Prism` global that
+    // neither setup provides). Everything else is safe and roughly halves the
+    // cold build.
+    experimental_faster: {
+      swcJsLoader: true,
+      swcJsMinimizer: false, // breaks Redoc SSG: "ReferenceError: Prism is not defined"
+      swcHtmlMinimizer: false,
+      lightningCssMinimizer: true,
+      mdxCrossCompilerCache: true,
+      rspackBundler: true,
+      rspackPersistentCache: true,
+      ssgWorkerThreads: false, // same Redoc SSG failure on /api-reference
+    },
   },
 
   markdown: {
     mermaid: true,
   },
 
-  url: 'https://hindsight.vectorize.io',
-  baseUrl: '/',
+  url: "https://hindsight.vectorize.io",
+  baseUrl: "/",
 
-  organizationName: 'vectorize-io',
-  projectName: 'hindsight',
+  organizationName: "vectorize-io",
+  projectName: "hindsight",
   trailingSlash: false,
 
-  onBrokenLinks: 'throw',
+  onBrokenLinks: "throw",
 
   i18n: {
-    defaultLocale: 'en',
-    locales: ['en'],
+    defaultLocale: "en",
+    locales: ["en"],
   },
 
   headTags: [
     {
-      tagName: 'link',
+      tagName: "link",
       attributes: {
-        rel: 'preconnect',
-        href: 'https://fonts.googleapis.com',
+        rel: "preconnect",
+        href: "https://fonts.googleapis.com",
       },
     },
     {
-      tagName: 'link',
+      tagName: "link",
       attributes: {
-        rel: 'preconnect',
-        href: 'https://fonts.gstatic.com',
-        crossorigin: 'anonymous',
+        rel: "preconnect",
+        href: "https://fonts.gstatic.com",
+        crossorigin: "anonymous",
       },
     },
     {
-      tagName: 'link',
+      tagName: "link",
       attributes: {
-        rel: 'stylesheet',
-        href: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap',
-        media: 'print',
+        rel: "stylesheet",
+        href: "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap",
+        media: "print",
         onload: "this.media='all'",
       },
     },
@@ -70,7 +86,7 @@ const config: Config = {
             src: `${umamiUrl}/script.js`,
             async: true,
             defer: true,
-            'data-website-id': umamiWebsiteId,
+            "data-website-id": umamiWebsiteId,
           },
         ]
       : []),
@@ -78,11 +94,11 @@ const config: Config = {
 
   presets: [
     [
-      'classic',
+      "classic",
       {
         docs: {
-          sidebarPath: './sidebars.ts',
-          routeBasePath: '/',
+          sidebarPath: "./sidebars.ts",
+          routeBasePath: "/",
           // Whether to include the "current" (Next / unreleased) docs version.
           //
           // Controlled by the single explicit env var INCLUDE_CURRENT_VERSION.
@@ -93,25 +109,25 @@ const config: Config = {
           // across Docusaurus hot-reload paths and used to cause the Next
           // version to disappear intermittently when editing files.
           onlyIncludeVersions: (() => {
-            const includeCurrent = process.env.INCLUDE_CURRENT_VERSION === 'true';
+            const includeCurrent = process.env.INCLUDE_CURRENT_VERSION === "true";
             let released: string[] = [];
             try {
-              released = require('./versions.json') as string[];
+              released = require("./versions.json") as string[];
             } catch {
               // No versions.json yet — nothing has been released.
               return undefined;
             }
-            return includeCurrent ? ['current', ...released] : released;
+            return includeCurrent ? ["current", ...released] : released;
           })(),
           // Disable version badges on all versions
           versions: (() => {
-            const config: Record<string, {badge: boolean}> = {
-              current: {badge: false},
+            const config: Record<string, { badge: boolean }> = {
+              current: { badge: false },
             };
             try {
-              const versions = require('./versions.json') as string[];
+              const versions = require("./versions.json") as string[];
               versions.forEach((v: string) => {
-                config[v] = {badge: false};
+                config[v] = { badge: false };
               });
             } catch {
               // No versions yet
@@ -121,44 +137,46 @@ const config: Config = {
         },
         blog: {
           showReadingTime: true,
-          blogTitle: 'Hindsight Blog',
-          blogDescription: 'Updates, insights, and deep dives into agent memory',
-          postsPerPage: 'ALL',
+          blogTitle: "Hindsight Blog",
+          blogDescription: "Updates, insights, and deep dives into agent memory",
+          postsPerPage: "ALL",
           blogSidebarCount: 0,
         },
         theme: {
-          customCss: './src/css/custom.css',
+          customCss: "./src/css/custom.css",
         },
       } satisfies Preset.Options,
     ],
     [
-      'redocusaurus',
+      "redocusaurus",
       {
         specs: [
           {
-            id: 'hindsight-api',
-            spec: 'static/openapi.json',
-            route: '/api-reference',
-            url: '/openapi.json',
+            id: "hindsight-api",
+            spec: "static/openapi.json",
+            route: "/api-reference",
+            url: "/openapi.json",
           },
         ],
         theme: {
-          primaryColor: '#0074d9',
+          primaryColor: "#0074d9",
           sidebar: {
-            backgroundColor: '#09090b',
+            backgroundColor: "#09090b",
           },
           rightPanel: {
-            backgroundColor: '#18181b',
+            backgroundColor: "#18181b",
           },
           typography: {
-            fontSize: '15px',
-            fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+            fontSize: "15px",
+            fontFamily:
+              "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
             headings: {
-              fontFamily: "'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+              fontFamily:
+                "'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
             },
             code: {
               fontFamily: "'JetBrains Mono', 'Fira Code', 'SF Mono', Monaco, Consolas, monospace",
-              fontSize: '13px',
+              fontSize: "13px",
             },
           },
         },
@@ -166,7 +184,7 @@ const config: Config = {
           scrollYOffset: 60,
           nativeScrollbars: true,
           expandSingleSchemaField: true,
-          expandResponses: '200,201',
+          expandResponses: "200,201",
         },
       },
     ],
@@ -174,42 +192,42 @@ const config: Config = {
 
   plugins: [
     [
-      '@docusaurus/plugin-content-docs',
+      "@docusaurus/plugin-content-docs",
       {
-        id: 'integrations',
-        path: './docs-integrations',
-        routeBasePath: 'sdks/integrations',
+        id: "integrations",
+        path: "./docs-integrations",
+        routeBasePath: "sdks/integrations",
         // Unversioned plugin: gives the integration pages a sidebar generated
         // from src/data/integrations.json without versioning them.
-        sidebarPath: './sidebars-integrations.ts',
+        sidebarPath: "./sidebars-integrations.ts",
       },
     ],
     [
-      '@docusaurus/plugin-content-blog',
+      "@docusaurus/plugin-content-blog",
       {
-        id: 'guides',
-        routeBasePath: 'guides',
-        path: './guides',
+        id: "guides",
+        routeBasePath: "guides",
+        path: "./guides",
         showReadingTime: true,
-        postsPerPage: 'ALL',
+        postsPerPage: "ALL",
         blogSidebarCount: 0,
-        blogTitle: 'Guides',
-        blogDescription: 'In-depth guides for AI memory and agent development',
-        feedOptions: {type: []},
-        onUntruncatedBlogPosts: 'ignore',
+        blogTitle: "Guides",
+        blogDescription: "In-depth guides for AI memory and agent development",
+        feedOptions: { type: [] },
+        onUntruncatedBlogPosts: "ignore",
       },
     ],
   ],
 
   themes: [
-    '@docusaurus/theme-mermaid',
+    "@docusaurus/theme-mermaid",
     [
-      '@easyops-cn/docusaurus-search-local',
+      "@easyops-cn/docusaurus-search-local",
       {
         hashed: true,
-        docsRouteBasePath: '/',
+        docsRouteBasePath: "/",
         indexBlog: true,
-        blogRouteBasePath: '/blog',
+        blogRouteBasePath: "/blog",
         highlightSearchTermsOnTargetPage: false,
       },
     ],
@@ -218,176 +236,186 @@ const config: Config = {
   themeConfig: {
     ...(ANNOUNCEMENT_BAR && {
       announcementBar: {
-        id: 'announcement',
+        id: "announcement",
         content: ANNOUNCEMENT_BAR,
-        backgroundColor: '#0074d9',
-        textColor: '#ffffff',
+        backgroundColor: "#0074d9",
+        textColor: "#ffffff",
         isCloseable: false,
       },
     }),
-    image: 'img/logo.png',
+    image: "img/logo.png",
     colorMode: {
-      defaultMode: 'dark',
+      defaultMode: "dark",
       respectPrefersColorScheme: true,
     },
     navbar: {
       logo: {
-        alt: 'Hindsight Logo',
-        src: 'img/logo.png',
-        style: { height: '32px' },
+        alt: "Hindsight Logo",
+        src: "img/logo.png",
+        style: { height: "32px" },
       },
       items: [
         {
-          type: 'doc',
-          docId: 'developer/index',
-          position: 'left',
-          label: 'Developer',
-          className: 'navbar-item-developer',
+          type: "doc",
+          docId: "developer/index",
+          position: "left",
+          label: "Developer",
+          className: "navbar-item-developer",
         },
         {
-          to: '/integrations',
-          position: 'left',
-          label: 'Integrations',
-          className: 'navbar-item-integrations',
+          to: "/integrations",
+          position: "left",
+          label: "Integrations",
+          className: "navbar-item-integrations",
         },
         {
-          to: '/changelog',
-          position: 'left',
-          label: 'Changelog',
-          className: 'navbar-item-changelog',
+          to: "/changelog",
+          position: "left",
+          label: "Changelog",
+          className: "navbar-item-changelog",
         },
         {
-          type: 'dropdown',
-          label: 'Resources',
-          position: 'left',
-          className: 'navbar-item-resources',
+          href: "https://learn.hindsight.vectorize.io",
+          position: "left",
+          label: "Academy",
+          className: "navbar-item-academy",
+        },
+        {
+          type: "dropdown",
+          label: "Resources",
+          position: "left",
+          className: "navbar-item-resources",
           items: [
             {
-              to: '/templates',
-              label: 'Bank Templates Hub',
-              customProps: { icon: 'lu-layout-template' },
+              to: "/templates",
+              label: "Bank Templates Hub",
+              customProps: { icon: "lu-layout-template" },
             },
             {
-              to: '/best-practices',
-              label: 'Best Practices',
-              customProps: { icon: 'lu-star' },
+              to: "/best-practices",
+              label: "Best Practices",
+              customProps: { icon: "lu-star" },
             },
             {
-              to: '/faq',
-              label: 'FAQ',
-              customProps: { icon: 'lu-circle-help' },
+              to: "/faq",
+              label: "FAQ",
+              customProps: { icon: "lu-circle-help" },
             },
             {
-              to: '/cookbook',
-              label: 'Cookbook',
-              customProps: { icon: 'lu-book' },
+              to: "/cookbook",
+              label: "Cookbook",
+              customProps: { icon: "lu-book" },
             },
             {
-              to: '/blog',
-              label: 'Blog',
-              customProps: { icon: 'lu-rss' },
+              to: "/blog",
+              label: "Blog",
+              customProps: { icon: "lu-rss" },
             },
             {
-              to: '/api-reference',
-              label: 'API Reference',
-              customProps: { icon: 'lu-book-open' },
+              to: "/api-reference",
+              label: "API Reference",
+              customProps: { icon: "lu-book-open" },
             },
             {
-              href: 'https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg',
-              label: 'Community',
-              customProps: { icon: 'si-slack' },
+              href: "https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg",
+              label: "Community",
+              customProps: { icon: "si-slack" },
             },
             {
-              href: 'https://benchmarks.hindsight.vectorize.io/',
-              label: 'Benchmarks',
-              customProps: { icon: 'lu-chart-bar' },
+              href: "https://benchmarks.hindsight.vectorize.io/",
+              label: "Benchmarks",
+              customProps: { icon: "lu-chart-bar" },
             },
             {
-              href: 'https://benchmarks.hindsight.vectorize.io/',
-              label: 'Which Model Should I Use?',
-              customProps: { icon: 'lu-cpu' },
+              href: "https://benchmarks.hindsight.vectorize.io/",
+              label: "Which Model Should I Use?",
+              customProps: { icon: "lu-cpu" },
             },
             {
-              href: 'https://arxiv.org/abs/2512.12818',
-              label: 'Paper',
-              customProps: { icon: 'lu-file-text' },
+              href: "https://arxiv.org/abs/2512.12818",
+              label: "Paper",
+              customProps: { icon: "lu-file-text" },
             },
           ],
         },
         {
-          type: 'docsVersionDropdown',
-          position: 'right',
-          className: 'navbar-item-version',
+          type: "docsVersionDropdown",
+          position: "right",
+          className: "navbar-item-version",
         },
         {
-          href: 'https://ui.hindsight.vectorize.io/signup',
-          position: 'right',
-          label: 'Cloud',
-          className: 'navbar-item-cloud',
+          href: "https://ui.hindsight.vectorize.io/signup",
+          position: "right",
+          label: "Cloud",
+          className: "navbar-item-cloud",
         },
         {
-          href: 'https://github.com/vectorize-io/hindsight',
-          position: 'right',
-          label: 'GitHub',
-          className: 'header-github-link',
+          href: "https://github.com/vectorize-io/hindsight",
+          position: "right",
+          label: "GitHub",
+          className: "header-github-link",
         },
       ],
     },
     footer: {
-      style: 'dark',
+      style: "dark",
       links: [
         {
-          title: 'Documentation',
+          title: "Documentation",
           items: [
             {
-              label: 'Introduction',
-              to: '/',
+              label: "Introduction",
+              to: "/",
             },
             {
-              label: 'Developer Guide',
-              to: '/developer/installation',
+              label: "Developer Guide",
+              to: "/developer/installation",
             },
             {
-              label: 'Clients & Integrations',
-              to: '/sdks/python',
+              label: "Clients & Integrations",
+              to: "/sdks/python",
             },
             {
-              label: 'API Reference',
-              to: '/api-reference/',
+              label: "API Reference",
+              to: "/api-reference/",
             },
           ],
         },
         {
-          title: 'Resources',
+          title: "Resources",
           items: [
             {
-              label: 'Cookbook',
-              to: '/cookbook',
+              label: "Cookbook",
+              to: "/cookbook",
             },
             {
-              label: 'Changelog',
-              to: '/changelog',
+              label: "Changelog",
+              to: "/changelog",
             },
             {
-              label: 'Guides',
-              to: '/guides',
+              label: "Guides",
+              to: "/guides",
             },
             {
-              label: 'Hindsight Cloud',
-              href: 'https://ui.hindsight.vectorize.io/signup',
+              label: "Academy",
+              href: "https://learn.hindsight.vectorize.io",
+            },
+            {
+              label: "Hindsight Cloud",
+              href: "https://ui.hindsight.vectorize.io/signup",
             },
           ],
         },
         {
-          title: 'Community',
+          title: "Community",
           items: [
             {
-              label: 'GitHub',
-              href: 'https://github.com/vectorize-io/hindsight',
+              label: "GitHub",
+              href: "https://github.com/vectorize-io/hindsight",
             },
             {
-              label: 'Slack',
-              href: 'https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg',
+              label: "Slack",
+              href: "https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg",
             },
           ],
         },
@@ -397,42 +425,42 @@ const config: Config = {
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
-      additionalLanguages: ['bash', 'json', 'python', 'rust'],
+      additionalLanguages: ["bash", "json", "python", "rust"],
     },
     mermaid: {
       theme: {
-        light: 'base',
-        dark: 'base',
+        light: "base",
+        dark: "base",
       },
       options: {
         themeVariables: {
           // Gradient start (#0074d9 blue) for nodes
-          primaryColor: '#0074d9',
-          primaryTextColor: '#ffffff',
-          primaryBorderColor: '#005db0',
+          primaryColor: "#0074d9",
+          primaryTextColor: "#ffffff",
+          primaryBorderColor: "#005db0",
           // Gradient end (#009296 teal) for edges/clusters
-          secondaryColor: '#009296',
-          secondaryTextColor: '#ffffff',
-          secondaryBorderColor: '#007a7d',
+          secondaryColor: "#009296",
+          secondaryTextColor: "#ffffff",
+          secondaryBorderColor: "#007a7d",
           // Tertiary
-          tertiaryColor: '#e6f7f8',
-          tertiaryTextColor: '#1e293b',
+          tertiaryColor: "#e6f7f8",
+          tertiaryTextColor: "#1e293b",
           // Lines and edges - gradient end color
-          lineColor: '#009296',
+          lineColor: "#009296",
           // Text
-          textColor: '#1e293b',
+          textColor: "#1e293b",
           // Node specific - gradient start
-          nodeBkg: '#0074d9',
-          nodeTextColor: '#ffffff',
-          nodeBorder: '#005db0',
+          nodeBkg: "#0074d9",
+          nodeTextColor: "#ffffff",
+          nodeBorder: "#005db0",
           // Main background
-          mainBkg: '#0074d9',
+          mainBkg: "#0074d9",
           // Clusters/subgraphs - gradient end
-          clusterBkg: 'rgba(0, 146, 150, 0.08)',
-          clusterBorder: '#009296',
+          clusterBkg: "rgba(0, 146, 150, 0.08)",
+          clusterBorder: "#009296",
           // Labels
-          edgeLabelBackground: 'transparent',
-          labelBackground: 'transparent',
+          edgeLabelBackground: "transparent",
+          labelBackground: "transparent",
           // Font - Inter to match body text
           fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
         },

@@ -5,8 +5,15 @@
  * (missions + git/chat retain strategies), retains memories, reflects, drains async operations, and
  * creates knowledge pages. Nothing here knows about opencode/claude-code/etc.
  */
-import { CODING_BANK_TEMPLATE, PAGE_MAX_TOKENS, PAGE_TRIGGER, PAGES } from "./missions";
-import { sleep } from "./util";
+import {
+  CODING_BANK_STRUCTURE,
+  CODING_BANK_TEMPLATE,
+  PAGE_MAX_TOKENS,
+  PAGE_TRIGGER,
+  PAGES,
+} from "./missions";
+import { pool, semverGte, sleep } from "./util";
+import type { RetainStamp } from "./retain-stamp";
 
 /** One node of GET /knowledge-base/tree. Only the fields this client reads. */
 export interface KnowledgeNode {
@@ -23,12 +30,49 @@ export interface ClientOpts {
   apiToken?: string;
   bank: string;
   log?: (msg: string) => void;
+  /** Cap on concurrent retain-related requests (drain op polls, deepen pools). Default 10. */
+  maxParallelRetains?: number;
 }
 
 export interface RetainOpts {
   timestamp?: string; // when the content occurred (temporal ranking)
   metadata?: Record<string, string>; // source provenance (returned with recalls)
-  async?: boolean; // enqueue server-side (default) vs block on extraction
+  /** "append" concatenates `content` onto the stored document instead of replacing it — the whole
+   *  point of the live write-back cursor (core/retain-cursor.ts). Requires a document_id. */
+  updateMode?: "append";
+  /** Deterministic operation id: re-submitting the same payload returns the original operation
+   *  instead of admitting a second one. Ignored by servers older than 0.8.6. */
+  operationId?: string;
+}
+
+/** First release whose retain endpoint honours a caller-supplied `operation_id` (#2937, v0.8.6).
+ *  Below it the field is silently ignored — unknown request fields are not rejected — so an append
+ *  could be applied twice without us ever knowing. Hence: no idempotency, no append. */
+export const MIN_IDEMPOTENT_RETAIN_VERSION = "0.8.6";
+
+/**
+ * Raised when the API rate-limits a request (HTTP 429), carrying how long it asked us to wait.
+ *
+ * A plain Error would be indistinguishable from a 500 or a network fault, and those want opposite
+ * treatment: a rate limit is a "not now, ask again" that the caller can honour, while a server
+ * error is not worth hammering. Callers that have somewhere safe to wait retry; the rest fail as
+ * before.
+ */
+export class RateLimitedError extends Error {
+  readonly code = "rate_limited";
+  constructor(readonly retryAfterMs: number) {
+    super(`rate limited; retry after ${Math.round(retryAfterMs / 1000)}s`);
+    this.name = "RateLimitedError";
+  }
+}
+
+/** Parse a `Retry-After` header (delta-seconds or HTTP-date) into ms; 0 when absent or unusable. */
+export function retryAfterMs(header: string | null | undefined): number {
+  if (!header) return 0;
+  const secs = Number(header.trim());
+  if (Number.isFinite(secs) && secs >= 0) return secs * 1000;
+  const at = Date.parse(header);
+  return Number.isNaN(at) ? 0 : Math.max(0, at - Date.now());
 }
 
 /** Raised when the target server predates the knowledge-pages API surface. */
@@ -42,6 +86,29 @@ export class KnowledgePagesUnavailableError extends Error {
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "error"]);
 
+/** Default cap on concurrent retain-related requests; configurable via `maxParallelRetains`. */
+export const DEFAULT_MAX_PARALLEL_RETAINS = 10;
+
+/** How long drain() pauses between poll cycles when the API did not rate-limit (429). */
+const POLL_CYCLE_MS = 5000;
+
+/** Minimum backoff after a 429 that carried no (or a shorter) Retry-After. */
+const RETRY_AFTER_FLOOR_MS = 10 * 1000;
+
+/**
+ * Ceiling on a single backoff, however long `Retry-After` asks for.
+ *
+ * The header is a server's hint, not a budget we owe it: a large value (an incident, a
+ * misconfigured limiter, a proxy inventing one) would otherwise park a drain for as long as it
+ * says — up to the whole `maxMs`, with the background seed frozen behind it. Capping keeps the
+ * signal without handing over the schedule; if the limit still applies, the next poll simply gets
+ * another 429 and backs off again.
+ */
+const RETRY_AFTER_CEILING_MS = 60 * 1000;
+
+/** Bank-level missions the template seeds once and then leaves alone (#2492). */
+const MISSION_FIELDS = ["reflect_mission", "retain_mission", "observations_mission"] as const;
+
 export class HindsightClient {
   readonly apiUrl: string;
   readonly apiToken?: string;
@@ -49,13 +116,17 @@ export class HindsightClient {
   readonly opIds: string[] = []; // async operation ids collected by retain(), for drain()
   /** Tri-state capability probe: unknown until the first page request, then cached. */
   knowledgePagesSupported: boolean | undefined;
+  /** Tri-state capability probe: unknown until the first append-mode retain, then cached. */
+  private idempotentRetain: boolean | undefined;
   private readonly log: (msg: string) => void;
+  readonly maxParallelRetains: number;
 
   constructor(o: ClientOpts) {
     this.apiUrl = o.apiUrl.replace(/\/$/, "");
     this.apiToken = o.apiToken;
     this.bank = o.bank;
     this.log = o.log ?? (() => {});
+    this.maxParallelRetains = o.maxParallelRetains || DEFAULT_MAX_PARALLEL_RETAINS;
   }
 
   private headers(): Record<string, string> {
@@ -83,12 +154,15 @@ export class HindsightClient {
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(15_000),
     });
+    if (r.status === 429 && !tolerate.includes(429))
+      throw new RateLimitedError(retryAfterMs(r.headers.get("retry-after")));
     if (!r.ok && r.status !== 404 && !tolerate.includes(r.status))
       throw new Error(`${method} ${url} -> ${r.status} ${await r.text()}`);
     return r;
   }
 
-  /** Retain one memory. Async by default: enqueue extraction server-side and collect its op-id for drain(). */
+  /** Retain one memory. ALWAYS async: enqueue extraction server-side and collect its op-id for
+   *  drain(). Nothing in this plugin can afford to block a coding agent's hook on extraction. */
   async retain(
     content: string,
     context: string,
@@ -106,15 +180,39 @@ export class HindsightClient {
     };
     if (opts.timestamp) item.timestamp = opts.timestamp;
     if (opts.metadata) item.metadata = opts.metadata;
-    const isAsync = opts.async !== false;
-    const r = await this.req("POST", this.bankUrl("/memories"), { items: [item], async: isAsync });
-    if (isAsync) {
-      try {
-        const j = (await r.json()) as { operation_id?: string };
-        if (j.operation_id) this.opIds.push(j.operation_id);
-      } catch {
-        /* ignore */
-      }
+    if (opts.updateMode) item.update_mode = opts.updateMode;
+    const body: Record<string, unknown> = { items: [item], async: true };
+    if (opts.operationId) body.operation_id = opts.operationId;
+    const r = await this.req("POST", this.bankUrl("/memories"), body);
+    try {
+      const j = (await r.json()) as { operation_id?: string };
+      if (j.operation_id) this.opIds.push(j.operation_id);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /**
+   * Whether this server honours `operation_id` on an async retain, and can therefore be appended to
+   * safely (see MIN_IDEMPOTENT_RETAIN_VERSION). Probed once per client via GET /version; anything
+   * unreachable, unparseable or older answers "no", which costs efficiency, never correctness.
+   */
+  async supportsIdempotentRetain(): Promise<boolean> {
+    if (this.idempotentRetain === undefined) {
+      this.idempotentRetain = await this.probeIdempotentRetain();
+      this.log(`server retain idempotency: ${this.idempotentRetain ? "supported" : "unavailable"}`);
+    }
+    return this.idempotentRetain;
+  }
+
+  private async probeIdempotentRetain(): Promise<boolean> {
+    try {
+      const r = await this.req("GET", `${this.apiUrl}/version`);
+      if (!r.ok) return false;
+      const j = (await r.json()) as { api_version?: string };
+      return semverGte(j.api_version, MIN_IDEMPOTENT_RETAIN_VERSION);
+    } catch {
+      return false;
     }
   }
 
@@ -153,12 +251,44 @@ export class HindsightClient {
       await this.req("DELETE", this.bankUrl());
       this.log(`[bank] reset ${this.bank}`);
     }
-    await this.req("POST", this.bankUrl("/import"), CODING_BANK_TEMPLATE);
+    // Seed the missions ONCE. After that they belong to whoever set them — see CODING_BANK_STRUCTURE.
+    const seeded = opts.reset ? false : await this.hasBankMissions();
+    await this.req(
+      "POST",
+      this.bankUrl("/import"),
+      seeded ? CODING_BANK_STRUCTURE : CODING_BANK_TEMPLATE
+    );
     this.log(
-      `[bank] template applied to ${this.bank}: missions, entity_labels {knowledge}, ` +
-        `strategies {git, gitlog, conversation, document}`
+      seeded
+        ? `[bank] structure applied to ${this.bank}: entity_labels {knowledge}, ` +
+            `strategies {git, gitlog, conversation, document} — missions left as configured`
+        : `[bank] template applied to ${this.bank}: missions, entity_labels {knowledge}, ` +
+            `strategies {git, gitlog, conversation, document}`
     );
     await this.seedPages();
+  }
+
+  /**
+   * Whether this bank already carries bank-level mission overrides — ours from an earlier seed, or
+   * the user's own edit. Either way they are not ours to overwrite.
+   *
+   * Reads the bank-scoped OVERRIDES, not the resolved config, so inherited global defaults don't
+   * read as "already set". A missing bank, or a deployment with the bank-config API switched off,
+   * answers false: there is nothing to preserve, and without that API a user cannot set per-bank
+   * missions in the first place.
+   */
+  private async hasBankMissions(): Promise<boolean> {
+    try {
+      const r = await this.req("GET", this.bankUrl("/config"));
+      if (!r.ok) return false;
+      const j = (await r.json()) as { overrides?: Record<string, unknown> };
+      return MISSION_FIELDS.some((f) => {
+        const v = j.overrides?.[f];
+        return typeof v === "string" && v.trim() !== "";
+      });
+    } catch {
+      return false;
+    }
   }
 
   /** Delete one document (cascades its memory units/links). Used by deepen's self-cleanup. */
@@ -182,7 +312,14 @@ export class HindsightClient {
     }
   }
 
-  /** Poll each enqueued operation by id until terminal. LIST only shows active ops, so per-id GET is reliable. */
+  /**
+   * Poll each enqueued operation by id until terminal. LIST only shows active ops, so per-id GET is reliable.
+   *
+   * Concurrency is capped at `maxParallelRetains` (the API rate-limits bursts, not single
+   * requests — a 200 to a lone GET with 429s under `Promise.all` over every pending op). A 429
+   * leaves the op pending and backs the next cycle off by its `Retry-After` (10s floor) instead
+   * of hammering the next cycle 5s later.
+   */
   async drain(ids: string[], label: string, maxMs = 60 * 60 * 1000): Promise<void> {
     if (!ids.length) return;
     this.log(`[wait] draining ${ids.length} ${label} operations …`);
@@ -190,24 +327,32 @@ export class HindsightClient {
     const pending = new Set(ids);
     let failed = 0;
     while (pending.size && Date.now() - start < maxMs) {
-      await Promise.all(
-        [...pending].map(async (id) => {
-          try {
-            const r = await fetch(this.bankUrl(`/operations/${id}`), { headers: this.headers() });
-            if (!r.ok) return;
-            const st = (((await r.json()) as { status?: string }).status || "").toLowerCase();
-            if (TERMINAL.has(st)) {
-              pending.delete(id);
-              if (st !== "completed") failed++;
-            }
-          } catch {
-            /* transient — retry next cycle */
+      // Cycle backoff: default 5s; any 429 in the cycle raises it to the longest Retry-After seen
+      // (floor 10s) so a rate-limited API gets room to recover before the next poll round.
+      let backoffMs = POLL_CYCLE_MS;
+      await pool([...pending], this.maxParallelRetains, async (id) => {
+        try {
+          const r = await fetch(this.bankUrl(`/operations/${id}`), { headers: this.headers() });
+          if (r.status === 429) {
+            backoffMs = Math.min(
+              RETRY_AFTER_CEILING_MS,
+              Math.max(backoffMs, RETRY_AFTER_FLOOR_MS, retryAfterMs(r.headers.get("retry-after")))
+            );
+            return; // op stays pending — retried after the backoff
           }
-        })
-      );
+          if (!r.ok) return;
+          const st = (((await r.json()) as { status?: string }).status || "").toLowerCase();
+          if (TERMINAL.has(st)) {
+            pending.delete(id);
+            if (st !== "completed") failed++;
+          }
+        } catch {
+          /* transient — retry next cycle */
+        }
+      });
       if (pending.size) {
         this.log(`  … ${pending.size}/${ids.length} ${label} ops pending`);
-        await sleep(5000);
+        await sleep(backoffMs);
       }
     }
     this.log(
@@ -414,6 +559,7 @@ export class HindsightClient {
     title: string;
     summary: string;
     relatesToPageId?: string;
+    stamp?: RetainStamp;
   }): Promise<{ page_id: string }> {
     // `/knowledge-base/pages` mints its OWN page id (kp-…); we can't set it. So for a new initiative
     // we create the page first and adopt the server-assigned id — that id is what the return value
@@ -444,14 +590,20 @@ export class HindsightClient {
     const content = `${verb}: ${args.title}. ${args.summary}`;
     // Unique marker document id (NOT pageId) so repeated captures accrue instead of replacing.
     const markerId = `initiative-marker-${this.slugify(args.title)}-${Date.now()}`;
-    await this.retain(
-      content,
-      "initiative marker",
-      markerId,
-      ["knowledge:feature-work", `relatedPageId:${pageId}`],
-      "document",
-      { async: true }
-    );
+    const tags = [
+      ...new Set([
+        ...(args.stamp?.tags ?? []),
+        "knowledge:feature-work",
+        `relatedPageId:${pageId}`,
+      ]),
+    ];
+    if (Object.keys(args.stamp?.metadata ?? {}).length) {
+      await this.retain(content, "initiative marker", markerId, tags, "document", {
+        metadata: args.stamp?.metadata,
+      });
+    } else {
+      await this.retain(content, "initiative marker", markerId, tags, "document");
+    }
     return { page_id: pageId };
   }
 

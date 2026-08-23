@@ -44,12 +44,16 @@ INTEGRATIONS: dict[str, IntegrationMeta] = {
     "agent-framework": IntegrationMeta("hindsight-agent-framework", "Microsoft Agent Framework"),
     "ag2": IntegrationMeta("hindsight-ag2"),
     "ai-sdk": IntegrationMeta("@vectorize-io/hindsight-ai-sdk", "AI SDK"),
+    "eliza": IntegrationMeta("@vectorize-io/hindsight-eliza", "elizaOS"),
     "chat": IntegrationMeta("@vectorize-io/hindsight-chat", "Chat SDK"),
     "openclaw": IntegrationMeta("@vectorize-io/hindsight-openclaw", "OpenClaw"),
     "langgraph": IntegrationMeta("hindsight-langgraph", "LangGraph"),
     "nemoclaw": IntegrationMeta("@vectorize-io/hindsight-nemoclaw", "NemoClaw"),
     "strands": IntegrationMeta("hindsight-strands", "Strands"),
     "claude-code": IntegrationMeta("hindsight-memory", "Claude Code"),
+    # Git-distributed plugin bundle (Agent Plugins standard), not a registry
+    # package — its changelog links to the source tree (see _package_url).
+    "agent-plugin": IntegrationMeta("hindsight-agent-plugin", "Agent Plugins"),
     "zcode": IntegrationMeta("hindsight-zcode", "ZCode"),
     "claude-agent-sdk": IntegrationMeta("hindsight-claude-agent-sdk", "Claude Agent SDK"),
     "llamaindex": IntegrationMeta("hindsight-llamaindex", "LlamaIndex"),
@@ -657,8 +661,10 @@ def _get_package_name(integration: str) -> str:
 
 
 def _package_url(integration: str, package_name: str) -> str:
-    if integration == "claude-code":
-        return "https://github.com/vectorize-io/hindsight/tree/main/hindsight-integrations/claude-code"
+    # Git-distributed plugin bundles have no npm/pypi package — link to the
+    # source tree instead of a registry page.
+    if integration in ("claude-code", "agent-plugin"):
+        return f"https://github.com/vectorize-io/hindsight/tree/main/hindsight-integrations/{integration}"
     if package_name.startswith("@"):
         return f"https://www.npmjs.com/package/{package_name}"
     return f"https://pypi.org/project/{package_name}/"

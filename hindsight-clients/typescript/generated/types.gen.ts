@@ -232,7 +232,7 @@ export type BankConfigUpdate = {
   /**
    * Updates
    *
-   * Configuration overrides. Keys can be in Python field format (llm_provider) or environment variable format (HINDSIGHT_API_LLM_PROVIDER). Only hierarchical fields can be overridden per-bank.
+   * Configuration overrides. Keys can be in Python field format (retain_extraction_mode) or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE). Only hierarchical fields can be overridden per-bank.
    */
   updates: {
     [key: string]: unknown;
@@ -426,7 +426,7 @@ export type BankStatsResponse = {
   /**
    * Pending Consolidation
    *
-   * Number of memories not yet processed into observations
+   * Number of source memories (world/experience) still queued for consolidation into observations. Excludes memories whose consolidation permanently failed — those are counted only in failed_consolidation — so this drains to 0 when the consolidator catches up.
    */
   pending_consolidation?: number;
   /**
@@ -684,6 +684,50 @@ export type BankTemplateConfig = {
    * Persist raw source text (documents.original_text / chunks.chunk_text). Set false to keep only derived facts.
    */
   store_document_text?: boolean | null;
+  /**
+   * Enable Auto Consolidation
+   *
+   * Automatically consolidate observations after retain
+   */
+  enable_auto_consolidation?: boolean | null;
+  /**
+   * Consolidation Max Memories Per Round
+   *
+   * Max memory units fed into a single consolidation round
+   */
+  consolidation_max_memories_per_round?: number | null;
+  /**
+   * Consolidation Llm Parallelism
+   *
+   * Number of consolidation LLM batches processed concurrently
+   */
+  consolidation_llm_parallelism?: number | null;
+  /**
+   * Recall Include Chunks
+   *
+   * Include raw chunks in recall results
+   */
+  recall_include_chunks?: boolean | null;
+  /**
+   * Recall Max Tokens
+   *
+   * Max tokens of results returned by recall
+   */
+  recall_max_tokens?: number | null;
+  /**
+   * Recall Chunks Max Tokens
+   *
+   * Max tokens of raw chunks returned by recall (when recall_include_chunks is set)
+   */
+  recall_chunks_max_tokens?: number | null;
+  /**
+   * Memory Defense
+   *
+   * Memory Defense policy for this bank (validated against the DefensePolicy schema on write)
+   */
+  memory_defense?: {
+    [key: string]: unknown;
+  } | null;
 };
 
 /**
@@ -1208,7 +1252,7 @@ export type CreateDirectiveRequest = {
   /**
    * Tags
    *
-   * Tags for filtering
+   * Directive execution scope. Empty means global; non-empty requires a matching reflect scope.
    */
   tags?: Array<string>;
 };
@@ -1520,6 +1564,27 @@ export type DispositionTraits = {
    * How much to consider emotional context (1=detached, 5=empathetic)
    */
   empathy: number;
+};
+
+/**
+ * DocumentExportSubmitResponse
+ *
+ * Response for the async document-export endpoint (202).
+ *
+ * The export runs in the background; poll the operations endpoint for status.
+ * On completion the operation's ``result_metadata`` carries ``download_url``
+ * (fetch the ZIP from GET /v1/default/files/download/{key}), ``storage_key``,
+ * ``byte_size``, and ``filename``.
+ */
+export type DocumentExportSubmitResponse = {
+  /**
+   * Operation Id
+   */
+  operation_id: string;
+  /**
+   * Status
+   */
+  status?: string;
 };
 
 /**
@@ -2722,6 +2787,32 @@ export type ListTagsResponse = {
    * Offset
    */
   offset: number;
+};
+
+/**
+ * LivenessResponse
+ *
+ * Payload for the API's DB-free liveness probe.
+ */
+export type LivenessResponse = {
+  /**
+   * Status
+   *
+   * Always "alive" — reaching this handler is the check
+   */
+  status: "alive";
+  /**
+   * Version
+   *
+   * Hindsight version this process is running
+   */
+  version: string;
+  /**
+   * Uptime Seconds
+   *
+   * Seconds since the process started
+   */
+  uptime_seconds: number;
 };
 
 /**
@@ -4052,6 +4143,12 @@ export type RecallResponse = {
   source_facts?: {
     [key: string]: RecallResult;
   } | null;
+  /**
+   * Source Facts Truncated
+   *
+   * Whether the source_facts map was cut short by the token budget. When true, some IDs in results[].source_fact_ids have no entry in source_facts — the budget ran out, the references are not dangling. Only set when source facts were requested.
+   */
+  source_facts_truncated?: boolean | null;
 };
 
 /**
@@ -4355,19 +4452,19 @@ export type ReflectRequest = {
   /**
    * Tags
    *
-   * Filter memories by tags during reflection. If not specified, all memories are considered.
+   * Scope raw facts, observations, mental models, and tagged directives during reflection. With no tags, memory retrieval is unfiltered while only untagged/global directives are loaded. Use tags=[] with tags_match='exact' to select the untagged/global scope.
    */
   tags?: Array<string> | null;
   /**
    * Tags Match
    *
-   * How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).
+   * How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged), or 'exact' (set equality). Untagged directives remain global in every mode.
    */
   tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
   /**
    * Tag Groups
    *
-   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}.
+   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. Mutually exclusive with tags.
    */
   tag_groups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput> | null;
   /**
@@ -5282,6 +5379,36 @@ export type HealthEndpointHealthGetResponses = {
    */
   200: unknown;
 };
+
+export type GetReadinessData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/health/ready";
+};
+
+export type GetReadinessResponses = {
+  /**
+   * Successful Response
+   */
+  200: unknown;
+};
+
+export type GetLivenessData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/health/live";
+};
+
+export type GetLivenessResponses = {
+  /**
+   * Successful Response
+   */
+  200: LivenessResponse;
+};
+
+export type GetLivenessResponse = GetLivenessResponses[keyof GetLivenessResponses];
 
 export type GetVersionData = {
   body?: never;
@@ -6781,13 +6908,13 @@ export type ListDirectivesData = {
     /**
      * Tags
      *
-     * Filter by tags
+     * Filter directives by execution scope. Omit or pass [] to list all directives.
      */
     tags?: Array<string> | null;
     /**
      * Tags Match
      *
-     * How to match tags
+     * How tagged directives match the requested scope. Untagged/global directives are included.
      */
     tags_match?: "any" | "all" | "exact";
     /**
@@ -7891,7 +8018,7 @@ export type ExportBankTemplateResponses = {
 export type ExportBankTemplateResponse =
   ExportBankTemplateResponses[keyof ExportBankTemplateResponses];
 
-export type ExportDocumentsData = {
+export type ExportDocumentsSyncRemovedData = {
   body?: never;
   headers?: {
     /**
@@ -7905,35 +8032,23 @@ export type ExportDocumentsData = {
      */
     bank_id: string;
   };
-  query?: {
-    /**
-     * Document Id
-     *
-     * Document id(s) to export; omit for all
-     */
-    document_id?: Array<string> | null;
-    /**
-     * Include Observations
-     *
-     * Also export consolidated observations (restored on import)
-     */
-    include_observations?: boolean;
-  };
+  query?: never;
   url: "/v1/default/banks/{bank_id}/document-transfer";
 };
 
-export type ExportDocumentsErrors = {
+export type ExportDocumentsSyncRemovedErrors = {
   /**
    * Validation Error
    */
   422: HttpValidationError;
 };
 
-export type ExportDocumentsError = ExportDocumentsErrors[keyof ExportDocumentsErrors];
+export type ExportDocumentsSyncRemovedError =
+  ExportDocumentsSyncRemovedErrors[keyof ExportDocumentsSyncRemovedErrors];
 
-export type ExportDocumentsResponses = {
+export type ExportDocumentsSyncRemovedResponses = {
   /**
-   * Transfer archive
+   * Successful Response
    */
   200: unknown;
 };
@@ -7980,6 +8095,89 @@ export type ImportDocumentsResponses = {
 };
 
 export type ImportDocumentsResponse = ImportDocumentsResponses[keyof ImportDocumentsResponses];
+
+export type ExportDocumentsData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: {
+    /**
+     * Document Id
+     *
+     * Document id(s) to export; omit for all
+     */
+    document_id?: Array<string> | null;
+    /**
+     * Include Observations
+     *
+     * Also export consolidated observations (restored on import; whole-bank only)
+     */
+    include_observations?: boolean;
+  };
+  url: "/v1/default/banks/{bank_id}/document-transfer/export";
+};
+
+export type ExportDocumentsErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ExportDocumentsError = ExportDocumentsErrors[keyof ExportDocumentsErrors];
+
+export type ExportDocumentsResponses = {
+  /**
+   * Successful Response
+   */
+  202: DocumentExportSubmitResponse;
+};
+
+export type ExportDocumentsResponse = ExportDocumentsResponses[keyof ExportDocumentsResponses];
+
+export type DownloadFileData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Key
+     */
+    key: string;
+  };
+  query?: never;
+  url: "/v1/default/files/download/{key}";
+};
+
+export type DownloadFileErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type DownloadFileError = DownloadFileErrors[keyof DownloadFileErrors];
+
+export type DownloadFileResponses = {
+  /**
+   * Stored file
+   */
+  200: unknown;
+};
 
 export type GetBankTemplateSchemaData = {
   body?: never;

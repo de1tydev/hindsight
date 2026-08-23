@@ -126,7 +126,8 @@ class CodexLLM(LLMInterface):
         api_key: str,  # Will be ignored, reads from the Codex auth.json (CODEX_HOME or ~/.codex)
         base_url: str,
         model: str,
-        reasoning_effort: str = "low",
+        reasoning_effort: str | None = None,
+        extra_body: dict[str, Any] | None = None,
         **kwargs: Any,
     ):
         """Initialize Codex LLM provider."""
@@ -177,6 +178,7 @@ class CodexLLM(LLMInterface):
         # Reasoning summary controls presentation separately from the backend's
         # reasoning effort, which is sent unchanged in each request payload.
         self.reasoning_summary = self._map_reasoning_effort(reasoning_effort)
+        self._extra_body = dict(extra_body or {})
 
         # HTTP client for SSE streaming
         self._client = httpx.AsyncClient(timeout=120.0)
@@ -327,12 +329,26 @@ class CodexLLM(LLMInterface):
             except CodexRefreshExpiredError:
                 raise
 
-    def _map_reasoning_effort(self, effort: str) -> str:
+    def _reasoning_payload(self, summary: str) -> dict[str, str]:
+        """Build the ``reasoning`` request object.
+
+        ``effort`` is present only when the operator configured one: an unset
+        HINDSIGHT_API_*_REASONING_EFFORT means the model runs at its own default
+        effort, and Hindsight does not pick one on the operator's behalf.
+        """
+        payload = {"summary": summary}
+        if self.reasoning_effort is not None:
+            payload["effort"] = self.reasoning_effort
+        return payload
+
+    def _map_reasoning_effort(self, effort: str | None) -> str:
         """
         Map standard reasoning effort to Codex reasoning summary format.
 
         Args:
-            effort: Standard effort level ("low", "medium", "high", "xhigh").
+            effort: Standard effort level ("low", "medium", "high", "xhigh"), or None
+                when unconfigured — the summary then stays "auto", the same neutral
+                presentation an unrecognised level gets.
 
         Returns:
             Codex reasoning summary: "concise", "detailed", or "auto".
@@ -343,7 +359,7 @@ class CodexLLM(LLMInterface):
             "high": "detailed",
             "xhigh": "detailed",
         }
-        return mapping.get(effort.lower(), "auto")
+        return mapping.get(effort.lower(), "auto") if effort else "auto"
 
     async def verify_connection(self) -> None:
         """Verify Codex connection by making a simple test call."""
@@ -451,12 +467,13 @@ class CodexLLM(LLMInterface):
             "tools": [],
             "tool_choice": "auto",
             "parallel_tool_calls": True,
-            "reasoning": {"effort": self.reasoning_effort, "summary": reasoning_summary},
+            "reasoning": self._reasoning_payload(reasoning_summary),
             "store": False,  # Codex uses stateless mode
             "stream": True,  # SSE streaming
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": str(uuid.uuid4()),
         }
+        payload.update(self._extra_body)
 
         if use_forced_tool and schema is not None:
             # Single function tool whose parameters ARE the response schema;
@@ -839,12 +856,13 @@ class CodexLLM(LLMInterface):
                 else tool_choice.mode.value
             ),
             "parallel_tool_calls": True,
-            "reasoning": {"effort": self.reasoning_effort, "summary": reasoning_summary},
+            "reasoning": self._reasoning_payload(reasoning_summary),
             "store": False,
             "stream": True,
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": str(uuid.uuid4()),
         }
+        payload.update(self._extra_body)
 
         headers = self._build_request_headers()
 

@@ -138,7 +138,12 @@ class MaintenanceLoop:
     @staticmethod
     def _cross_store_recovery_enabled() -> bool:
         """True when the memories store keeps memories outside SQL and therefore has
-        cross-store write-group txns a crashed writer could leave undecided."""
+        cross-store write-group txns a crashed writer could leave undecided.
+
+        Deliberately reads the PROCESS-LEVEL class attribute, not the per-bank
+        ``writes_memory_rows_in_sql_for(bank_id)`` — this only decides whether the recovery LOOP
+        needs to run at all. A store that routes some banks outside SQL keeps the class attribute
+        False so the loop runs, then ``recover_pending_txns`` is bank-scoped inside it."""
         try:
             from .memories import get_memories
 
@@ -282,6 +287,9 @@ class MaintenanceLoop:
             try:
                 table = fq_table_explicit("async_operations", schema)
                 async with acquire_with_retry(backend, max_retries=1) as conn:
+                    # Delete export archives owned by rows about to be pruned first,
+                    # so the file-storage blobs don't outlive their operation row.
+                    await engine.purge_expired_export_archives(conn, table, cutoff)
                     async with conn.transaction():
                         deleted = await backend.ops.prune_terminal_operations(
                             conn, table, cutoff, batch_size=cfg.operation_cleanup_batch_size

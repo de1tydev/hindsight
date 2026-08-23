@@ -32,7 +32,8 @@ import { brandWord } from "./brand";
 import { diag } from "./diag";
 import { setLogLevel } from "./log";
 import { parsePageList, buildKnowledgePreamble, type PageRef } from "./knowledge-injection";
-import type { ClientOpts } from "./hindsight";
+import type { ClientOpts, RetainOpts } from "./hindsight";
+import { buildRetainStamp } from "./retain-stamp";
 import { HindsightClient } from "./hindsight";
 import { sessionCacheFile, writeSessionCache } from "./session-cache";
 
@@ -49,7 +50,7 @@ interface SeedContextClient {
     documentId: string,
     tags: string[],
     strategy: string,
-    opts?: { async?: boolean }
+    opts?: RetainOpts
   ): Promise<void>;
 }
 
@@ -138,7 +139,7 @@ export async function buildSessionStartContext(args: {
   harness?: string;
   stateDir?: string;
   hasGit?: (dir: string) => boolean;
-  startSeed?: (repoDir: string, opts?: { limit?: number }) => void;
+  startSeed?: (repoDir: string, opts?: { limit?: number; harness?: string }) => void;
   startSurvey?: (
     repoDir: string,
     opts?: { harness?: SurveyHarness; model?: string; budgetUsd?: number }
@@ -156,6 +157,7 @@ export async function buildSessionStartContext(args: {
   const startSurvey = args.startSurvey ?? startCodebaseSurvey;
   const resolveHeadSha = args.headSha ?? gitHeadSha;
   const countCommitsSince = args.commitsSince ?? commitsSince;
+  const retainStamp = () => buildRetainStamp(cfg, { directory: cwd, harness, bankId });
 
   // Codebase-survey baseline (Option A): the bank is the only state, so the HEAD at the last survey
   // is recorded IN the bank as a tiny `survey-baseline:<sha>` marker doc (tag source:survey-baseline;
@@ -166,18 +168,22 @@ export async function buildSessionStartContext(args: {
   const recordSurveyBaseline = (sha: string): void => {
     if (!client.retain) return; // minimal client (some tests) — nothing to record
     try {
+      const stamp = retainStamp();
+      const content =
+        `🛰️ Hindsight is researching this codebase — survey started at commit ${sha.slice(0, 12)}. ` +
+        `(Internal marker: no memories are extracted from this document.)`;
+      const tags = [...new Set([...stamp.tags, SURVEY_BASELINE_TAG])];
       // Fire-and-forget; Promise.resolve tolerates a non-Promise return (e.g. a test spy).
-      void Promise.resolve(
-        client.retain(
-          `🛰️ Hindsight is researching this codebase — survey started at commit ${sha.slice(0, 12)}. ` +
-            `(Internal marker: no memories are extracted from this document.)`,
-          "hindsight codebase-survey baseline",
-          `${SURVEY_BASELINE_PREFIX}${sha}`,
-          [SURVEY_BASELINE_TAG],
-          "survey",
-          { async: true }
-        )
-      ).catch(() => {});
+      const retained = client.retain(
+        content,
+        "hindsight codebase-survey baseline",
+        `${SURVEY_BASELINE_PREFIX}${sha}`,
+        tags,
+        "survey",
+        // `retain` only sets metadata when it is truthy, so an empty stamp sends none.
+        { metadata: Object.keys(stamp.metadata).length ? stamp.metadata : undefined }
+      );
+      void Promise.resolve(retained).catch(() => {});
     } catch {
       /* best-effort — a failed baseline write never breaks SessionStart */
     }
@@ -208,7 +214,10 @@ export async function buildSessionStartContext(args: {
           // idempotent (per-bank lock, dedup by document id) and each run does only the missing
           // work: cold seed, newly appeared conversations, the next per-commit diff batch. The
           // one-time extras stay cold-gated below.
-          startSeed(cwd, { limit: cfg.seedLimit });
+          // Pass the ASKING harness through: without it deepen.js falls back to the config
+          // loader's harness default and misfiles this session's survey + git history into the
+          // wrong bank (e.g. `opencode::<project>` for a claude-code session). See #3247.
+          startSeed(cwd, { limit: cfg.seedLimit, harness });
           // Cold iff the bank has zero source:git docs (an undefined result — server error — is
           // NOT treated as cold; we never surveyed/noted on an unconfirmed-empty bank).
           if (docIds.size === 0) {
@@ -336,7 +345,7 @@ export async function runSessionStartHook(
     syncCompanionSkill(harness); // keep the installed skill current with the package version
     if (cfg.disabled) return;
 
-    const resolved = applyBankConfig(cfg, deriveBankId(cfg, cwd, harness));
+    const resolved = applyBankConfig(cfg, deriveBankId(cfg, cwd, harness), cwd);
     cfg = resolved.cfg;
     const bankId = resolved.bankId;
     if (cfg.disabled) return; // per-bank opt-out (banks.<id> override)
@@ -344,7 +353,12 @@ export async function runSessionStartHook(
     // detached; we wait only briefly, so an already-running daemon is adopted immediately while a
     // cold one keeps coming up in the background and is picked up by a later turn.
     await ensureDaemon(cfg, harness, { waitMs: DAEMON_WAIT_SESSION_START_MS });
-    const client = makeClient({ apiUrl: cfg.apiUrl, apiToken: cfg.apiToken, bank: bankId });
+    const client = makeClient({
+      apiUrl: cfg.apiUrl,
+      apiToken: cfg.apiToken,
+      bank: bankId,
+      maxParallelRetains: cfg.maxParallelRetains,
+    });
 
     const out = await buildSessionStartContext({ cwd, bankId, cfg, client, harness });
     if (out.deferInitialReflect && sessionId) {
